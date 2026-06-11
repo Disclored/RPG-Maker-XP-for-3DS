@@ -459,17 +459,34 @@ static void check_entry_methods(mrb_state *mrb, int script_idx, const char *scri
             "# FIX: $data_tilesets -- Game_Map#setup acede a $data_tilesets[tileset_id]\n"
             "# Se for nil/Array simples, .tileset_name/.autotile_names crasham.\n"
             "begin\n"
-            "  # Tentar carregar Tilesets.rxdata se ainda nao carregado\n"
-            "  if !$data_tilesets.is_a?(Array) || $data_tilesets.length <= 1\n"
+            "  # DIAGNOSTICO: estado do $data_tilesets ANTES de decidir carregar\n"
+            "  begin\n"
+            "    _dtl = $data_tilesets.is_a?(Array) ? $data_tilesets.length : -1\n"
+            "    _dt1 = ($data_tilesets.is_a?(Array) && $data_tilesets.length > 1) ? $data_tilesets[1] : nil\n"
+            "    _dtn = (_dt1.respond_to?(:tileset_name) ? _dt1.tileset_name.to_s : '<sem metodo>')\n"
+            "    dbg \"[TSET|DIAG] antes: class=#{$data_tilesets.class} len=#{_dtl} [1].tileset_name='#{_dtn}'\"\n"
+            "  rescue => e\n"
+            "    dbg \"[TSET|DIAG] antes ERRO: #{e.class}: #{e.message}\"\n"
+            "  end\n"
+            "  # FIX: carregar Tilesets.rxdata sempre que $data_tilesets[1] nao tenha nome real.\n"
+            "  # (O fallback [nil, ts] tem length 2 e enganava a guarda antiga 'length <= 1',\n"
+            "  #  deixando $data_tilesets[4] = nil -> Game_Map#setup le campos de nil -> mapa preto.)\n"
+            "  t1 = ($data_tilesets.is_a?(Array) && $data_tilesets.length > 1) ? $data_tilesets[1] : nil\n"
+            "  has_real = t1.respond_to?(:tileset_name) && (t1.tileset_name.to_s.length > 0)\n"
+            "  if !has_real\n"
             "    begin\n"
-            "      dbg '[TSET] a tentar load_data Tilesets.rxdata'\n"
+            "      dbg '[TSET] sem dados reais -> a tentar load_data Tilesets.rxdata'\n"
             "      loaded = load_data('Data/Tilesets.rxdata')\n"
             "      dbg \"[TSET] carregado: #{loaded.class} len=#{loaded.length rescue '?'}\"\n"
-            "      $data_tilesets = loaded if loaded.is_a?(Array) && loaded.length > 1\n"
-            "      dbg \"[TSET] $data_tilesets=#{$data_tilesets.class} len=#{$data_tilesets.length rescue '?'}\"\n"
+            "      if loaded.is_a?(Array) && loaded.length > ($data_tilesets.is_a?(Array) ? $data_tilesets.length : 0)\n"
+            "        $data_tilesets = loaded\n"
+            "      end\n"
+            "      dbg \"[TSET] depois: class=#{$data_tilesets.class} len=#{$data_tilesets.length rescue '?'} [1].name='#{($data_tilesets[1].tileset_name rescue '?')}'\"\n"
             "    rescue => e\n"
             "      dbg \"[TSET] ERRO load Tilesets.rxdata: #{e.class}: #{e.message}\"\n"
             "    end\n"
+            "  else\n"
+            "    dbg \"[TSET] ja tem dados reais (len=#{$data_tilesets.length rescue '?'}), skip load\"\n"
             "  end\n"
             "  unless $data_tilesets.is_a?(Array) && $data_tilesets.length > 1\n"
             "    ts = RPG::Tileset.new\n"
@@ -874,6 +891,14 @@ begin
                      "callbacks"].include?(name)
     return ""    if name.start_with?("name","title","filename","path",
                                      "character","charset","tileset","text")
+    # REDE DE SEGURANCA (ecra preto na mensagem): qualquer resolver de imagem/
+    # windowskin/frame/skin que escape ao method_missing deve devolver "" (que a
+    # janela tolera), NUNCA 0 (Integer), que rebenta AnimatedBitmap.new/.width.
+    return ""    if name.start_with?("pbResolveBitmap","pbBitmapName",
+                                     "pbGetSystemFrame","pbGetSpeechFrame",
+                                     "pbDefaultSystemFrame","pbDefaultSpeechFrame",
+                                     "pbDefaultWindowskin","getWindowskin")
+    return ""    if name.start_with?("windowskin","skin","frame","graphic","bitmap","image")
     return 0
   end
 rescue; end
@@ -1439,6 +1464,14 @@ def _safe_return_for(name)
   return []    if name.start_with?("all","list","each","get_all","find_all")
   return ""    if name.start_with?("name","title","filename","path",
                                    "character","charset","tileset","text")
+  # REDE DE SEGURANCA (ecra preto na mensagem): resolvers de imagem/windowskin/
+  # frame/skin que escapem ao method_missing devem devolver "" (a janela tolera),
+  # NUNCA 0 (Integer) -- 0 rebenta AnimatedBitmap.new(0) e (0).width na janela.
+  return ""    if name.start_with?("pbResolveBitmap","pbBitmapName",
+                                   "pbGetSystemFrame","pbGetSpeechFrame",
+                                   "pbDefaultSystemFrame","pbDefaultSpeechFrame",
+                                   "pbDefaultWindowskin","getWindowskin")
+  return ""    if name.start_with?("windowskin","skin","frame","graphic","bitmap","image")
   return 0
 end
 
@@ -1462,6 +1495,32 @@ begin
   dbg "[PATCH] Object#method_missing universal OK"
 rescue => e
   dbg "[PATCH] Object#method_missing falhou: #{e.message}"
+end
+
+# -- FIX INPUT: Input::F6/F7/F8/F9 em falta -----------------------------------
+# O jogo redefine Input.update (plugin KGC ScreenCapture) e faz
+# `trigger?(Input::F8)`. Mas o binding C++ so define constantes ate F5, por isso
+# Input::F8 cai no method_missing -> pode lancar erro/ruido dentro de Input.update,
+# que e' chamado a CADA frame no loop das mensagens. Definimos F6..F9 (e CTRL/ALT)
+# com valores altos inofensivos (nunca premidos no 3DS) para Input.update correr
+# limpo e o input das mensagens (USE/BACK) funcionar sem interferencia.
+begin
+  if Object.const_defined?(:Input)
+    m = Input
+    {
+      "F6" => 96, "F7" => 97, "F8" => 98, "F9" => 99,
+      "CTRL" => 90, "ALT" => 91
+    }.each do |name, val|
+      sym = name.to_sym
+      already = (m.const_defined?(sym) rescue false)
+      unless already
+        m.const_set(sym, val) rescue nil
+      end
+    end
+    dbg "[INPUT] Input::F6..F9/CTRL/ALT garantidos OK"
+  end
+rescue => e
+  dbg "[INPUT] Input const fix falhou: #{e.class}: #{e.message}"
 end
 
 # -- Patch method_missing nas classes reais do jogo ----------------------------
@@ -1496,6 +1555,161 @@ end
     dbg "[MISSING_PATCH] #{klass_name} falhou: #{e.message}"
   end
 end
+
+# === FIX JANELA DE MENSAGEM (ecra preto na Intro) ============================
+# SINTOMA: a Intro executa, a 1a fala (code=101) corre, mas a criacao da
+# janela Window_AdvancedTextPokemon congela o jogo -- Scene_Map#update deixa de
+# ser chamado a partir do frame ~46.
+#
+# CAUSA: SpriteWindow_Base#initialize chama pbResolveBitmap(skin) para resolver
+# o windowskin. pbResolveBitmap e' uma funcao GLOBAL (metodo privado de Object),
+# mas neste runtime nao fica visivel como metodo de instancia dentro da janela,
+# por isso cai no method_missing universal. _safe_return_for("pbResolveBitmap")
+# nao bate em nenhum padrao de nome e devolve 0 (Integer). A janela recebe
+# @curframe=0, AnimatedBitmap.new(0) / skin.width sobre 0 falham, a janela nunca
+# fica pronta, o loop interno de pbMessage nunca devolve o controlo ao
+# Scene_Map#main -> congela. (No log: "[MISSING] Window_AdvancedTextPokemon#
+# pbResolveBitmap(\"\")".)
+#
+# FIX: definir pbResolveBitmap EXPLICITAMENTE como metodo real de Kernel e Object
+# (publico), com a logica correcta (resolve ficheiro; devolve nil se nao existir,
+# NUNCA 0). Assim sai do method_missing. Alem disso, reforcar os defaults de
+# windowskin de MessageConfig para nunca devolverem 0/lixo. Nada disto altera os
+# scripts do jogo (read-only) -- apenas garante que as funcoes globais existem
+# como metodos reais e robustos.
+begin
+  # Lista de candidatos de windowskin que tipicamente existem num jogo PE/EBDX.
+  # Usada so como ultimo recurso, para a janela conseguir formar-se.
+  # (variavel global para resolucao fiavel dentro de instance_eval/blocks no mruby)
+  $__mkxp_wskin_fallbacks = [
+    "Graphics/Windowskins/speech hgss 1",
+    "Graphics/Windowskins/choice 1",
+    "Graphics/Windowskins/001-Blue01",
+    "Graphics/System/Window",
+    "Graphics/Windowskins/Window"
+  ]
+
+  # Definir como metodos PUBLICOS reais de Object (sai do method_missing).
+  # No mruby, def dentro de "class ::Object" + "public" garante visibilidade a
+  # todas as instancias, incl. Window_AdvancedTextPokemon.
+  #
+  # IMPORTANTE: nao queremos degradar a resolucao das OUTRAS imagens (sprites,
+  # tilesets). Por isso guardamos a pbResolveBitmap ORIGINAL (se existir e for
+  # chamavel) e tentamos sempre essa primeiro; so usamos o fallback robusto se a
+  # original falhar, devolver nil, ou nao existir.
+  begin
+    # NOTA: pbResolveBitmap definido no top-level e' metodo PRIVADO de Object,
+    # por isso testamos com respond_to?(...,true) e tambem private_method_defined?.
+    _has_orig = (Object.new.respond_to?(:pbResolveBitmap, true) rescue false) ||
+                (Object.method_defined?(:pbResolveBitmap) rescue false) ||
+                (Object.private_method_defined?(:pbResolveBitmap) rescue false)
+    if _has_orig &&
+       !(Object.method_defined?(:__mkxp_orig_resolvebmp) rescue false) &&
+       !(Object.private_method_defined?(:__mkxp_orig_resolvebmp) rescue false)
+      # so guardar se NAO for ja o nosso (evita recursao em recargas)
+      class ::Object
+        alias_method :__mkxp_orig_resolvebmp, :pbResolveBitmap
+      end
+      $__mkxp_has_orig_resolvebmp = true
+    end
+  rescue
+    $__mkxp_has_orig_resolvebmp = false
+  end
+
+  class ::Object
+    # resolucao robusta por filesystem do jogo (helpers do binding/scripts)
+    def __mkxp_try_bitmap(base)
+      return nil if base.nil?
+      s = (base.to_s rescue "")
+      return nil if s.empty?
+      noext = s.gsub(/\.(bmp|png|gif|jpg|jpeg)$/i, "")
+      # 1) pbTryString (resolve dentro de archives/RTP) se disponivel e real
+      begin
+        if respond_to?(:pbTryString)
+          r = (pbTryString(noext + ".png") rescue nil)
+          return r if r && r != 0
+          r = (pbTryString(noext + ".gif") rescue nil)
+          return r if r && r != 0
+        end
+      rescue
+      end
+      # 2) safeExists? (FileTest.exist? — funciona com caminhos do jogo no 3DS)
+      begin
+        if respond_to?(:safeExists?)
+          ["", ".png", ".gif"].each do |ext|
+            cand = noext + ext
+            return cand if (safeExists?(cand) rescue false)
+          end
+        end
+      rescue
+      end
+      # 3) File.exist? directo (ultimo recurso)
+      ["", ".png", ".gif"].each do |ext|
+        cand = noext + ext
+        begin
+          return cand if File.exist?(cand)
+        rescue
+        end
+      end
+      nil
+    end
+
+    # pbResolveBitmap real e robusto. Tenta a ORIGINAL primeiro (preserva o
+    # comportamento de sprites/tilesets); fallback so se a original falhar.
+    def pbResolveBitmap(x)
+      return nil if x.nil?
+      s = (x.to_s rescue "")
+      return nil if s.empty?
+      # 1) original (se existir e nao for a nossa)
+      if $__mkxp_has_orig_resolvebmp && respond_to?(:__mkxp_orig_resolvebmp)
+        begin
+          r = __mkxp_orig_resolvebmp(x)
+          return r if r.is_a?(String) && !r.empty?
+          # original devolveu nil/""/0 -> tentar fallback
+        rescue
+        end
+      end
+      # 2) fallback robusto
+      r2 = (__mkxp_try_bitmap(s) rescue nil)
+      return r2 if r2.is_a?(String) && !r2.empty?
+      nil
+    end
+
+    public :__mkxp_try_bitmap
+    public :pbResolveBitmap
+  end
+
+  dbg "[WSKIN] pbResolveBitmap real registado em Object (orig_disponivel=#{$__mkxp_has_orig_resolvebmp ? 'sim' : 'nao'})"
+rescue => e
+  dbg "[WSKIN] pbResolveBitmap patch falhou: #{e.class}: #{e.message}"
+end
+
+# Reforcar os defaults de windowskin. A camada 1 (pbResolveBitmap real) ja faz
+# os metodos originais do MessageConfig resolverem bem; a camada 3 (rede no
+# _safe_return_for) apanha qualquer escape devolvendo "" em vez de 0. Por isso
+# aqui NAO reescrevemos os metodos originais (evita metaprogramacao fragil no
+# mruby) -- apenas garantimos a existencia de um helper de fallback seguro que
+# resolve para um windowskin existente, caso algo precise.
+begin
+  if Object.const_defined?(:MessageConfig)
+    unless MessageConfig.respond_to?(:__mkxp_first_existing_wskin)
+      MessageConfig.define_singleton_method(:__mkxp_first_existing_wskin) do
+        list = ($__mkxp_wskin_fallbacks || [])
+        i = 0
+        while i < list.length
+          r = (pbResolveBitmap(list[i]) rescue nil)
+          return r if r.is_a?(String) && !r.empty?
+          i += 1
+        end
+        ""
+      end
+    end
+    dbg "[WSKIN] MessageConfig helper de fallback OK"
+  end
+rescue => e
+  dbg "[WSKIN] MessageConfig patch falhou: #{e.class}: #{e.message}"
+end
+# === /FIX JANELA DE MENSAGEM =================================================
 
 # -- Injectar metodos ausentes directamente apos MISSING_PATCH ----------------
 # Os scripts do jogo redefinem Game_Player, Game_System, Game_Temp, etc. do
@@ -2431,18 +2645,66 @@ begin
       dbg "[DebugIntro] game_screen stub failed: #{e.message}"
     end
 
-    # --- $game_system fallback stub ---
+    # --- $game_system: criar Game_System REAL (tem map_interpreter = Interpreter.new) ---
+    # CRITICO: sem um map_interpreter REAL, pbMapInterpreter.update e' no-op (engolido
+    # pelo method_missing universal) e os eventos autorun -- intro / criacao de
+    # personagem -- NUNCA correm, deixando o ecra preto no mapa de intro (Map001).
+    # Por isso preferimos sempre Game_System.new; so' caimos no stub se falhar, e
+    # mesmo o stub passa a ter um Interpreter REAL.
     begin
-      unless $game_system
-        _obj = Object.new
-        _obj.define_singleton_method(:bgm_play)       { |*a| }
-        _obj.define_singleton_method(:bgs_play)       { |*a| }
-        _obj.define_singleton_method(:update)         { }
-        _obj.define_singleton_method(:map_interpreter){ nil }
-        $game_system = _obj
+      _mi_ok = begin
+        $game_system && $game_system.respond_to?(:map_interpreter) &&
+        $game_system.map_interpreter && $game_system.map_interpreter.respond_to?(:update)
+      rescue
+        false
+      end
+      unless _mi_ok
+        begin
+          $game_system = Game_System.new
+          dbg "[DebugIntro] $game_system = Game_System.new OK map_interpreter=#{($game_system.map_interpreter.class rescue '?')}"
+        rescue => gse
+          dbg "[DebugIntro] Game_System.new falhou (#{gse.class}: #{gse.message}) -- stub com Interpreter real"
+          _mi = (Interpreter.new(0, true) rescue nil)
+          _obj = Object.new
+          _obj.define_singleton_method(:bgm_play)          { |*a| }
+          _obj.define_singleton_method(:bgs_play)          { |*a| }
+          _obj.define_singleton_method(:update)            { }
+          _obj.define_singleton_method(:map_interpreter)   { _mi }
+          _obj.define_singleton_method(:menu_disabled)     { false }
+          _obj.define_singleton_method(:save_disabled)     { false }
+          _obj.define_singleton_method(:encounter_disabled){ false }
+          $game_system = _obj
+        end
       end
     rescue => e
-      dbg "[DebugIntro] game_system stub failed: #{e.message}"
+      dbg "[DebugIntro] game_system setup falhou: #{e.message}"
+    end
+
+    # Sinalizar "novo jogo" (Game.start_new faz isto) -- a intro pode depender disto.
+    begin
+      $PokemonTemp.begunNewGame = true if $PokemonTemp.respond_to?(:begunNewGame=)
+    rescue
+    end
+
+    # --- $game_switches / $game_variables / $game_self_switches ---
+    # CRITICO: o SaveData.load_new_game_values falhou (ver $game_player=NilClass),
+    # por isso estes globais ficam nil. Sem eles, "Controlar Variaveis" (cmd 122) e
+    # pbSetSelfSwitch nao tem onde escrever -> o evento de arranque (QuickStartActivate)
+    # nunca completa o contador de 5 frames e NUNCA aciona o Evento 1 'Intro'
+    # (criacao de personagem). Criamos os 3 globais reais aqui.
+    begin
+      if $game_switches.nil? || !$game_switches.respond_to?(:[])
+        $game_switches = Game_Switches.new
+      end
+      if $game_variables.nil? || !$game_variables.respond_to?(:[])
+        $game_variables = Game_Variables.new
+      end
+      if $game_self_switches.nil? || !$game_self_switches.respond_to?(:[])
+        $game_self_switches = Game_SelfSwitches.new
+      end
+      dbg "[DebugIntro] switches=#{$game_switches.class} variables=#{$game_variables.class} self_switches=#{$game_self_switches.class}"
+    rescue => e
+      dbg "[DebugIntro] game_switches/variables setup falhou: #{e.class}: #{e.message}"
     end
 
     # --- $game_temp: criar Game_Temp real ou stub completo ---
@@ -3024,6 +3286,159 @@ end
     DBGLOG("[binding] main loop exited\n");
 }
 /* =========================================================
+ * CACHE DE BYTECODE (acelerar arranque)
+ * =========================================================
+ * PROBLEMA: a cada arranque, os ~376 scripts (8+ MB de Ruby) sao parseados e
+ * compilados para bytecode em runtime pelo mruby, no CPU lento do 3DS -> ~5 min.
+ *
+ * SOLUCAO: compilar cada script para bytecode .mrb UMA vez, gravar em
+ * sdmc:/mkxp/cache/, e nos arranques seguintes carregar o bytecode (salta o
+ * parsing) -> segundos.
+ *
+ * GENERICO / POR-CONTEUDO: a chave da cache deriva do CONTEUDO ja-patchado
+ * (nome + tamanho + hash FNV-1a). Por isso:
+ *   - funciona para QUALQUER jogo (nao e' especifico deste fan-game);
+ *   - cada jogo paga a compilacao so no 1o arranque dele;
+ *   - scripts identicos entre jogos reaproveitam a mesma cache;
+ *   - se um script mudar, a chave muda -> recompila automaticamente (sem cache
+ *     desatualizada).
+ *
+ * SEGURANCA: se QUALQUER passo da cache falhar (ler, gravar, bytecode invalido,
+ * versao mruby diferente), faz fallback transparente a mrb_load_nstring. A cache
+ * nunca pode partir o arranque.
+ *
+ * TODO (UX, quando o emulador estiver avancado): no 1o arranque de um jogo,
+ * mostrar uma barra de progresso de compilacao ("A preparar o jogo... N/total")
+ * em vez de ecra preto, ja que essa primeira vez demora.
+ */
+
+/* Para DESLIGAR a cache (se algum dia causar problemas), basta mudar para 0.
+ * Com 0, o arranque volta ao comportamento antigo (mrb_load_nstring direto).
+ *
+ * NOTA IMPORTANTE: este build do mruby foi compilado com MRB_NO_STDIO, que
+ * DESATIVA mrb_dump_irep (gravar bytecode). Por isso a cache gerada-no-3DS NAO
+ * e' possivel com esta lib. Mantemos o codigo (desligado) para o caso de no
+ * futuro se usar uma lib mruby com dump ativado, ou bytecode pre-compilado no
+ * PC com mrbc (que usa mrb_load_irep_buf, esse SIM disponivel aqui).
+ * => Por defeito DESLIGADO (0) para o build funcionar. */
+#ifndef MKXP_BYTECODE_CACHE
+#define MKXP_BYTECODE_CACHE 0
+#endif
+
+#if MKXP_BYTECODE_CACHE
+/* FNV-1a 64-bit -> hex, sobre um buffer (conteudo do script ja patchado). */
+static void mkxp_cache_key(const char *name, const unsigned char *data,
+                           size_t len, char *out, size_t out_sz) {
+    unsigned long long h = 1469598103934665603ULL; /* offset basis */
+    /* incorporar o nome para evitar colisoes entre scripts diferentes */
+    for (const char *p = name; p && *p; ++p) {
+        h ^= (unsigned char)*p;
+        h *= 1099511628211ULL;
+    }
+    h ^= (unsigned long long)len; h *= 1099511628211ULL;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= data[i];
+        h *= 1099511628211ULL;
+    }
+    /* nome "sanitizado" curto + hash, p.ex. cache/Main_a1b2c3d4e5f60718.mrb */
+    char safe[40]; size_t si = 0;
+    for (const char *p = name; p && *p && si < sizeof(safe) - 1; ++p) {
+        char c = *p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9')) safe[si++] = c;
+        else safe[si++] = '_';
+    }
+    safe[si] = 0;
+    snprintf(out, out_sz, "sdmc:/mkxp/cache/%s_%016llx.mrb", safe, h);
+}
+
+/* Garante que a pasta da cache existe (idempotente). */
+static void mkxp_cache_ensure_dir(void) {
+    mkdir("sdmc:/mkxp", 0777);        /* pode ja existir -> ignora erro */
+    mkdir("sdmc:/mkxp/cache", 0777);
+}
+
+/* Tenta carregar+executar bytecode da cache. Devolve true se correu (ok ou com
+ * excecao tratada); false se a cache nao existe/invalida (=> recompilar). */
+static bool mkxp_cache_try_load(mrb_state *mrb, const char *cache_path,
+                                const char *script_name) {
+    FILE *cf = fopen(cache_path, "rb");
+    if (!cf) return false;
+    fseek(cf, 0, SEEK_END);
+    long csz = ftell(cf);
+    fseek(cf, 0, SEEK_SET);
+    if (csz <= 8) { fclose(cf); return false; }   /* ficheiro corrompido/curto */
+    std::vector<unsigned char> buf((size_t)csz);
+    size_t rd = fread(buf.data(), 1, (size_t)csz, cf);
+    fclose(cf);
+    if (rd != (size_t)csz) return false;
+
+    /* Validar header RITE (".mrb" comeca por "RITE"). Se nao, ignorar. */
+    if (csz < 4 || buf[0] != 'R' || buf[1] != 'I' || buf[2] != 'T' || buf[3] != 'E')
+        return false;
+
+    int arena = mrb_gc_arena_save(mrb);
+    mrb_load_irep_buf(mrb, buf.data(), (size_t)csz);
+    if (mrb->exc) {
+        /* Excecao na EXECUCAO do bytecode e' normal (mesmos erros que o .rb ja
+         * dava) e era tolerada antes; tratamos e consideramos "carregado".    */
+        show_error(mrb, script_name);
+        mrb->exc = 0;
+    }
+    mrb_gc_arena_restore(mrb, arena);
+    return true;
+}
+
+/* Compila a string para irep, GRAVA o bytecode na cache, e executa o irep.
+ * Devolve true se compilou/executou; false se a compilacao falhou (=> o
+ * chamador faz fallback a mrb_load_nstring). */
+static bool mkxp_cache_compile_run(mrb_state *mrb, const char *code, size_t code_len,
+                                   const char *cache_path, const char *script_name) {
+    int arena = mrb_gc_arena_save(mrb);
+    mrbc_context *cxt = mrbc_context_new(mrb);
+    if (!cxt) { mrb_gc_arena_restore(mrb, arena); return false; }
+    mrbc_filename(mrb, cxt, script_name);
+    cxt->no_exec = TRUE;   /* compilar SEM executar -> obtemos o proc/irep */
+
+    mrb_value v = mrb_load_nstring_cxt(mrb, code, code_len, cxt);
+    /* Com no_exec=TRUE: parse falhado -> v e' UNDEF (padrao do mruby-require).
+     * Sucesso -> v e' um RProc cujo irep podemos despejar.                    */
+    if (mrb->exc || mrb_undef_p(v) || mrb_type(v) != MRB_TT_PROC) {
+        if (mrb->exc) { show_error(mrb, script_name); mrb->exc = 0; }
+        mrbc_context_free(mrb, cxt);
+        mrb_gc_arena_restore(mrb, arena);
+        return false;   /* parse/codegen falhou -> fallback a nstring */
+    }
+
+    struct RProc *proc = mrb_proc_ptr(v);
+    const mrb_irep *irep = proc->body.irep;
+
+    /* Gravar bytecode (best-effort: se falhar, ainda executamos na mesma). */
+    if (irep) {
+        unsigned char *bin = NULL;
+        size_t bin_size = 0;
+        int dret = mrb_dump_irep(mrb, irep, DUMP_ENDIAN_NAT, &bin, &bin_size);
+        if (dret == MRB_DUMP_OK && bin && bin_size > 0) {
+            FILE *wf = fopen(cache_path, "wb");
+            if (wf) {
+                fwrite(bin, 1, bin_size, wf);
+                fclose(wf);
+            }
+        }
+        if (bin) mrb_free(mrb, bin);
+    }
+
+    /* Executar agora o proc compilado (equivalente a ter corrido o .rb). */
+    mrb_vm_run(mrb, proc, mrb_top_self(mrb), 0);
+    if (mrb->exc) { show_error(mrb, script_name); mrb->exc = 0; }
+
+    mrbc_context_free(mrb, cxt);
+    mrb_gc_arena_restore(mrb, arena);
+    return true;
+}
+#endif /* MKXP_BYTECODE_CACHE */
+
+/* =========================================================
  * ENTRY POINT
  * ========================================================= */
  
@@ -3048,6 +3463,13 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
     mrb_gc_register(mrb, scripts_array);
     int num_scripts = (int)RARRAY_LEN(scripts_array);
         DBGLOG("[SCRIPTS] Loading %d scripts\n", num_scripts);
+
+#if MKXP_BYTECODE_CACHE
+    /* Criar pasta de cache de bytecode (idempotente). Se a cache funcionar,
+     * os arranques seguintes saltam o parsing e sao MUITO mais rapidos. */
+    mkxp_cache_ensure_dir();
+    DBGLOG("[CACHE] cache de bytecode: sdmc:/mkxp/cache/\n");
+#endif
 
     /* Carregar rgss_stubs.rb antes dos scripts do jogo */
     {
@@ -3157,13 +3579,39 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
         // Aplicar patches (Main, etc.)
         patch_script(decomp, (uLong)decomp.size(), script_name);
 
-        // Executar no mruby
+#if MKXP_BYTECODE_CACHE
+        // --- CACHE DE BYTECODE -------------------------------------------
+        // Chave por conteudo JA-PATCHADO. 1a vez: compila + grava .mrb.
+        // Seguintes: carrega bytecode (rapido). Fallback seguro a nstring.
+        char cache_path[320];
+        mkxp_cache_key(script_name, decomp.data(), decomp.size(),
+                       cache_path, sizeof(cache_path));
+
+        bool done = mkxp_cache_try_load(mrb, cache_path, script_name);
+        if (!done) {
+            // nao havia cache valida -> compilar, gravar e executar
+            done = mkxp_cache_compile_run(mrb, (const char*)decomp.data(),
+                                          decomp.size(), cache_path, script_name);
+        }
+        if (!done) {
+            // ultimo recurso: caminho antigo (compila+executa, sem cache)
+            mrb_value result = mrb_load_nstring(mrb, (const char*)decomp.data(), decomp.size());
+            (void)result;
+            if (mrb->exc) {
+                show_error(mrb, script_name);
+                mrb->exc = 0;   // continuar mesmo com erro
+            }
+        }
+        // --- /CACHE DE BYTECODE ------------------------------------------
+#else
+        // Caminho antigo (cache desligada): compila+executa em runtime.
         mrb_value result = mrb_load_nstring(mrb, (const char*)decomp.data(), decomp.size());
-        (void)result;  /* valor de retorno não usado; erro verificado via mrb->exc */
+        (void)result;
         if (mrb->exc) {
             show_error(mrb, script_name);
-            mrb->exc = 0;   // continuar mesmo com erro
+            mrb->exc = 0;
         }
+#endif
     }
 
     mrb_gc_unregister(mrb, scripts_array);
