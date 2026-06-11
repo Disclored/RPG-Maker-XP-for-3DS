@@ -661,3 +661,236 @@ begin
 rescue => e
   begin; Probe.log "TM setup FALHOU: #{e.class}: #{e.message}"; rescue; end
 end
+
+# =============================================================================
+# >>> SUPER-LOG: CADEIA DA INTRO / EVENTOS AUTORUN <<<
+# Objetivo: descobrir porque o evento autorun da intro (Map001) nao corre.
+# Instrumenta Interpreter (map_interpreter) + Game_Map#update + eventos.
+# Procura no log por:  [PRB] EV
+# trigger: 0=botao 1=toque-jogador 2=toque-evento 3=AUTORUN 4=PARALELO
+# Tudo em begin/rescue; nao parte o arranque.
+# =============================================================================
+begin
+  def Probe.dump_events(tag)
+    begin
+      gm = $game_map
+      if gm.nil?; Probe.log "EV #{tag}: $game_map=nil"; return; end
+      evs = (gm.events rescue nil)
+      n = (evs.respond_to?(:size) ? evs.size : -1)
+      cei = ($game_temp.common_event_id rescue '?')
+      nr  = (gm.need_refresh rescue '?')
+      Probe.log "EV #{tag}: map_id=#{gm.map_id rescue '?'} events=#{n} need_refresh=#{nr} common_event_id=#{cei}"
+      if evs.respond_to?(:values)
+        evs.values.each do |e|
+          tr = (e.trigger rescue '?')
+          st = (e.starting rescue '?')
+          lst = (e.list rescue nil)
+          pg  = (e.instance_variable_get(:@page) rescue nil)
+          Probe.log "EV   id=#{e.id rescue '?'} name='#{e.name rescue '?'}' @(#{e.x rescue '?'},#{e.y rescue '?'}) trigger=#{tr} starting=#{st} page=#{pg ? 'ok' : 'nil'} list=#{lst ? (lst.size rescue '?') : 'nil'}"
+        end
+      end
+    rescue => e
+      Probe.log "EV #{tag} ERRO #{e.class}: #{e.message}"
+    end
+  end
+
+  # one-time: campos de inicio + interpretador
+  def Probe.dump_start
+    begin
+      Probe.log "EV START: start_map_id=#{$data_system.start_map_id rescue '?'} start_x=#{$data_system.start_x rescue '?'} start_y=#{$data_system.start_y rescue '?'} player@(#{$game_player.x rescue '?'},#{$game_player.y rescue '?'}) map=#{$game_map.map_id rescue '?'}"
+      mi = ($game_system.map_interpreter rescue nil)
+      Probe.log "EV START: map_interpreter=#{mi ? mi.class : 'nil'} running?=#{(mi.running? rescue '?')} main=#{(mi.instance_variable_get(:@main) rescue '?')}"
+      Probe.log "EV START: switches=#{($game_switches.class rescue 'nil')} variables=#{($game_variables.class rescue 'nil')} self_switches=#{($game_self_switches.class rescue 'nil')} var[1]=#{($game_variables[1] rescue '?')}"
+    rescue => e
+      Probe.log "EV START ERRO #{e.class}: #{e.message}"
+    end
+  end
+
+  if Object.const_defined?(:Interpreter)
+    class Interpreter
+      # setup_starting_event: o coracao -- procura o evento autorun
+      unless method_defined?(:__p_sse)
+        alias_method :__p_sse, :setup_starting_event
+        def setup_starting_event
+          $p_sse = ($p_sse || 0) + 1
+          if $p_sse <= 4
+            Probe.dump_start if $p_sse == 1
+            Probe.dump_events("sse##{$p_sse} ANTES")
+          end
+          r = __p_sse
+          if $p_sse <= 4
+            Probe.log "EV sse##{$p_sse} DEPOIS: running?=#{(running? rescue '?')} list=#{(@list ? (@list.size rescue '?') : 'nil')} event_id=#{(@event_id rescue '?')}"
+          end
+          r
+        end
+      end
+
+      # update: confirma que o interpretador esta a ser actualizado
+      unless method_defined?(:__p_iupd)
+        alias_method :__p_iupd, :update
+        def update
+          mn = (@main rescue nil)
+          if mn
+            $p_iupd = ($p_iupd || 0) + 1
+            Probe.log "EV interp.update(main) ##{$p_iupd}: running?=#{(running? rescue '?')} list=#{(@list ? 'set' : 'nil')} msg_wait=#{(@message_waiting rescue '?')} wait=#{(@wait_count rescue '?')}" if $p_iupd <= 5 || ($p_iupd % 120 == 0)
+          end
+          __p_iupd
+        end
+      end
+
+      # execute_command: comandos + texto/parametros + transicao de evento + contador
+      if method_defined?(:execute_command) && !method_defined?(:__p_exec)
+        alias_method :__p_exec, :execute_command
+        def execute_command
+          $p_exec = ($p_exec || 0) + 1
+          begin
+            eid = (@event_id rescue '?')
+            if $p_last_eid != eid
+              Probe.log "EV >>> evento mudou: #{$p_last_eid.inspect} -> #{eid} (var[1]=#{($game_variables[1] rescue '?')})"
+              $p_last_eid = eid
+            end
+            if $p_exec <= 80
+              cmd  = (@list && @list[@index] ? @list[@index] : nil)
+              code = (cmd ? (cmd.code rescue '?') : '?')
+              extra = ''
+              if cmd && [101,401,102,103,122,111,355,655,123,121,201,117,119,118,108,408].include?(code)
+                s = ((cmd.parameters rescue nil)).inspect rescue '?'
+                s = s[0, 90] + '...' if s.length > 90
+                extra = " p=#{s}"
+              end
+              Probe.log "EV exec ##{$p_exec}: code=#{code} idx=#{@index rescue '?'} ev=#{eid}#{extra}"
+            elsif $p_exec % 300 == 0
+              Probe.log "EV exec ##{$p_exec} (a correr) code=#{(@list[@index].code rescue '?')} ev=#{eid} var[1]=#{($game_variables[1] rescue '?')}"
+            end
+          rescue => ee
+            Probe.log "EV exec ERRO #{ee.message}" if $p_exec <= 80
+          end
+          __p_exec
+        end
+      end
+    end
+    Probe.log "EV Interpreter instrumentado OK"
+  else
+    Probe.log "EV AVISO: Interpreter nao existe"
+  end
+
+  # Game_Map#update: os eventos sao actualizados? (deteta autorun)
+  if Object.const_defined?(:Game_Map)
+    class Game_Map
+      unless method_defined?(:__p_gmupd)
+        alias_method :__p_gmupd, :update
+        def update
+          $p_gmupd = ($p_gmupd || 0) + 1
+          Probe.log "EV game_map.update ##{$p_gmupd} (events update -> deteta autorun)" if $p_gmupd <= 3
+          __p_gmupd
+        end
+      end
+    end
+    Probe.log "EV Game_Map#update instrumentado OK"
+  end
+
+  # === INSTRUMENTACAO DA JANELA DE MENSAGEM ==================================
+  # Objectivo: ver EXACTAMENTE onde a criacao/loop da janela de mensagem vai,
+  # depois da 1a fala (code=101). Confirma se o fix do windowskin resolve, e se
+  # o loop da mensagem passa a correr (ou se fica preso a espera de input).
+
+  # NOTA: pbResolveBitmap e' (re)definido pelo binding DEPOIS do probe, por isso
+  # nao o instrumentamos aqui (seria sobreposto). Vemos o resultado via o log
+  # [WSKIN] do binding e via o hook de SpriteWindow_Base#init (windowskin DEPOIS).
+
+  # SpriteWindow_Base#initialize: a base da janela forma-se sem travar?
+  if Object.const_defined?(:SpriteWindow_Base)
+    begin
+      class SpriteWindow_Base
+        unless method_defined?(:__p_swb_init)
+          alias_method :__p_swb_init, :initialize
+          def initialize(*a)
+            $p_swb = ($p_swb || 0) + 1
+            n = $p_swb
+            Probe.log "WIN SpriteWindow_Base#init ##{n} ANTES args=#{a.inspect[0,40]}"
+            r = __p_swb_init(*a)
+            sk = (self.windowskin rescue nil)
+            Probe.log "WIN SpriteWindow_Base#init ##{n} DEPOIS windowskin=#{sk.class} (#{(sk.width rescue '?')}x#{(sk.height rescue '?')})"
+            r
+          end
+        end
+      end
+      Probe.log "WIN SpriteWindow_Base instrumentado OK"
+    rescue => e
+      Probe.log "WIN SpriteWindow_Base hook falhou: #{e.message}"
+    end
+  end
+
+  # Window_AdvancedTextPokemon#initialize: a janela de mensagem completa?
+  if Object.const_defined?(:Window_AdvancedTextPokemon)
+    begin
+      class Window_AdvancedTextPokemon
+        unless method_defined?(:__p_watp_init)
+          alias_method :__p_watp_init, :initialize
+          def initialize(*a)
+            Probe.log "WIN Window_AdvancedText#init ANTES text=#{(a[0].inspect[0,40] rescue '?')}"
+            r = __p_watp_init(*a)
+            Probe.log "WIN Window_AdvancedText#init DEPOIS OK (janela criada)"
+            r
+          end
+        end
+        # update: o loop da mensagem corre? mostrar estado interno (busy/waitcount)
+        unless method_defined?(:__p_watp_upd)
+          alias_method :__p_watp_upd, :update
+          def update(*a)
+            $p_watp_upd = ($p_watp_upd || 0) + 1
+            if $p_watp_upd <= 10 || ($p_watp_upd % 60 == 0)
+              busy = (self.busy? rescue '?')
+              wc   = (self.waitcount rescue (@waitcount rescue '?'))
+              txt  = ((@text || @display rescue nil)).to_s[0,30]
+              # leitura NAO-INVASIVA do input real (trigger? original, intacto)
+              use  = (Input.trigger?(Input::USE)  rescue '?')
+              back = (Input.trigger?(Input::BACK) rescue '?')
+              cpress = (Input.press?(Input::C) rescue '?')
+              Probe.log "WIN watp#update ##{$p_watp_upd} busy=#{busy} waitcount=#{wc} USE=#{use.inspect} BACK=#{back.inspect} C_press=#{cpress.inspect} txt=#{txt.inspect}"
+            end
+            __p_watp_upd(*a)
+          end
+        end
+      end
+      Probe.log "WIN Window_AdvancedTextPokemon instrumentado OK"
+    rescue => e
+      Probe.log "WIN Window_AdvancedText hook falhou: #{e.message}"
+    end
+  end
+
+  # INPUT: NAO instrumentamos Input.trigger? diretamente -- e' um metodo C e
+  # alias_method/define_method no singleton parte-o (todos os botoes passam a
+  # devolver 0/nil). Em vez disso, espiamos de forma NAO-INVASIVA: a cada vez
+  # que o jogo chama Input.trigger? para USE/BACK, queremos so saber se alguma
+  # vez devolve true. Fazemos isso lendo press?/trigger? a partir do nosso
+  # proprio update da janela (abaixo), sem substituir o metodo C.
+  #
+  # (bloco antigo removido: ele fazia alias :__p_trigger e partia o input.)
+
+  # pbMessage / pbMessageDisplay: o display de mensagem inicia e termina?
+  ["pbMessage", "pbMessageDisplay"].each do |mn|
+    begin
+      if Object.respond_to?(mn, true)
+        Object.class_eval do
+          alias_name = "__p_orig_#{mn}"
+          unless method_defined?(alias_name.to_sym)
+            alias_method alias_name.to_sym, mn.to_sym
+            define_method(mn.to_sym) do |*a, &b|
+              Probe.log "WIN #{mn} START"
+              r = send(alias_name.to_sym, *a, &b)
+              Probe.log "WIN #{mn} END"
+              r
+            end
+          end
+        end
+      end
+    rescue => e
+      Probe.log "WIN #{mn} hook falhou: #{e.message}"
+    end
+  end
+  Probe.log "WIN instrumentacao de mensagem completa"
+  # === /INSTRUMENTACAO DA JANELA DE MENSAGEM =================================
+rescue => e
+  begin; Probe.log "EV super-log setup FALHOU: #{e.class}: #{e.message}"; rescue; end
+end
