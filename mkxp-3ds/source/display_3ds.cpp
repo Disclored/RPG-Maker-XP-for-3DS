@@ -7,6 +7,25 @@ extern FILE *g_dbglog;
 #define TOP_W 400
 #define TOP_H 240
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ESCALA GLOBAL JOGO -> ECRA  (Opcao A: sem distorcao, centrado, barras laterais)
+ *
+ * O jogo desenha em coordenadas logicas de GAME_W x GAME_H (Settings::SCREEN_*).
+ * Este fan-game usa 512x384. O ecra de cima do 3DS e' 400x240.
+ * Para caber SEM distorcao nem cortes, usamos o menor fator de escala:
+ *   escala_altura = 240/384 = 0.625
+ *   escala_largura = 400/512 = 0.781  -> usamos 0.625 (o menor) para nada cortar
+ * Resultado: 512*0.625=320 de largura, 384*0.625=240 de altura.
+ *   -> 320x240 centrado: barra preta de (400-320)/2 = 40px de cada lado.
+ *
+ * Se algum dia mudares a resolucao do jogo, ajusta GAME_W/GAME_H e recalcula.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+#define GAME_W   512.0f
+#define GAME_H   384.0f
+#define DISP_SCALE  ( (float)TOP_H / GAME_H )                 /* 240/384 = 0.625 */
+#define DISP_OFF_X  ( ( (float)TOP_W - GAME_W * DISP_SCALE ) * 0.5f )  /* (400-320)/2 = 40 */
+#define DISP_OFF_Y  ( ( (float)TOP_H - GAME_H * DISP_SCALE ) * 0.5f )  /* (240-240)/2 = 0  */
+
 static C3D_RenderTarget* s_top    = nullptr;
 static C3D_RenderTarget* s_bottom = nullptr;
 
@@ -70,6 +89,25 @@ void display_3ds_begin_frame() {
     C2D_SceneBegin(s_top);
     s_blit_count   = 0;
     s_blit_skipped = 0;
+
+    /* ===== TESTE DE DIAGNOSTICO DO ECRA DE CIMA =============================
+     * Desenha quadrados de cor solida em coordenadas FIXAS e garantidamente
+     * dentro do ecra de cima (400x240). Serve para distinguir:
+     *  - Se VES os quadrados -> o display funciona; o ecra preto e' porque o
+     *    conteudo do jogo (tilemap 720x560, sprites) e' desenhado FORA da area
+     *    visivel ou com coordenadas/escala erradas (RMXP 640x480 vs 3DS 400x240).
+     *  - Se NAO ves os quadrados -> o problema e' o proprio display/apresentacao
+     *    do top screen (nada chega ao ecra).
+     * Para desligar depois: poe MKXP_DISPLAY_TEST a 0. */
+#ifndef MKXP_DISPLAY_TEST
+#define MKXP_DISPLAY_TEST 1
+#endif
+#if MKXP_DISPLAY_TEST
+    /* vermelho no canto sup-esq, verde ao centro, azul no canto inf-dir */
+    C2D_DrawRectSolid( 10.0f,  10.0f, 0.0f, 60.0f, 60.0f, C2D_Color32(255,  0,  0,255));
+    C2D_DrawRectSolid(170.0f,  90.0f, 0.0f, 60.0f, 60.0f, C2D_Color32(  0,255,  0,255));
+    C2D_DrawRectSolid(330.0f, 170.0f, 0.0f, 60.0f, 60.0f, C2D_Color32(  0,  0,255,255));
+#endif
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -262,6 +300,12 @@ void display_3ds_blit(DS3Texture* t,
     s_blit_count++;
     s_blit_total++;
 
+    /* ESCALA GLOBAL jogo(512x384) -> ecra(400x240). Ver constantes no topo. */
+    float fdx = dx * DISP_SCALE + DISP_OFF_X;
+    float fdy = dy * DISP_SCALE + DISP_OFF_Y;
+    float fdw = sw * DISP_SCALE;
+    float fdh = sh * DISP_SCALE;
+
     float tw = (float)t->tex.width;
     float th = (float)t->tex.height;
 
@@ -275,7 +319,7 @@ void display_3ds_blit(DS3Texture* t,
         u0, v_top, u1, v_bottom
     };
     C2D_Image img = { &t->tex, &sub };
-    C2D_DrawParams p = { {dx, dy, sw, sh}, {0.0f, 0.0f}, 0.5f, 0.0f };
+    C2D_DrawParams p = { {fdx, fdy, fdw, fdh}, {0.0f, 0.0f}, 0.5f, 0.0f };
 
     C2D_ImageTint tint;
     C2D_PlainImageTint(&tint, C2D_Color32f(1.0f, 1.0f, 1.0f, alpha), 1.0f);
@@ -315,6 +359,13 @@ void display_3ds_blit_ex(DS3Texture* t,
     s_blit_count++;
     s_blit_total++;
 
+    /* ESCALA GLOBAL: transformar coords do jogo (512x384) -> ecra (400x240).
+     * dx,dy,dw,dh vem em coordenadas logicas do jogo; aplicamos escala + offset. */
+    float fdx = dx * DISP_SCALE + DISP_OFF_X;
+    float fdy = dy * DISP_SCALE + DISP_OFF_Y;
+    float fdw = dw * DISP_SCALE;
+    float fdh = dh * DISP_SCALE;
+
     float tw = (float)t->tex.width;
     float th = (float)t->tex.height;
 
@@ -328,7 +379,7 @@ void display_3ds_blit_ex(DS3Texture* t,
         u0, v_top, u1, v_bottom
     };
     C2D_Image img = { &t->tex, &sub };
-    C2D_DrawParams p = { {dx, dy, dw, dh}, {0.0f, 0.0f}, 0.5f, 0.0f };
+    C2D_DrawParams p = { {fdx, fdy, fdw, fdh}, {0.0f, 0.0f}, 0.5f, 0.0f };
 
     C2D_ImageTint tint;
     C2D_PlainImageTint(&tint, C2D_Color32f(1.0f, 1.0f, 1.0f, alpha), 1.0f);
