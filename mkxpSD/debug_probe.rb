@@ -701,6 +701,24 @@ begin
       mi = ($game_system.map_interpreter rescue nil)
       Probe.log "EV START: map_interpreter=#{mi ? mi.class : 'nil'} running?=#{(mi.running? rescue '?')} main=#{(mi.instance_variable_get(:@main) rescue '?')}"
       Probe.log "EV START: switches=#{($game_switches.class rescue 'nil')} variables=#{($game_variables.class rescue 'nil')} self_switches=#{($game_self_switches.class rescue 'nil')} var[1]=#{($game_variables[1] rescue '?')}"
+
+      # ===== TESTE DE POSICAO DA CAMARA =====================================
+      # Hipotese: o conteudo do Map001 esta no canto inf-direito (tiles ~13-19,
+      # 10-14, onde estao os eventos QuickStartActivate@(19,14)). O jogador esta
+      # em (0,0) (canto vazio/preto) porque start_x/start_y vieram 0. A camara
+      # segue o jogador -> mostra so a zona preta. Forcamos o jogador para perto
+      # do conteudo e centramos a camara, UMA vez, para ver se o mapa aparece.
+      # Se aparecer, confirma-se a causa (posicao inicial errada).
+      unless $p_repos_done
+        $p_repos_done = true
+        if (TEST_REPOSITION rescue true)
+          tx, ty = 15, 12
+          ($game_player.moveto(tx, ty) rescue nil)
+          # centrar a camara no jogador (Game_Map#center existe no Essentials)
+          ($game_map.center(tx, ty) rescue nil)
+          Probe.log "EV START [REPOS-TEST] jogador->(#{tx},#{ty}) cam ox=#{($game_map.display_x rescue '?')} oy=#{($game_map.display_y rescue '?')} player@(#{$game_player.x rescue '?'},#{$game_player.y rescue '?'})"
+        end
+      end
     rescue => e
       Probe.log "EV START ERRO #{e.class}: #{e.message}"
     end

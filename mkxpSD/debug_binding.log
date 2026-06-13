@@ -13,6 +13,7 @@ binding_3ds_run: sdmc:/mkxp/game
 [FIX4] __rebind_bitmapwrapper_init__ registado em Kernel OK
 [marshal] load OK (971249 bytes): userdefs=0 tables=0 top_type=14
 [SCRIPTS] Loading 376 scripts
+[CACHE] cache de bytecode: sdmc:/mkxp/cache/
 [STUBS] rgss_stubs.rb loaded
 [STUBS] Regexp stub pre-carregado OK
 [STUBS] ios_compat_3ds.rb loaded
@@ -36,19 +37,137 @@ binding_3ds_run: sdmc:/mkxp/game
 [SKIP-PATCH] Compiler_MapsAndEvents
 [PATCH Main] loop do..end removido (177 bytes)
 [SCRIPTS] Loaded 376 scripts
-[SPR|INIT] #1 spr_init C++ chamado: sprite=0x908a3a8 g_sprites.size=1
-[SPR|SET_BMP] #1 sprite=0x908a3a8 bobj_type=20 DATA_PTR=0x8e48278 bmp=0x8e48278
+[marshal] load OK (930620 bytes): userdefs=0 tables=0 top_type=14
+[PLUGINS] 54 plugins a carregar
+[PLUGINS] plugin 'v19.1 Hotfixes' (3 scripts)
+[ERROR] plugin 'v19.1 Hotfixes' / Battle bug fixes.rb: NameError: undefined method 'pbGetMoveScoreFunctionCode' for class PokeBattle_AI
+  bt[0]: (unknown):0
+  bt[1]: (unknown):0
+[ERROR] plugin 'v19.1 Hotfixes' / Debug bug fixes.rb: NameError: undefined method 'compile_encounters' for class #<Class:Compiler>
+  bt[0]: (unknown):0
+  bt[1]: (unknown):0
+  bt[2]: (unknown):0
+[ERROR] plugin 'v19.1 Hotfixes' / Misc bug fixes.rb: SyntaxError: syntax error
+[PLUGINS] plugin 'Wild Drop Items' (1 scripts)
+[PLUGINS] plugin 'Water bubles' (1 scripts)
+[PLUGINS] plugin 'Voltseon's Trainer Generator' (3 scripts)
+[PLUGINS] plugin 'Voltseon's Pause Menu' (5 scripts)
+[PLUGINS] plugin 'Voltseon's A-Star Pathfinding' (1 scripts)
+[PLUGINS] plugin 'Trade Screen: DX' (1 scripts)
+[PLUGINS] plugin 'Luka's Scripting Utilities' (1 scripts)
+[ERROR] plugin 'Luka's Scripting Utilities' / script.rb: NameError: undefined method 'round' for class Numeric
+  bt[0]: (unknown):0
+  bt[1]: (unknown):0
+[PLUGINS] plugin 'Tileset Rearranger' (1 scripts)
+[PLUGINS] plugin 'Textbook' (1 scripts)
+[PLUGINS] plugin 'Terrain Tag Side Stairs' (1 scripts)
+[PLUGINS] plugin 'Spot Step Animation' (1 scripts)
+[PLUGINS] plugin 'Better Speed Up' (1 scripts)
+[PLUGINS] plugin 'Day-Care Checker Item' (1 scripts)
+[ERROR] plugin 'Day-Care Checker Item' / Script.rb: NoMethodError: undefined method 'defined?'
+  bt[0]: (unknown):0
+  bt[1]: (unknown):0
+  bt[2]: (unknown):0
+[PLUGINS] plugin 'Random Pokemon Selector' (1 scripts)
+[PLUGINS] plugin 'Quicksave' (1 scripts)
+[PLUGINS] plugin 'PokéSearch' (2 scripts)
+[PLUGINS] plugin 'Peti's Trainer Card' (1 scripts)
+[PLUGINS] plugin 'PE Terrain Step Sounds' (1 scripts)
+[PLUGINS] plugin 'Overworld Shadows EX' (1 scripts)
+[PLUGINS] plugin 'Near-Universal TMs' (1 scripts)
+[PLUGINS] plugin 'Name Window' (1 scripts)
+[PLUGINS] plugin 'Ultimate Move Tutor' (2 scripts)
+[PLUGINS] plugin 'Trade Expert' (2 scripts)
+[PLUGINS] plugin 'Marin's Scripting Utilities' (1 scripts)
+[ERROR] plugin 'Marin's Scripting Utilities' / script.rb: NameError: undefined method 'delete' for class #<Class:Dir>
+  bt[0]: (unknown):0
+  bt[1]: (unknown):0
+  bt[2]: (unknown):0
+[PLUGINS] plugin 'Marin's Map Exporter' (1 scripts)
+[PLUGINS] plugin 'Marin's Footprints' (1 scripts)
+[PLUGINS] plugin 'Modern Quest System + UI' (4 scripts)
+[PLUGINS] plugin 'Modular Title Screen' (9 scripts)
+[PLUGINS] plugin 'Item Find' (1 scripts)
+[PLUGINS] plugin 'Gender selection (style: S/M)' (4 scripts)
+[PLUGINS] SKIP 'Elite Battle: DX' (485 scripts) -- plugin partido, saltado p/ acelerar boot
+[PLUGINS] plugin 'Fly Animation by KleinStudio' (1 scripts)
+[PLUGINS] plugin 'Field moves usable by compatibility' (1 scripts)
+[PLUGINS] plugin 'Fancy Badges' (2 scripts)
+[PLUGINS] plugin 'Enhanced Jukebox' (2 scripts)
+[PLUGINS] plugin 'Encounter List UI (v19)' (1 scripts)
+[PLUGINS] plugin 'Following Pokemon EX' (18 scripts)
+[ERROR] plugin 'Following Pokemon EX' / 003_Dialogue_Specific.rb: NoMethodError: undefined method 'defined?'
+  bt[0]: (unknown):0
+[ERROR] plugin 'Following Pokemon EX' / Misc.rb: NoMethodError: undefined method '__followingpkmn__pbStartOver'
+  bt[0]: (unknown):0
+[ERROR] plugin 'Following Pokemon EX' / Sprite.rb: NameError: undefined method 'update' for class DependentEventSprites
+  bt[0]: (unknown):0
+  bt[1]: (unknown):0
+[ERROR] plugin 'Following Pokemon EX' / Animations.rb: NoMethodError: undefined method '__followingpkmn__pbHiddenMoveAnimation'
+  bt[0]: (unknown):0
+[ERROR] plugin 'Following Pokemon EX' / Compatibility.rb: NoMethodError: undefined method 'convert_files'
+  bt[0]: (unknown):0
+  bt[1]: (unknown):0
+[ERROR] plugin 'Following Pokemon EX' / Field Moves.rb: NoMethodError: undefined method '__followingpkmn__pbEndSurf'
+  bt[0]: (unknown):0
+[ERROR] plugin 'Following Pokemon EX' / Refresh.rb: NoMethodError: undefined method '__followingpkmn__pbDismountBike'
+  bt[0]: (unknown):0
+[ERROR] plugin 'Following Pokemon EX' / Sprite Renamer.rb: NoMethodError: undefined method 'convert_files'
+  bt[0]: (unknown):0
+  bt[1]: (unknown):0
+[PLUGINS] plugin 'EVs and IVs in Summary' (1 scripts)
+[PLUGINS] plugin 'EBDX Stat Boost Overlay' (1 scripts)
+[ERROR] plugin 'EBDX Stat Boost Overlay' / Script.rb: NameError: undefined method 'setUp' for class DataBoxEBDX
+  bt[0]: (unknown):0
+  bt[1]: (unknown):0
+[PLUGINS] plugin 'Generation 5 Door Zoom Animation' (1 scripts)
+[PLUGINS] plugin 'DiegoWT's Starter Selection' (2 scripts)
+[PLUGINS] plugin 'Set the Controls Screen' (1 scripts)
+[PLUGINS] plugin 'Clone Trainer (v19)' (1 scripts)
+[PLUGINS] plugin 'BluMascs Pokeventures (v19)' (3 scripts)
+[PLUGINS] plugin 'BerryPots for Essentials v19' (1 scripts)
+[PLUGINS] plugin 'Bag Screen w/interactable Party' (2 scripts)
+[PLUGINS] plugin 'BW Text Entry Scene' (2 scripts)
+[PLUGINS] plugin 'BW Location Signposts' (2 scripts)
+[PLUGINS] plugin 'Pokedex BW Style' (3 scripts)
+[PLUGINS] plugin 'BW Key Items' (1 scripts)
+[PLUGINS] plugin 'Auto Multi Save' (1 scripts)
+[PLUGINS] plugin 'Always inside Bushes' (1 scripts)
+[PLUGINS] plugin 'Advanced Pokédex' (1 scripts)
+[PLUGINS] cache: 50 hits (.mrb), 55 miss (texto)
+[PLUGINS] cache: 54 .mrb gerados AUTOMATICAMENTE no 3DS
+[PLUGINS] >> proxima corrida sera' rapida (sem BAT)
+[PLUGINS] concluido: 90 scripts OK, 15 falharam
+[SPR|INIT] #1 spr_init C++ chamado: sprite=0x89e46e8 g_sprites.size=1
+[SPR|SET_BMP] #1 sprite=0x89e46e8 bobj_type=20 DATA_PTR=0x8b47598 bmp=0x8b47598
 [SPR|SET_BMP]   bmp OK via resolve: 4x4 tex_dirty=1
 [PROBE] debug_probe.rb carregado
+[SMOKE] smoke_test.rb carregado (corre no Scene_DebugIntro)
 [BMP|REINIT] Bitmap MRB_TT_DATA + bmp_init rebound OK
 [BMP|REINIT] BitmapWrapper MRB_TT_DATA + bmp_init rebound OK
 [FIX3] Sprite#initialize re-bound para spr_init C++ OK (MRB_TT_DATA garantido)
 [REBIND] Graphics.update/freeze/transition re-bound OK
+[load_data] req='Data/Tilesets.rxdata' -> 'sdmc:/mkxp/game/Data/Tilesets.rxdata'
+[RXCACHE] MISS 'Data/Tilesets.rxdata' -> grava apos load
+[load_data] aberto (game, 1277986 bytes)
+[marshal] Table#1 reconstruido: x=4400 y=1 z=1 cells=4400 (buf=8820 bytes)
+[marshal] Table#2 reconstruido: x=4400 y=1 z=1 cells=4400 (buf=8820 bytes)
+[marshal] Table#3 reconstruido: x=4400 y=1 z=1 cells=4400 (buf=8820 bytes)
+[marshal] load OK (1277986 bytes): userdefs=153 tables=153 top_type=14
+[load_data] 'Data/Tilesets.rxdata' -> Array(len=52)
+[load_data]   [1] = RPG::Tileset
+[load_data]   [2] = RPG::Tileset
+[load_data]   [3] = RPG::Tileset
+[RXCACHE] gravado 'sdmc:/mkxp/cache/rxdata/Data_Tilesets.rxdata.1277986.0.mrx' (proxima corrida le da cache)
 [check_entry] globals forcados OK: $DEBUG=true $joiplay=true $MKXP=true
 [check_entry] Spriteset_Map patches OK
 [rand-fix] rand/oldRand redefinidos para __native_rand__ OK
-[MFD] [PRB] MISSING Object#dbg("[STUB] DependentEvents stub criado OK")
-[MFD] [PATCH] Object#method_missing universal OK
+[MFD] [FIX-INPUT] controlinput=0 -> Input nativo C++ ativo (override do plugin desligado)
+[MFD] [PATCH] Object#method_missing universal+SuperDebug OK
+[MFD] [PATCH] __dump_missing_methods__ disponivel OK
+[MFD] [INPUT] Input::F6..F9/CTRL/ALT garantidos OK
+[MFD] [FIX-INPUT2] Input.update reposto como no-op (poll vem de grph_update)
+[MFD] [FIX-INPUT3] Input.trigger?/press?/repeat?/release? -> C++ nativo direto
 [MFD] [MISSING_PATCH] Game_Map OK
 [MFD] [MISSING_PATCH] Game_Player OK
 [MFD] [MISSING_PATCH] Game_Character OK
@@ -72,6 +191,10 @@ binding_3ds_run: sdmc:/mkxp/game
 [MFD] [MISSING_PATCH] PokemonLoad_Scene OK
 [MFD] [MISSING_PATCH] Spriteset_Global OK
 [MFD] [MISSING_PATCH] Scene_DebugIntro OK
+[MFD] [MISSING-DET] Class#private_method_defined? cat=PREDICADO aridade=1 tipos=[Symbol] vals=[:__mkxp_orig_resolvebmp] bloco=nao ret=false
+[MFD] [WSKIN] pbResolveBitmap real registado em Object (orig_disponivel=nao)
+[MFD] [BMP] pbBitmap global real instalado (Object+Kernel)
+[MFD] [WSKIN] MessageConfig helper de fallback OK
 [MFD] [PATCH2] Game_Player direct methods OK
 [MFD] [PATCH2] Game_System direct methods OK
 [MFD] [PATCH2] Game_Temp direct methods OK
@@ -84,11 +207,14 @@ binding_3ds_run: sdmc:/mkxp/game
 [MFD] [PATCH] Scene_Map#update granular OK
 [MFD] [PATCH] Scene_Map#createSpritesets diagnostico OK
 [load_data] req='Data/regional_dexes.dat' -> 'sdmc:/mkxp/game/Data/regional_dexes.dat'
+[RXCACHE] MISS 'Data/regional_dexes.dat' -> grava apos load
 [load_data] aberto (game, 4093 bytes)
 [marshal] load OK (4093 bytes): userdefs=0 tables=0 top_type=14
 [load_data] 'Data/regional_dexes.dat' -> Array(len=1)
 [load_data]   [0] = Array
+[RXCACHE] gravado 'sdmc:/mkxp/cache/rxdata/Data_regional_dexes.dat.4093.0.mrx' (proxima corrida le da cache)
 [MFD] [INIT] $PokemonGlobal = PokemonGlobalMetadata.new OK
+[MFD] [MISSING-DET] Object#defined? cat=PREDICADO aridade=1 tipos=[Class] vals=[#<NDS::NullStub>] bloco=nao ret=false
 [MFD] [PATCH] RPG::Cache @cache inicializado OK
 [MFD] [PATCH] __force_bitmapwrapper_tt__ OK
 [MFD] [PATCH] __rebind_bitmapwrapper_init__ OK (pre-eval)
@@ -104,7 +230,7 @@ binding_3ds_run: sdmc:/mkxp/game
 [BMP|REINIT] BitmapWrapper MRB_TT_DATA + bmp_init rebound OK
 [FIX2] bitmapBindingReinit chamado antes do loop principal OK
 [binding] calling mainFunctionDebug loop
-[MFD] [MISSING] Class#instance_method(:initialize)
+[MFD] [MISSING-DET] Class#instance_method cat=NORMAL aridade=1 tipos=[Symbol] vals=[:initialize] bloco=nao ret=0
 [MFD] [BW-DIAG] BitmapWrapper#initialize arity=-1 owner=0
 [MFD] [BW-DIAG] BitmapWrapper.new(32,32) OK class=BitmapWrapper ptr=32
 [loop] calling mainFunctionDebug
@@ -112,689 +238,18 @@ binding_3ds_run: sdmc:/mkxp/game
 [MFD] [MFD] step2: PluginManager
 [MFD] [MFD] step3: Compiler
 [MFD] [MFD] step4: Game.initialize
-[MFD] [MFD] step5: Game.set_up_system
-[MFD] [MFD] step6: Graphics.update
-[MFD] [CHK] Graphics.class=Module
-[MFD] [MISSING] Proc#owner()
-[MFD] [CHK] Graphics.update owner=0
-[MFD] [CHK] Graphics.freeze owner=0
-[MFD] [CHK] calling Graphics.update
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=0 frozen=0
-[GFX|STATE|update-early] frame=0 frozen=0 freeze_count=0 transition_count=0 skipped=0 watchdog=off(0/600)
-[GFX|SCENE|update-early] $scene=NIL  ← PROBLEMA: sem cena activa
-[GFX|RENDER] frame 0 → begin_frame + sprites_draw_all + end_frame
-[DISPLAY|FRAME] begin #0 (tex_ok=0 tex_fail=0 blit_total=0)
-[SPR|DUMP] diag_frame=1 g_sprites=1 (disposed=1 invisible=0 no_bitmap=0 ready=0)
-[GFX|RENDER] frame 0 → sprites_draw_all fez 0 blits novos
-[GFX|WARN]   → ZERO blits! Sprites não registados ou todos invisíveis.
-[GFX|WARN]     Verificar: sprite.visible=true, sprite.bitmap!=nil, z correcto
-[GFX|SCENE|zero-blits] $scene=NIL  ← PROBLEMA: sem cena activa
-[DISPLAY|FRAME] end #1: blits=0 skipped=0
-[DISPLAY|BLACK] frame 1: ecrã preto — ZERO sprites desenhados
-[DISPLAY|BLACK]   Causas possíveis:
-[DISPLAY|BLACK]     1. sprites_draw_all lista está vazia (sem sprites registados)
-[DISPLAY|BLACK]     2. todos os sprites têm visible=false
-[DISPLAY|BLACK]     3. todos os sprites têm bitmap=nil
-[DISPLAY|BLACK]     4. Tilemap não usa o sistema de sprites (render separado?)
-[MFD] [CHK] returned from Graphics.update
-[MFD] [MFD] step7: Graphics.freeze
-[GFX|ENTER] grph_freeze entrou
-[GFX|FREEZE] freeze #1 chamado no frame 1
-[GFX|SCENE|freeze] $scene=NIL  ← PROBLEMA: sem cena activa
-[GFX|FREEZE]   → ecrã ficará preto até Graphics.transition() ser chamado!
-[MFD] [MFD] step8: pbCallTitle
-[MFD] [PRB] INIT Scene_DebugIntro()
-[MFD] [PRB] INIT Scene_DebugIntro OK
-[MFD] [MFD] step8 done: $scene=Scene_DebugIntro
-[MFD] [MFD] entering scene loop: Scene_DebugIntro
-[MFD] [MFD] scene.main start: Scene_DebugIntro
-[GFX|TRANSITION] transition #1 chamado no frame 1 (estava frozen=1, skipped=0 frames)
-[GFX|SCENE|transition] $scene=Scene_DebugIntro
-[MFD] [DebugIntro] chamada #1
-[MFD] [DebugIntro] bypass: setting $scene = Scene_Map
-[GFX|TRANSITION] transition #2 chamado no frame 1 (estava frozen=0, skipped=0 frames)
-[GFX|SCENE|transition] $scene=Scene_DebugIntro
-[GFX|TRANSITION]   AVISO: transition() chamado mas frozen já era false!
-[MFD] [DebugIntro] init step A: SaveData.load_new_game_values
-[MFD] [DebugIntro] init step A OK: $game_player=NilClass
-[MFD] [DebugIntro] init step B: PokemonMapFactory
-[load_data] req='Data/Map001.rxdata' -> 'sdmc:/mkxp/game/Data/Map001.rxdata'
-[load_data] aberto (game, 15007 bytes)
-[marshal] Table#1 reconstruido: x=20 y=15 z=3 cells=900 (buf=1820 bytes)
-[marshal] load OK (15007 bytes): userdefs=3 tables=1 top_type=8
-[load_data] 'Data/Map001.rxdata' -> RPG::Map
-[MFD] [MISSING] NilClass#tileset_name()
-[MFD] [MISSING] NilClass#autotile_names()
-[MFD] [MISSING] NilClass#panorama_name()
-[MFD] [MISSING] NilClass#panorama_hue()
-[MFD] [MISSING] NilClass#fog_name()
-[MFD] [MISSING] NilClass#fog_hue()
-[MFD] [MISSING] NilClass#fog_opacity()
-[MFD] [MISSING] NilClass#fog_blend_type()
-[MFD] [MISSING] NilClass#fog_zoom()
-[MFD] [MISSING] NilClass#fog_sx()
-[MFD] [MISSING] NilClass#fog_sy()
-[MFD] [MISSING] NilClass#battleback_name()
-[MFD] [MISSING] NilClass#passages()
-[MFD] [MISSING] NilClass#priorities()
-[MFD] [MISSING] NilClass#terrain_tags()
-[MFD] [MISSING] Integer#[](0)
-[load_data] req='Data/map_connections.dat' -> 'sdmc:/mkxp/game/Data/map_connections.dat'
-[load_data] aberto (game, 244 bytes)
-[marshal] load OK (244 bytes): userdefs=0 tables=0 top_type=14
-[load_data] 'Data/map_connections.dat' -> Array(len=9)
-[load_data]   [0] = Array
-[load_data]   [1] = Array
-[load_data]   [2] = Array
-[load_data]   [3] = Array
-[load_data] req='Data/Map194.rxdata' -> 'sdmc:/mkxp/game/Data/Map194.rxdata'
-[load_data] aberto (game, 128828 bytes)
-[marshal] Table#1 reconstruido: x=86 y=85 z=3 cells=21930 (buf=43880 bytes)
-[marshal] load OK (128828 bytes): userdefs=22 tables=1 top_type=8
-[load_data] 'Data/Map194.rxdata' -> RPG::Map
-[load_data] req='Data/Map011.rxdata' -> 'sdmc:/mkxp/game/Data/Map011.rxdata'
-[load_data] aberto (game, 51315 bytes)
-[marshal] Table#1 reconstruido: x=80 y=55 z=3 cells=13200 (buf=26420 bytes)
-[marshal] load OK (51315 bytes): userdefs=3 tables=1 top_type=8
-[load_data] 'Data/Map011.rxdata' -> RPG::Map
-[load_data] req='Data/Map056.rxdata' -> 'sdmc:/mkxp/game/Data/Map056.rxdata'
-[load_data] aberto (game, 79247 bytes)
-[marshal] Table#1 reconstruido: x=70 y=70 z=3 cells=14700 (buf=29420 bytes)
-[marshal] load OK (79247 bytes): userdefs=5 tables=1 top_type=8
-[load_data] 'Data/Map056.rxdata' -> RPG::Map
-[load_data] req='Data/Map012.rxdata' -> 'sdmc:/mkxp/game/Data/Map012.rxdata'
-[load_data] aberto (game, 59310 bytes)
-[marshal] Table#1 reconstruido: x=100 y=64 z=3 cells=19200 (buf=38420 bytes)
-[marshal] load OK (59310 bytes): userdefs=1 tables=1 top_type=8
-[load_data] 'Data/Map012.rxdata' -> RPG::Map
-[load_data] req='Data/Map139.rxdata' -> 'sdmc:/mkxp/game/Data/Map139.rxdata'
-[load_data] aberto (game, 94570 bytes)
-[marshal] Table#1 reconstruido: x=60 y=90 z=3 cells=16200 (buf=32420 bytes)
-[marshal] load OK (94570 bytes): userdefs=13 tables=1 top_type=8
-[load_data] 'Data/Map139.rxdata' -> RPG::Map
-[load_data] req='Data/Map043.rxdata' -> 'sdmc:/mkxp/game/Data/Map043.rxdata'
-[load_data] aberto (game, 93436 bytes)
-[marshal] Table#1 reconstruido: x=65 y=70 z=3 cells=13650 (buf=27320 bytes)
-[marshal] load OK (93436 bytes): userdefs=43 tables=1 top_type=8
-[load_data] 'Data/Map043.rxdata' -> RPG::Map
-[load_data] req='Data/Map032.rxdata' -> 'sdmc:/mkxp/game/Data/Map032.rxdata'
-[load_data] aberto (game, 40984 bytes)
-[marshal] Table#1 reconstruido: x=52 y=67 z=3 cells=10452 (buf=20924 bytes)
-[marshal] load OK (40984 bytes): userdefs=9 tables=1 top_type=8
-[load_data] 'Data/Map032.rxdata' -> RPG::Map
-[load_data] req='Data/Map131.rxdata' -> 'sdmc:/mkxp/game/Data/Map131.rxdata'
-[load_data] aberto (game, 31974 bytes)
-[marshal] Table#1 reconstruido: x=64 y=53 z=3 cells=10176 (buf=20372 bytes)
-[marshal] load OK (31974 bytes): userdefs=3 tables=1 top_type=8
-[load_data] 'Data/Map131.rxdata' -> RPG::Map
-[load_data] req='Data/Map092.rxdata' -> 'sdmc:/mkxp/game/Data/Map092.rxdata'
-[load_data] aberto (game, 69776 bytes)
-[marshal] Table#1 reconstruido: x=40 y=92 z=3 cells=11040 (buf=22100 bytes)
-[marshal] load OK (69776 bytes): userdefs=9 tables=1 top_type=8
-[load_data] 'Data/Map092.rxdata' -> RPG::Map
-[load_data] req='Data/Map085.rxdata' -> 'sdmc:/mkxp/game/Data/Map085.rxdata'
-[load_data] aberto (game, 97708 bytes)
-[marshal] Table#1 reconstruido: x=72 y=50 z=3 cells=10800 (buf=21620 bytes)
-[marshal] load OK (97708 bytes): userdefs=7 tables=1 top_type=8
-[load_data] 'Data/Map085.rxdata' -> RPG::Map
-[load_data] req='Data/Map111.rxdata' -> 'sdmc:/mkxp/game/Data/Map111.rxdata'
-[load_data] aberto (game, 59407 bytes)
-[marshal] Table#1 reconstruido: x=60 y=56 z=3 cells=10080 (buf=20180 bytes)
-[marshal] load OK (59407 bytes): userdefs=5 tables=1 top_type=8
-[load_data] 'Data/Map111.rxdata' -> RPG::Map
-[load_data] req='Data/Map118.rxdata' -> 'sdmc:/mkxp/game/Data/Map118.rxdata'
-[load_data] aberto (game, 81610 bytes)
-[marshal] Table#1 reconstruido: x=69 y=99 z=3 cells=20493 (buf=41006 bytes)
-[marshal] load OK (81610 bytes): userdefs=7 tables=1 top_type=8
-[load_data] 'Data/Map118.rxdata' -> RPG::Map
-[load_data] req='Data/Map190.rxdata' -> 'sdmc:/mkxp/game/Data/Map190.rxdata'
-[load_data] aberto (game, 63040 bytes)
-[marshal] Table#1 reconstruido: x=79 y=63 z=3 cells=14931 (buf=29882 bytes)
-[marshal] load OK (63040 bytes): userdefs=9 tables=1 top_type=8
-[load_data] 'Data/Map190.rxdata' -> RPG::Map
-[load_data] req='Data/Map145.rxdata' -> 'sdmc:/mkxp/game/Data/Map145.rxdata'
-[load_data] aberto (game, 97986 bytes)
-[marshal] Table#1 reconstruido: x=76 y=60 z=3 cells=13680 (buf=27380 bytes)
-[marshal] load OK (97986 bytes): userdefs=11 tables=1 top_type=8
-[load_data] 'Data/Map145.rxdata' -> RPG::Map
-[load_data] req='Data/MapInfos.rxdata' -> 'sdmc:/mkxp/game/Data/MapInfos.rxdata'
-[load_data] aberto (game, 20754 bytes)
-[marshal] load OK (20754 bytes): userdefs=0 tables=0 top_type=15
-[load_data] 'Data/MapInfos.rxdata' -> Hash
-[MFD] [DebugIntro] PokemonMapFactory.new OK
-[MFD] [MAP] map_id=1
-[MFD] [MISSING] Game_Map#defined?(#<RPG::Map>)
-[MFD] [MAP] tileset_id=1
-[MFD] [MAP] tileset_name=''
-[MFD] [MAP] data=Table
-[MFD] [MAP] @map=RPG::Map
-[MFD] [MAP] @map.tileset_id=4
-[MFD] [MAP] data_tilesets[1]=RPG::Tileset
-[MFD] [MAP] data_tilesets[1].tileset_name=''
-[MFD] [MAP] $game_map class=Game_Map
-[MFD] [DebugIntro] init step C: game_player moveto
-[MFD] [DebugIntro] init step D: PokemonEncounters
-[MFD] [DebugIntro] PokemonEncounters OK
-[MFD] [DebugIntro] game_player: Game_Player.new OK
-[MFD] [DebugIntro] game_temp: Game_Temp.new OK
-[MFD] [PRB] INIT Scene_Map()
-[MFD] [PRB] INIT Scene_Map OK
-[MFD] [DebugIntro] Scene_Map.new OK
-[MFD] [DebugIntro] success
-[MFD] [MFD] scene.main done: Scene_DebugIntro -> $scene=Scene_Map
-[MFD] [MFD] scene.main start: Scene_Map
-[GFX|TRANSITION] transition #3 chamado no frame 1 (estava frozen=0, skipped=0 frames)
-[GFX|SCENE|transition] $scene=Scene_Map
-[GFX|TRANSITION]   AVISO: transition() chamado mas frozen já era false!
-[MFD] [Scene_Map] main: iniciando (watchdog C++ activado)
-[MFD] [Scene_Map] $game_player real=true, class=Game_Player
-[MFD] [Scene_Map] Viewport=OK
-[MFD] [Scene_Map] Tilemap=OK
-[MFD] [Scene_Map] Plane=OK
-[MFD] [Scene_Map] CustomTilemap=OK
-[MFD] [Scene_Map] Spriteset_Map init_patched=true
-[MFD] [Scene_Map] Viewport.new(0,0,1,1) OK: Viewport
-[WD] watchdog activado max=600 frames
-[MFD] [createSpritesets] $MapFactory=PokemonMapFactory
-[MFD] [createSpritesets] $game_map=Game_Map
-[MFD] [createSpritesets] $MapFactory.maps=Array(1)
-[MFD] [PRB] INIT Spriteset_Global()
-[MFD] [PRB] INIT Sprite_Character(#<Viewport>, #<Game_Player>)
-[SPR|INIT] #2 spr_init C++ chamado: sprite=0x8e925d0 g_sprites.size=2
-[MFD] [PRB] INIT Sprite_Reflection(#<Sprite_Character>, #<Game_Player>, #<Viewport>)
-[SPR|INIT] #3 spr_init C++ chamado: sprite=0x938d560 g_sprites.size=3
-[MFD] [MISSING] NilClass#width()
-[MFD] [MISSING] NilClass#height()
-[SPR|SET_BMP] #2 sprite=0x938d560 bobj_type=-1 DATA_PTR=0x0 bmp=0x0
-[MFD] [PRB] INIT Sprite_Reflection OK
-[MFD] [PRB] INIT Sprite_SurfBase(#<Sprite_Character>, #<Game_Player>, #<Viewport>)
-[TEX|CREATE] #1: src=256x256 → POT=256x256 (256.0KB VRAM)
-[TEX|CREATE] #1 OK valid=true total_ok=1 total_fail=0
-[TEX|CREATE] #2: src=256x256 → POT=256x256 (256.0KB VRAM)
-[TEX|CREATE] #2 OK valid=true total_ok=2 total_fail=0
-[MFD] [PRB] INIT Sprite_SurfBase OK
-[SPR|SET_BMP] #3 sprite=0x8e925d0 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[MFD] [MISSING] NilClass#set(0,0,8,8)
-[SPR|SET_BMP] #4 sprite=0x938d560 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[MFD] [PRB] INIT Sprite_Character OK
-[SPR|SET_BMP] #5 sprite=0x8e925d0 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[SPR|SET_BMP] #6 sprite=0x938d560 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[MFD] [PRB] INIT Spriteset_Global OK
-[MFD] [Spriteset_Map] initialize args=[#<Game_Map>]
-[MFD] [Spriteset_Map] initialize: iniciando
-[MFD] [PRB] INIT Spriteset_Map(#<Game_Map>)
-[SPR|INIT] #4 spr_init C++ chamado: sprite=0x9394d98 g_sprites.size=4
-[SPR|SET_BMP] #7 sprite=0x9394d98 bobj_type=20 DATA_PTR=0x9395168 bmp=0x9395168
-[SPR|SET_BMP]   bmp OK via resolve: 720x560 tex_dirty=1
-[MFD] [BMP] pbGetTileset: nome vazio -> fallback 32x32
-[MFD] [BMP] pbGetAutotile: tentando 'Graphics/Autotiles/0'
-[TEX|CREATE] #3: src=32x32 → POT=32x32 (4.0KB VRAM)
-[TEX|CREATE] #3 OK valid=true total_ok=3 total_fail=0
-[MFD] [BMP] pbGetAutotile('0') -> 32x32
-[MFD] [BMP] pbGetAutotile: tentando 'Graphics/Autotiles/0'
-[TEX|CREATE] #4: src=32x32 → POT=32x32 (4.0KB VRAM)
-[TEX|CREATE] #4 OK valid=true total_ok=4 total_fail=0
-[MFD] [BMP] pbGetAutotile('0') -> 32x32
-[MFD] [BMP] pbGetAutotile: tentando 'Graphics/Autotiles/0'
-[TEX|CREATE] #5: src=32x32 → POT=32x32 (4.0KB VRAM)
-[TEX|CREATE] #5 OK valid=true total_ok=5 total_fail=0
-[MFD] [BMP] pbGetAutotile('0') -> 32x32
-[MFD] [BMP] pbGetAutotile: tentando 'Graphics/Autotiles/0'
-[TEX|CREATE] #6: src=32x32 → POT=32x32 (4.0KB VRAM)
-[TEX|CREATE] #6 OK valid=true total_ok=6 total_fail=0
-[MFD] [BMP] pbGetAutotile('0') -> 32x32
-[MFD] [BMP] pbGetAutotile: tentando 'Graphics/Autotiles/0'
-[TEX|CREATE] #7: src=32x32 → POT=32x32 (4.0KB VRAM)
-[TEX|CREATE] #7 OK valid=true total_ok=7 total_fail=0
-[MFD] [BMP] pbGetAutotile('0') -> 32x32
-[MFD] [BMP] pbGetAutotile: tentando 'Graphics/Autotiles/0'
-[TEX|CREATE] #8: src=32x32 → POT=32x32 (4.0KB VRAM)
-[TEX|CREATE] #8 OK valid=true total_ok=8 total_fail=0
-[MFD] [BMP] pbGetAutotile('0') -> 32x32
-[MFD] [BMP] pbGetAutotile: tentando 'Graphics/Autotiles/0'
-[TEX|CREATE] #9: src=32x32 → POT=32x32 (4.0KB VRAM)
-[TEX|CREATE] #9 OK valid=true total_ok=9 total_fail=0
-[MFD] [BMP] pbGetAutotile('0') -> 32x32
-[MFD] [PRB] INIT Sprite_Character(#<Viewport>, #<Game_Event>)
-[SPR|INIT] #5 spr_init C++ chamado: sprite=0x954fb90 g_sprites.size=5
-[SPR|SET_BMP] #8 sprite=0x954fb90 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[MFD] [PRB] INIT Sprite_Character OK
-[MFD] [PRB] INIT Sprite_Character(#<Viewport>, #<Game_Event>)
-[SPR|INIT] #6 spr_init C++ chamado: sprite=0x80dbcc0 g_sprites.size=6
-[MFD] [PRB] INIT Sprite_Character OK
-[MFD] [PRB] INIT Sprite_Character(#<Viewport>, #<Game_Event>)
-[SPR|INIT] #7 spr_init C++ chamado: sprite=0x8b141f8 g_sprites.size=7
-[SPR|SET_BMP] #9 sprite=0x8b141f8 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[MFD] [PRB] INIT Sprite_Character OK
-[MFD] [PRB] INIT Sprite_Character(#<Viewport>, #<Game_Event>)
-[SPR|INIT] #8 spr_init C++ chamado: sprite=0x8a744f0 g_sprites.size=8
-[SPR|SET_BMP] #10 sprite=0x8a744f0 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[MFD] [PRB] INIT Sprite_Character OK
-[MFD] [PRB] INIT Sprite_Character(#<Viewport>, #<Game_Event>)
-[SPR|INIT] #9 spr_init C++ chamado: sprite=0x938d0b0 g_sprites.size=9
-[SPR|SET_BMP] #11 sprite=0x938d0b0 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[MFD] [PRB] INIT Sprite_Character OK
-[SPR|SET_BMP] #12 sprite=0x954fb90 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[SPR|SET_BMP] #13 sprite=0x8b141f8 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[SPR|SET_BMP] #14 sprite=0x8a744f0 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[SPR|SET_BMP] #15 sprite=0x938d0b0 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[MFD] [PRB] INIT Spriteset_Map OK
-[MFD] [Spriteset_Map] initialize: OK
-[MFD] [Spriteset_Map] character_sprites=5 com_bitmap=4
-[MFD] [Spriteset_Map] @tilemap=TilemapLoader
-[MFD] [Spriteset_Map] tileset=BitmapWrapper 32x32
-[MFD] [Spriteset_Map] $game_map.events=5
-[SPR|SET_BMP] #16 sprite=0x954fb90 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[SPR|SET_BMP] #17 sprite=0x8b141f8 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[SPR|SET_BMP] #18 sprite=0x8a744f0 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[SPR|SET_BMP] #19 sprite=0x938d0b0 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[SPR|SET_BMP] #20 sprite=0x8e925d0 bobj_type=20 DATA_PTR=0x802b140 bmp=0x802b140
-[SPR|SET_BMP]   bmp OK via resolve: 32x32 tex_dirty=1
-[MFD] [createSpritesets] OK: @spritesets=Hash(1)
-[MFD] [createSpritesets] @spritesetGlobal=Spriteset_Global
-[GFX|TRANSITION] transition #4 chamado no frame 1 (estava frozen=0, skipped=0 frames)
-[GFX|SCENE|transition] $scene=Scene_Map
-[GFX|TRANSITION]   AVISO: transition() chamado mas frozen já era false!
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=1 frozen=0
-[GFX|STATE|update-early] frame=1 frozen=0 freeze_count=1 transition_count=4 skipped=0 watchdog=ON(0/600)
-[GFX|SCENE|update-early] $scene=Scene_Map
-[GFX|RENDER] frame 1 → begin_frame + sprites_draw_all + end_frame
-[DISPLAY|FRAME] begin #1 (tex_ok=9 tex_fail=0 blit_total=0)
-[SPR|DUMP] diag_frame=2 g_sprites=9 (disposed=1 invisible=0 no_bitmap=1 ready=7)
-[TEX|CREATE] #10: src=32x32 → POT=32x32 (4.0KB VRAM)
-[TEX|CREATE] #10 OK valid=true total_ok=10 total_fail=0
-[GFX|RENDER] frame 1 → sprites_draw_all fez 7 blits novos
-[DISPLAY|FRAME] end #2: blits=7 skipped=0
-[DISPLAY|FRAME] frame 2 OK — 7 sprites desenhados
-[MFD] [SM#update] chamada #1
-[MFD] [SM#update]   to_title=false
-[MFD] [SM#update]   player_transferring=false
-[MFD] [SM#update]   transition_processing=false
-[MFD] [SM#update]   @spritesets=Hash(1)
-[MFD] [SM#update]   @spritesetGlobal=Spriteset_Global
-[MFD] [SM#update]   $MapFactory=PokemonMapFactory
-[MFD] [SM#update]   $scene=Scene_Map
-[MFD] [SM#update] __update_orig_diag__ OK #1
-[MFD] [SM#update] update completo #1
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=2 frozen=0
-[GFX|STATE|update-early] frame=2 frozen=0 freeze_count=1 transition_count=4 skipped=0 watchdog=ON(1/600)
-[GFX|SCENE|update-early] $scene=Scene_Map
-[GFX|RENDER] frame 2 → begin_frame + sprites_draw_all + end_frame
-[DISPLAY|FRAME] begin #2 (tex_ok=11 tex_fail=0 blit_total=7)
-[SPR|DUMP] diag_frame=3 g_sprites=9 (disposed=1 invisible=0 no_bitmap=1 ready=7)
-[GFX|RENDER] frame 2 → sprites_draw_all fez 7 blits novos
-[DISPLAY|FRAME] end #3: blits=7 skipped=0
-[DISPLAY|FRAME] frame 3 OK — 7 sprites desenhados
-[MFD] [SM#update] chamada #2
-[MFD] [SM#update]   to_title=false
-[MFD] [SM#update]   player_transferring=false
-[MFD] [SM#update]   transition_processing=false
-[MFD] [SM#update]   @spritesets=Hash(1)
-[MFD] [SM#update]   @spritesetGlobal=Spriteset_Global
-[MFD] [SM#update]   $MapFactory=PokemonMapFactory
-[MFD] [SM#update]   $scene=Scene_Map
-[MFD] [SM#update] __update_orig_diag__ OK #2
-[MFD] [SM#update] update completo #2
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=3 frozen=0
-[SPR|DUMP] diag_frame=4 g_sprites=9 (disposed=1 invisible=0 no_bitmap=1 ready=7)
-[MFD] [SM#update] chamada #3
-[MFD] [SM#update]   to_title=false
-[MFD] [SM#update]   player_transferring=false
-[MFD] [SM#update]   transition_processing=false
-[MFD] [SM#update]   @spritesets=Hash(1)
-[MFD] [SM#update]   @spritesetGlobal=Spriteset_Global
-[MFD] [SM#update]   $MapFactory=PokemonMapFactory
-[MFD] [SM#update]   $scene=Scene_Map
-[MFD] [SM#update] __update_orig_diag__ OK #3
-[MFD] [SM#update] update completo #3
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=4 frozen=0
-[SPR|DUMP] diag_frame=5 g_sprites=9 (disposed=1 invisible=0 no_bitmap=1 ready=7)
-[MFD] [SM#update] chamada #4
-[MFD] [SM#update]   to_title=false
-[MFD] [SM#update]   player_transferring=false
-[MFD] [SM#update]   transition_processing=false
-[MFD] [SM#update]   @spritesets=Hash(1)
-[MFD] [SM#update]   @spritesetGlobal=Spriteset_Global
-[MFD] [SM#update]   $MapFactory=PokemonMapFactory
-[MFD] [SM#update]   $scene=Scene_Map
-[MFD] [SM#update] __update_orig_diag__ OK #4
-[MFD] [SM#update] update completo #4
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=5 frozen=0
-[SPR|DUMP] diag_frame=6 g_sprites=9 (disposed=1 invisible=0 no_bitmap=1 ready=7)
-[MFD] [SM#update] chamada #5
-[MFD] [SM#update]   to_title=false
-[MFD] [SM#update]   player_transferring=false
-[MFD] [SM#update]   transition_processing=false
-[MFD] [SM#update]   @spritesets=Hash(1)
-[MFD] [SM#update]   @spritesetGlobal=Spriteset_Global
-[MFD] [SM#update]   $MapFactory=PokemonMapFactory
-[MFD] [SM#update]   $scene=Scene_Map
-[MFD] [SM#update] __update_orig_diag__ OK #5
-[MFD] [SM#update] update completo #5
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=6 frozen=0
-[SPR|DUMP] diag_frame=7 g_sprites=9 (disposed=1 invisible=0 no_bitmap=1 ready=7)
-[MFD] [SM#update] chamada #6
-[MFD] [SM#update]   to_title=false
-[MFD] [SM#update]   player_transferring=false
-[MFD] [SM#update]   transition_processing=false
-[MFD] [SM#update]   @spritesets=Hash(1)
-[MFD] [SM#update]   @spritesetGlobal=Spriteset_Global
-[MFD] [SM#update]   $MapFactory=PokemonMapFactory
-[MFD] [SM#update]   $scene=Scene_Map
-[MFD] [SM#update] __update_orig_diag__ OK #6
-[MFD] [SM#update] update completo #6
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=7 frozen=0
-[SPR|DUMP] diag_frame=8 g_sprites=9 (disposed=1 invisible=0 no_bitmap=1 ready=7)
-[MFD] [SM#update] chamada #7
-[MFD] [SM#update]   to_title=false
-[MFD] [SM#update]   player_transferring=false
-[MFD] [SM#update]   transition_processing=false
-[MFD] [SM#update]   @spritesets=Hash(1)
-[MFD] [SM#update]   @spritesetGlobal=Spriteset_Global
-[MFD] [SM#update]   $MapFactory=PokemonMapFactory
-[MFD] [SM#update]   $scene=Scene_Map
-[MFD] [SM#update] __update_orig_diag__ OK #7
-[MFD] [SM#update] update completo #7
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=8 frozen=0
-[SPR|DUMP] diag_frame=9 g_sprites=9 (disposed=1 invisible=0 no_bitmap=1 ready=7)
-[MFD] [SM#update] chamada #8
-[MFD] [SM#update]   to_title=false
-[MFD] [SM#update]   player_transferring=false
-[MFD] [SM#update]   transition_processing=false
-[MFD] [SM#update]   @spritesets=Hash(1)
-[MFD] [SM#update]   @spritesetGlobal=Spriteset_Global
-[MFD] [SM#update]   $MapFactory=PokemonMapFactory
-[MFD] [SM#update]   $scene=Scene_Map
-[MFD] [SM#update] __update_orig_diag__ OK #8
-[MFD] [SM#update] update completo #8
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=9 frozen=0
-[SPR|DUMP] diag_frame=10 g_sprites=9 (disposed=1 invisible=0 no_bitmap=1 ready=7)
-[MFD] [SM#update] chamada #9
-[MFD] [SM#update]   to_title=false
-[MFD] [SM#update]   player_transferring=false
-[MFD] [SM#update]   transition_processing=false
-[MFD] [SM#update]   @spritesets=Hash(1)
-[MFD] [SM#update]   @spritesetGlobal=Spriteset_Global
-[MFD] [SM#update]   $MapFactory=PokemonMapFactory
-[MFD] [SM#update]   $scene=Scene_Map
-[MFD] [SM#update] __update_orig_diag__ OK #9
-[MFD] [SM#update] update completo #9
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=10 frozen=0
-[MFD] [SM#update] chamada #10
-[MFD] [SM#update]   to_title=false
-[MFD] [SM#update]   player_transferring=false
-[MFD] [SM#update]   transition_processing=false
-[MFD] [SM#update]   @spritesets=Hash(1)
-[MFD] [SM#update]   @spritesetGlobal=Spriteset_Global
-[MFD] [SM#update]   $MapFactory=PokemonMapFactory
-[MFD] [SM#update]   $scene=Scene_Map
-[MFD] [SM#update] __update_orig_diag__ OK #10
-[MFD] [SM#update] update completo #10
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=11 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=12 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=13 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=14 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=15 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=16 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=17 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=18 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=19 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=20 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=21 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=22 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=23 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=24 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=25 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=26 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=27 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=28 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=29 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=30 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=31 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=32 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=33 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=34 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=35 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=36 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=37 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=38 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=39 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=40 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=41 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=42 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=43 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=44 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=45 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=46 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=47 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=48 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=49 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=50 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=51 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=52 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=53 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=54 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=55 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=56 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=57 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=58 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=59 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=60 frozen=0
-[WD] frame 60/600 frozen=0
-[GFX|SCENE|watchdog] $scene=Scene_Map
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=61 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=62 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=63 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=64 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=65 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=66 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=67 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=68 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=69 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=70 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=71 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=72 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=73 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=74 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=75 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=76 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=77 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=78 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=79 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=80 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=81 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=82 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=83 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=84 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=85 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=86 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=87 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=88 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=89 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=90 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=91 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=92 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=93 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=94 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=95 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=96 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=97 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=98 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=99 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=100 frozen=0
-[MFD] [SM#update] heartbeat #100 $scene=Scene_Map
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=101 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=102 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=103 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=104 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=105 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=106 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=107 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=108 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=109 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=110 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=111 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=112 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=113 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=114 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=115 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=116 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=117 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=118 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=119 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=120 frozen=0
-[WD] frame 120/600 frozen=0
-[GFX|SCENE|watchdog] $scene=Scene_Map
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=121 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=122 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=123 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=124 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=125 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=126 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=127 frozen=0
-[GFX|ENTER] grph_update entrou
-[GFX] grph_update CALLED frame=128 frozen=0
+[load_data] req='Data/Animations.rxdata' -> 'sdmc:/mkxp/game/Data/Animations.rxdata'
+[RXCACHE] MISS 'Data/Animations.rxdata' -> grava apos load
+[load_data] aberto (game, 43441 bytes)
+[marshal] Table#1 reconstruido: x=1 y=8 z=1 cells=8 (buf=36 bytes)
+[marshal] Table#2 reconstruido: x=1 y=8 z=1 cells=8 (buf=36 bytes)
+[marshal] Table#3 reconstruido: x=1 y=8 z=1 cells=8 (buf=36 bytes)
+[marshal] load OK (43441 bytes): userdefs=689 tables=667 top_type=14
+[load_data] 'Data/Animations.rxdata' -> Array(len=61)
+[load_data]   [1] = RPG::Animation
+[load_data]   [2] = RPG::Animation
+[load_data]   [3] = RPG::Animation
+[RXCACHE] gravado 'sdmc:/mkxp/cache/rxdata/Data_Animations.rxdata.43441.0.mrx' (proxima corrida le da cache)
+[load_data] req='Data/Tilesets.rxdata' -> 'sdmc:/mkxp/game/Data/Tilesets.rxdata'
+[RXCACHE] HIT 'Data/Tilesets.rxdata'
+[marshal] load OK (1277357 bytes): userdefs=0 tables=0 top_type=14
