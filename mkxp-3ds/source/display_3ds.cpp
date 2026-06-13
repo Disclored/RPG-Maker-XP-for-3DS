@@ -1,8 +1,13 @@
 #include "display_3ds.h"
+#include "debug_3ds.h"
 #include <cstring>
 #include <stdio.h>
 extern FILE *g_dbglog;
-#define printf(fmt, ...) do { if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); fflush(g_dbglog); } } while(0)
+/* OTIMIZACAO 3DS: flush periodico (cada 64 escritas) em vez de a cada printf,
+ * para evitar I/O sincrono ao cartao SD por frame. Contador global partilhado. */
+extern int g_dbglog_flushc;
+#define printf(fmt, ...) do { if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); \
+    if (++g_dbglog_flushc >= 64) { g_dbglog_flushc = 0; fflush(g_dbglog); } } } while(0)
 
 #define TOP_W 400
 #define TOP_H 240
@@ -28,6 +33,14 @@ extern FILE *g_dbglog;
 
 static C3D_RenderTarget* s_top    = nullptr;
 static C3D_RenderTarget* s_bottom = nullptr;
+
+/* Indica se estamos DENTRO de um bloco C3D_FrameBegin/FrameEnd. CRITICO:
+ * C3D_TexInit (alocacao de VRAM) NAO pode ser chamado dentro de um frame --
+ * corrompe o estado do GPU e o Azahar deixa de apresentar (ecra preto apesar
+ * dos blits). Como o sprite_binding cria texturas a meio do desenho, usamos
+ * esta flag para, no create_texture, fechar o frame temporariamente, criar a
+ * textura em seguranca, e reabrir o frame. */
+static bool s_in_frame = false;
 
 static int s_frame_count   = 0;
 static int s_blit_count    = 0;   /* blits neste frame */
@@ -68,6 +81,10 @@ void display_3ds_init() {
  * [DBG] Verifica render target antes de usar. Detecta se init falhou.
  * ═══════════════════════════════════════════════════════════════════════════ */
 void display_3ds_begin_frame() {
+    /* Super Debug: sincronizar o contador de frame global para todas as
+     * categorias poderem carimbar a que frame pertence o evento. */
+    dbg_set_frame(s_frame_count);
+
     /* [DBG] Frame 0,1,2 + cada 300: confirmar que o render está a arrancar */
     if (s_frame_count < 3 || s_frame_count % 300 == 0) {
         printf("[DISPLAY|FRAME] begin #%d "
@@ -84,30 +101,12 @@ void display_3ds_begin_frame() {
     }
 
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    s_in_frame = true;
     C2D_TargetClear(s_top,    C2D_Color32(0, 0, 0, 255));
     C2D_TargetClear(s_bottom, C2D_Color32(0, 0, 0, 255));
     C2D_SceneBegin(s_top);
     s_blit_count   = 0;
     s_blit_skipped = 0;
-
-    /* ===== TESTE DE DIAGNOSTICO DO ECRA DE CIMA =============================
-     * Desenha quadrados de cor solida em coordenadas FIXAS e garantidamente
-     * dentro do ecra de cima (400x240). Serve para distinguir:
-     *  - Se VES os quadrados -> o display funciona; o ecra preto e' porque o
-     *    conteudo do jogo (tilemap 720x560, sprites) e' desenhado FORA da area
-     *    visivel ou com coordenadas/escala erradas (RMXP 640x480 vs 3DS 400x240).
-     *  - Se NAO ves os quadrados -> o problema e' o proprio display/apresentacao
-     *    do top screen (nada chega ao ecra).
-     * Para desligar depois: poe MKXP_DISPLAY_TEST a 0. */
-#ifndef MKXP_DISPLAY_TEST
-#define MKXP_DISPLAY_TEST 1
-#endif
-#if MKXP_DISPLAY_TEST
-    /* vermelho no canto sup-esq, verde ao centro, azul no canto inf-dir */
-    C2D_DrawRectSolid( 10.0f,  10.0f, 0.0f, 60.0f, 60.0f, C2D_Color32(255,  0,  0,255));
-    C2D_DrawRectSolid(170.0f,  90.0f, 0.0f, 60.0f, 60.0f, C2D_Color32(  0,255,  0,255));
-    C2D_DrawRectSolid(330.0f, 170.0f, 0.0f, 60.0f, 60.0f, C2D_Color32(  0,  0,255,255));
-#endif
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -150,6 +149,7 @@ void display_3ds_end_frame() {
 
     if (!s_bottom) {
         printf("[DISPLAY|FRAME] ERRO: s_bottom=NULL no end_frame %d\n", s_frame_count);
+        C3D_FrameEnd(0);
         return;
     }
 
@@ -226,7 +226,17 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba) 
 
     for (int y = 0; y < h && y < th; y++) {
         for (int x = 0; x < w && x < tw; x++) {
-            int off = morton_offset(x, th - 1 - y, tw);
+            /* ORIENTACAO VERTICAL (causa raiz da imagem upside-down):
+             * Ha' DOIS pontos que controlam o flip vertical -- o upload (aqui) e
+             * as UVs (v_top/v_bottom no blit). A regra: EXATAMENTE UM deve
+             * inverter, nunca os dois, nunca nenhum.
+             *  - upload NATURAL (linha y -> linha y): imagem no topo da textura,
+             *    alinhada com h (nao desalinha com a POT th).
+             *  - UVs invertidas (v = 1.0 - sy/th): compensam o espaco UV do
+             *    PICA200 (V=0 base, V=1 topo), pondo o topo da imagem em cima.
+             * O codigo antigo invertia em AMBOS (th-1-y E 1.0-) com th errado ->
+             * upside-down + cortado. Agora: upload natural + UV invertida = 1 flip. */
+            int off = morton_offset(x, y, tw);
             const u8* src = rgba + (y * w + x) * 4;
             dst[off*4+0] = src[3]; /* A */
             dst[off*4+1] = src[2]; /* B */
@@ -300,6 +310,20 @@ void display_3ds_blit(DS3Texture* t,
     s_blit_count++;
     s_blit_total++;
 
+    /* GUARDA: opacity do sprite e' INT e pode sair de [0,255] (ex: fade do
+     * MODTS faz opacity += float). alpha>1.0 ou <0.0 da cor/transparencia
+     * errada no C2D_Color32f. Clampar. */
+    if (alpha < 0.0f) alpha = 0.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+
+    /* [DIAG] Primeiros blits: alpha+posicao+tamanho, para distinguir
+     * "transparente (alpha=0)" de "fora do ecra" de "ok mas invisivel". */
+    if ((s_frame_count <= 2 || s_frame_count % 600 == 0) && s_blit_count <= 20) {
+        printf("[BLIT|DIAG] f=%d #%d dx=%.0f dy=%.0f sw=%.0f sh=%.0f alpha=%.2f tex=%dx%d\n",
+               s_frame_count, s_blit_count, dx, dy, sw, sh, alpha,
+               (int)t->tex.width, (int)t->tex.height);
+    }
+
     /* ESCALA GLOBAL jogo(512x384) -> ecra(400x240). Ver constantes no topo. */
     float fdx = dx * DISP_SCALE + DISP_OFF_X;
     float fdy = dy * DISP_SCALE + DISP_OFF_Y;
@@ -309,11 +333,32 @@ void display_3ds_blit(DS3Texture* t,
     float tw = (float)t->tex.width;
     float th = (float)t->tex.height;
 
+    /* GUARDA: textura de dimensao 0 -> divisao por zero -> UVs NaN -> GPU
+     * desenha lixo ou nada. Saltar em vez de arriscar. */
+    if (tw < 1.0f || th < 1.0f) {
+        s_blit_skipped++;
+        return;
+    }
+
     float u0 = sx / tw;
     float u1 = (sx + sw) / tw;
     float v_top    = 1.0f - (sy / th);
     float v_bottom = 1.0f - ((sy + sh) / th);
 
+    /* Super Debug: sprites GRANDES (logo/fundo) -- dimensoes e UVs reais.
+     * Diagnostica o "corte a meio": ver se U[..] cobre a imagem toda e se
+     * fdw cabe no ecra. ~1x cada 300 frames. */
+    if (DBGV(DBG_SCALE) && sw >= 200.0f && (s_frame_count % 300 == 0)) {
+        DBG(DBG_SCALE,
+            "blit grande: src=%.0fx%.0f @(%.0f,%.0f) tex=%.0fx%.0f "
+            "U[%.3f..%.3f] V[%.3f..%.3f] dst=%.1fx%.1f @(%.1f,%.1f)",
+            sw, sh, sx, sy, tw, th, u0, u1, v_top, v_bottom,
+            fdw, fdh, fdx, fdy);
+    }
+
+    /* FIX ESPELHO HORIZONTAL: a imagem aparecia espelhada na horizontal
+     * (texto lia-se da direita p/ esquerda). Os campos left/right (U) da
+     * SubTexture estavam trocados -> passar u1 como left e u0 como right. */
     Tex3DS_SubTexture sub = {
         (u16)(int)(sw + 0.5f), (u16)(int)(sh + 0.5f),
         u0, v_top, u1, v_bottom
@@ -321,8 +366,17 @@ void display_3ds_blit(DS3Texture* t,
     C2D_Image img = { &t->tex, &sub };
     C2D_DrawParams p = { {fdx, fdy, fdw, fdh}, {0.0f, 0.0f}, 0.5f, 0.0f };
 
+    /* FIX BRANCO: C2D_PlainImageTint(..., 1.0f) usava blend=1.0, o que SUBSTITUI
+     * os pixels da imagem pela cor da tinta (branco) -> a imagem aparecia como
+     * um retangulo branco com a forma/opacidade certa mas sem o conteudo.
+     * Solucao: blend=0.0 em cada canto (mantem RGB original) e usar so o alpha
+     * do tint para a opacidade. */
     C2D_ImageTint tint;
-    C2D_PlainImageTint(&tint, C2D_Color32f(1.0f, 1.0f, 1.0f, alpha), 1.0f);
+    u32 tcol = C2D_Color32f(1.0f, 1.0f, 1.0f, alpha);
+    for (int ci = 0; ci < 4; ci++) {
+        tint.corners[ci].color = tcol;
+        tint.corners[ci].blend = 0.0f;
+    }
     C2D_DrawImage(img, &p, &tint);
 }
 
@@ -359,6 +413,22 @@ void display_3ds_blit_ex(DS3Texture* t,
     s_blit_count++;
     s_blit_total++;
 
+    /* GUARDA: opacity do sprite e' INT e pode sair de [0,255] (ex: fade do
+     * MODTS faz opacity += float). alpha>1.0 ou <0.0 da cor/transparencia
+     * errada no C2D_Color32f. Clampar. */
+    if (alpha < 0.0f) alpha = 0.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+
+    /* CLAMP de src negativo: o tilemap pode passar src_x/src_y NEGATIVOS quando
+     * a camara (@ox/@oy) fica negativa (ex: jogador perto da borda). Um sx<0 gera
+     * coordenadas de textura (u0) negativas -> lixo ou nada no ecra. Recortamos a
+     * parte negativa: avancamos a origem para 0, encolhemos a largura/altura, e
+     * deslocamos o destino para compensar (em coords do JOGO, antes da escala). */
+    if (sx < 0.0f) { float d = -sx; dx += d; dw -= d; sx = 0.0f; sw -= d; }
+    if (sy < 0.0f) { float d = -sy; dy += d; dh -= d; sy = 0.0f; sh -= d; }
+    /* se depois do recorte nao sobra nada, nada a desenhar */
+    if (sw <= 0.0f || sh <= 0.0f || dw <= 0.0f || dh <= 0.0f) { return; }
+
     /* ESCALA GLOBAL: transformar coords do jogo (512x384) -> ecra (400x240).
      * dx,dy,dw,dh vem em coordenadas logicas do jogo; aplicamos escala + offset. */
     float fdx = dx * DISP_SCALE + DISP_OFF_X;
@@ -369,11 +439,32 @@ void display_3ds_blit_ex(DS3Texture* t,
     float tw = (float)t->tex.width;
     float th = (float)t->tex.height;
 
+    /* GUARDA: textura de dimensao 0 -> divisao por zero -> UVs NaN -> GPU
+     * desenha lixo ou nada. Saltar em vez de arriscar. */
+    if (tw < 1.0f || th < 1.0f) {
+        s_blit_skipped++;
+        return;
+    }
+
     float u0 = sx / tw;
     float u1 = (sx + sw) / tw;
     float v_top    = 1.0f - (sy / th);
     float v_bottom = 1.0f - ((sy + sh) / th);
 
+    /* Super Debug: sprites GRANDES (logo/fundo) -- dimensoes e UVs reais.
+     * Diagnostica o "corte a meio": ver se U[..] cobre a imagem toda e se
+     * fdw cabe no ecra. ~1x cada 300 frames. */
+    if (DBGV(DBG_SCALE) && sw >= 200.0f && (s_frame_count % 300 == 0)) {
+        DBG(DBG_SCALE,
+            "blit grande: src=%.0fx%.0f @(%.0f,%.0f) tex=%.0fx%.0f "
+            "U[%.3f..%.3f] V[%.3f..%.3f] dst=%.1fx%.1f @(%.1f,%.1f)",
+            sw, sh, sx, sy, tw, th, u0, u1, v_top, v_bottom,
+            fdw, fdh, fdx, fdy);
+    }
+
+    /* FIX ESPELHO HORIZONTAL: a imagem aparecia espelhada na horizontal
+     * (texto lia-se da direita p/ esquerda). Os campos left/right (U) da
+     * SubTexture estavam trocados -> passar u1 como left e u0 como right. */
     Tex3DS_SubTexture sub = {
         (u16)(int)(sw + 0.5f), (u16)(int)(sh + 0.5f),
         u0, v_top, u1, v_bottom
@@ -381,7 +472,16 @@ void display_3ds_blit_ex(DS3Texture* t,
     C2D_Image img = { &t->tex, &sub };
     C2D_DrawParams p = { {fdx, fdy, fdw, fdh}, {0.0f, 0.0f}, 0.5f, 0.0f };
 
+    /* FIX BRANCO: C2D_PlainImageTint(..., 1.0f) usava blend=1.0, o que SUBSTITUI
+     * os pixels da imagem pela cor da tinta (branco) -> a imagem aparecia como
+     * um retangulo branco com a forma/opacidade certa mas sem o conteudo.
+     * Solucao: blend=0.0 em cada canto (mantem RGB original) e usar so o alpha
+     * do tint para a opacidade. */
     C2D_ImageTint tint;
-    C2D_PlainImageTint(&tint, C2D_Color32f(1.0f, 1.0f, 1.0f, alpha), 1.0f);
+    u32 tcol = C2D_Color32f(1.0f, 1.0f, 1.0f, alpha);
+    for (int ci = 0; ci < 4; ci++) {
+        tint.corners[ci].color = tcol;
+        tint.corners[ci].blend = 0.0f;
+    }
     C2D_DrawImage(img, &p, &tint);
 }

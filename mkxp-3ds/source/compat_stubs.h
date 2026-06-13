@@ -396,23 +396,67 @@ rescue; end
 # FIX: Window é uma classe Ruby pura (sem binding C++) -- definir normalmente.
 begin
   class Window
-    attr_accessor :windowskin,:contents,:stretch,:cursor_rect,:active
-    attr_accessor :visible,:pause,:x,:y,:z,:width,:height,:ox,:oy
+    attr_accessor :windowskin,:stretch,:cursor_rect,:active
+    attr_accessor :visible,:pause,:z,:ox,:oy
     attr_accessor :opacity,:back_opacity,:contents_opacity,:viewport
     def initialize(viewport=nil)
       @visible=true; @active=true; @pause=false; @stretch=true
       @x=0; @y=0; @z=100; @width=0; @height=0; @ox=0; @oy=0
       @opacity=255; @back_opacity=200; @contents_opacity=255
       @cursor_rect=Rect.new; @viewport=viewport; @disposed=false
-      begin; @contents=Bitmap.new(1,1); rescue; end
+      @contents=nil
+      # SPRITE INTERNO: o sistema de render so' desenha Sprites. Para o conteudo
+      # da janela (texto dos menus, desenhado em @contents via draw_text) ser
+      # VISIVEL, criamos um Sprite que mostra @contents. Sem isto, as janelas
+      # aparecem como caixas pretas (contents existe mas nunca vai ao ecra).
+      begin
+        @__csprite = Sprite.new(@viewport)
+        @__csprite.z = @z + 1
+      rescue
+        @__csprite = nil
+      end
+      begin; self.contents = Bitmap.new(1,1); rescue; end
+    end
+    def contents; @contents; end
+    def contents=(bmp)
+      @contents = bmp
+      # liga o bitmap do conteudo ao sprite interno -> passa a ser desenhado
+      begin
+        if @__csprite && !@__csprite.disposed?
+          @__csprite.bitmap = bmp
+          __sync_csprite
+        end
+      rescue; end
+      bmp
+    end
+    def x; @x; end
+    def x=(v); @x=v; __sync_csprite; v; end
+    def y; @y; end
+    def y=(v); @y=v; __sync_csprite; v; end
+    def width; @width; end
+    def width=(v); @width=v; v; end
+    def height; @height; end
+    def height=(v); @height=v; v; end
+    # Sincroniza o sprite do conteudo com a janela. A moldura RGSS reserva 16px
+    # de margem; o conteudo desenha-se deslocado (x+16, y+16) menos o scroll ox/oy.
+    def __sync_csprite
+      return unless @__csprite && (@__csprite.disposed? rescue true)==false
+      begin
+        @__csprite.x = @x + 16 - @ox
+        @__csprite.y = @y + 16 - @oy
+        @__csprite.z = @z + 1
+        @__csprite.visible = @visible
+        @__csprite.opacity = @contents_opacity
+      rescue; end
     end
     def disposed?; @disposed; end
     def dispose
       @disposed=true
+      begin; @__csprite.dispose if @__csprite && !@__csprite.disposed?; rescue; end
       begin; @contents.dispose if @contents && !@contents.disposed?; rescue; end
     end
-    def update; end
-    def refresh; end
+    def update; __sync_csprite; end
+    def refresh; __sync_csprite; end
   end
 rescue; end
 
@@ -550,7 +594,25 @@ begin
     unless respond_to?(:file?)
       def self.file?(p)
         return false if p.nil?
-        begin; f=open(p.to_s,"rb"); f.close; true; rescue; false; end
+        # Igual ao FileTest._try_open: em ambientes que nao lancam excecao para
+        # ficheiros inexistentes (Azahar), exigir handle real + 1 byte legivel,
+        # senao um save inexistente passa por "existe" e o get_newest_save_slot
+        # rebenta (NullStub > Integer). Save inexistente -> false -> New Game.
+        begin
+          f = open(p.to_s, "rb")
+          return false if f.nil?
+          ok = false
+          begin
+            b = f.read(1)
+            ok = !b.nil? && b.respond_to?(:bytesize) && b.bytesize > 0
+          rescue
+            ok = false
+          end
+          f.close rescue nil
+          ok
+        rescue
+          false
+        end
       end
     end
 
@@ -764,6 +826,33 @@ begin
     end
 
     # ------------------------------------------------------------------
+    # RPG::EventCommand -- CRITICO: o interpretador le .code/.parameters/.indent
+    # de CADA comando. Sem acessores, .code -> method_missing -> nil e NENHUM
+    # comando de evento e' despachado (intro, mensagens, escolhas: tudo no-op).
+    # O marshal ja' popula @code/@indent/@parameters; faltava expor os acessores.
+    # ------------------------------------------------------------------
+    class EventCommand
+      attr_accessor :code, :indent, :parameters
+      def initialize(code=0, indent=0, parameters=[])
+        @code=code; @indent=indent; @parameters=parameters
+      end
+    end
+
+    # RPG::MoveCommand / RPG::MoveRoute -- rotas de movimento de eventos.
+    class MoveCommand
+      attr_accessor :code, :parameters
+      def initialize(code=0, parameters=[])
+        @code=code; @parameters=parameters
+      end
+    end
+    class MoveRoute
+      attr_accessor :repeat, :skippable, :list
+      def initialize
+        @repeat=true; @skippable=false; @list=[MoveCommand.new(0)]
+      end
+    end
+
+    # ------------------------------------------------------------------
     # RPG::MapInfo -- usado por $map_infos (carregado de MapInfos.rxdata)
     # ------------------------------------------------------------------
     class MapInfo
@@ -895,8 +984,27 @@ begin
         full = root.empty? ? s : "#{root}#{s}"
         begin
           fh = open(full, "rb")
-          fh.close
-          return true
+          # CRITICO (crash get_newest_save_slot sem save): alguns ambientes
+          # (Azahar) nao lancam excecao para ficheiros inexistentes -- `open`
+          # devolve nil ou um stub. Se aceitarmos isso como "existe", o
+          # get_newest_save_slot tenta ler um save vazio e faz
+          # `NullStub > Integer` -> ArgumentError -> jogo fecha. Por isso
+          # exigimos um handle real E que consiga ler >=1 byte (ficheiro com
+          # conteudo). Um save inexistente falha aqui e devolve false -> o
+          # jogo trata como "sem save" e vai a New Game.
+          if fh.nil?
+            next
+          end
+          ok = false
+          begin
+            b = fh.read(1)
+            ok = !b.nil? && b.respond_to?(:bytesize) && b.bytesize > 0
+          rescue
+            ok = false
+          end
+          fh.close rescue nil
+          return true if ok
+          next
         rescue
           next
         end

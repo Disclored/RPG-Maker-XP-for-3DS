@@ -8,7 +8,20 @@
 #include "sprite_binding_3ds.h"
 #include "tilemap_binding_3ds.h"
 extern FILE *g_dbglog;
-#define printf(fmt, ...) do { if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); fflush(g_dbglog); } } while(0)
+/* OTIMIZACAO 3DS: fflush() a cada printf forcava escrita SINCRONA no cartao SD
+ * (lentissimo). Como o grph_update faz printf por frame (60x/s), isto era uma
+ * causa direta de lentidao e desgaste do SD. Agora so faz flush a cada 64
+ * escritas (contador global partilhado); o resto fica em buffer. Em caso de
+ * crash perdem-se no maximo ~64 linhas de log -- troca aceitavel pelo ganho. */
+extern int g_dbglog_flushc;
+#define printf(fmt, ...) do { if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); \
+    if (++g_dbglog_flushc >= 64) { g_dbglog_flushc = 0; fflush(g_dbglog); } } } while(0)
+
+/* OTIMIZACAO 3DS: controla os logs por-frame do grph_update. 0 = silencioso
+ * (recomendado, jogo mais leve e log limpo). 1 = verboso (debug do loop). */
+#ifndef GFX_VERBOSE
+#define GFX_VERBOSE 0
+#endif
 
 extern void inputBindingUpdate();
 
@@ -83,8 +96,13 @@ static mrb_value safe_funcall(mrb_state *mrb, mrb_value obj,
  *   [C] display_3ds_begin/end_frame com s_top=NULL → crash silencioso
  * ═══════════════════════════════════════════════════════════════════════════ */
 static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
+	/* OTIMIZACAO 3DS: estes 2 logs corriam a CADA frame (60x/s), enchendo o
+	 * log e gastando I/O. Agora so aparecem se GFX_VERBOSE=1. Para debug
+	 * detalhado do loop, mudar para 1. */
+#if GFX_VERBOSE
 	printf("[GFX|ENTER] grph_update entrou\n");
 	printf("[GFX] grph_update CALLED frame=%d frozen=%d\n", s_frame_count, s_frozen);
+#endif
     (void)self;
 
     if (!aptMainLoop()) {
@@ -92,7 +110,10 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
         mrb_raise(mrb, E_RUNTIME_ERROR, "aptMainLoop: quit requested");
     }
 
-    hidScanInput();
+    /* FIX INPUT: NAO chamar hidScanInput() aqui. O inputBindingUpdate() ja faz
+     * hidScanInput() internamente (via input_3ds_poll). Dois scans seguidos no
+     * mesmo frame fazem o segundo devolver keysDown=0 -> os triggers (ex: botao A
+     * = Input::USE para avancar o titulo) sao limpos antes do jogo os ler. */
     inputBindingUpdate();
 
     /* [DBG-A] Primeiros 3 frames: dump completo para confirmar estado inicial */
@@ -276,7 +297,7 @@ static mrb_value grph_wait(mrb_state *mrb, mrb_value self) {
         if (!aptMainLoop()) {
             mrb_raise(mrb, E_RUNTIME_ERROR, "aptMainLoop: quit requested");
         }
-        hidScanInput();
+        /* FIX INPUT: idem grph_update -- inputBindingUpdate() ja faz o scan. */
         inputBindingUpdate();
         if (!s_frozen) {
             display_3ds_begin_frame();

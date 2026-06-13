@@ -14,6 +14,29 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <vector>
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * FALLBACK para mrb_dump_irep / constantes de dump.
+ * A libmruby do port EXPORTA mrb_dump_irep (nm: "T mrb_dump_irep"), mas o
+ * header <mruby/dump.h> esconde a DECLARACAO e as constantes (DUMP_ENDIAN_NAT,
+ * MRB_DUMP_OK) atras de #ifndef MRB_NO_STDIO. Como a lib foi compilada com
+ * MRB_NO_STDIO, o header nao as declara -> erro de compilacao, apesar de a
+ * funcao existir no binario. Declaramo-las nos com a assinatura e valores
+ * estaveis do mruby 3.2.0.
+ * ───────────────────────────────────────────────────────────────────────── */
+#ifndef MRB_DUMP_OK
+#define MRB_DUMP_OK 0
+#endif
+#ifndef DUMP_ENDIAN_NAT
+/* MRB_DUMP_ENDIAN_BIG(4) | MRB_DUMP_ENDIAN_LIT(8) = 12. "Native" no mruby 3.2. */
+#define DUMP_ENDIAN_NAT 12
+#endif
+#ifndef MKXP_MRB_DUMP_IREP_DECLARED
+#define MKXP_MRB_DUMP_IREP_DECLARED 1
+extern "C" int mrb_dump_irep(mrb_state *mrb, const struct mrb_irep *irep,
+                             uint8_t flags, uint8_t **bin, size_t *bin_size);
+#endif
+
 #include "display_3ds.h"
 #include "input_3ds.h"
 #include "platform_3ds.h"
@@ -34,6 +57,10 @@ extern void inputBindingInit(mrb_state *mrb);
 
 /* Ficheiro de log global para dump detalhado */
 FILE *g_dbglog = NULL;
+/* Contador global de escritas para flush periodico do log (otimizacao 3DS:
+ * evita fflush sincrono ao SD a cada escrita). Partilhado pelos macros de log
+ * nos varios ficheiros via 'extern int g_dbglog_flushc'. */
+int g_dbglog_flushc = 0;
 
 static void dbglog_open() {
     g_dbglog = fopen("sdmc:/mkxp/debug_binding.log", "w");
@@ -46,7 +73,8 @@ static void dbglog_close() { if (g_dbglog) { fclose(g_dbglog); g_dbglog = NULL; 
 #define DBGLOG(fmt, ...) \
     do { \
         printf(fmt, ##__VA_ARGS__); \
-        if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); fflush(g_dbglog); } \
+        if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); \
+            if (++g_dbglog_flushc >= 64) { g_dbglog_flushc = 0; fflush(g_dbglog); } } \
     } while(0)
 
 /* Dump ate N bytes de um buffer como texto (printaveis) + hex para o resto */
@@ -1273,7 +1301,39 @@ module MessageTypes
 end
 
 module Game
-  def self.initialize; end
+  # ANTES era um stub vazio (def self.initialize; end) que IMPEDIA o
+  # carregamento dos dados do jogo -- por isso GameData::Species estava vazio e
+  # o titulo crashava com "Unknown ID SOLGALEO". Agora faz o trabalho real:
+  # cria os globals e carrega TODOS os dados (animations, tilesets, system e,
+  # crucialmente, GameData.load_all que carrega especies/moves/items/etc).
+  # Cada passo tem rescue para uma falha nao parar as outras (boot resiliente).
+  def self.initialize
+    begin; $PokemonTemp  = PokemonTemp.new;  rescue => e; dbg "[Game.init] PokemonTemp: #{e.message}"; end
+    begin; $game_temp    = Game_Temp.new;    rescue => e; dbg "[Game.init] Game_Temp: #{e.message}"; end
+    begin; $game_system  = Game_System.new;  rescue => e; dbg "[Game.init] Game_System: #{e.message}"; end
+    begin; $data_animations    = load_data('Data/Animations.rxdata');    rescue => e; dbg "[Game.init] Animations: #{e.message}"; end
+    begin; $data_tilesets      = load_data('Data/Tilesets.rxdata');      rescue => e; dbg "[Game.init] Tilesets: #{e.message}"; end
+    begin; $data_common_events = load_data('Data/CommonEvents.rxdata');  rescue => e; dbg "[Game.init] CommonEvents: #{e.message}"; end
+    begin; $data_system        = load_data('Data/System.rxdata');        rescue => e; dbg "[Game.init] System: #{e.message}"; end
+    begin; pbLoadBattleAnimations; rescue => e; dbg "[Game.init] BattleAnims: #{e.message}"; end
+    # GameData.load_all -- carrega cada tipo com rescue individual, para que se
+    # um tipo falhar (ex: Encounter), as ESPECIES continuem a carregar.
+    begin
+      dbg "[Game.init] a carregar GameData..."
+      [:Type, :Ability, :Move, :Item, :BerryPlant, :Species, :Ribbon,
+       :Encounter, :TrainerType, :Trainer, :Metadata, :MapMetadata].each do |sym|
+        begin
+          GameData.const_get(sym).load
+          dbg "[Game.init]   GameData::#{sym} OK"
+        rescue => e
+          dbg "[Game.init]   GameData::#{sym} FALHOU: #{e.class}: #{e.message}"
+        end
+      end
+    rescue => e
+      dbg "[Game.init] GameData.load_all geral: #{e.message}"
+    end
+    dbg "[Game.init] Game.initialize concluido"
+  end
   def self.set_up_system; end
 end
 
@@ -1408,6 +1468,41 @@ rescue => e
   dbg "[init] PokemonSystem.new failed: #{e.message}"
 end
 
+# -- FIX INPUT DO TITULO: desligar o override de Input do plugin de controlos ---
+# CAUSA RAIZ (descoberta via Super Debug): o plugin "Field Moves / Set Controls"
+# (plugins ~93991) reabre  module Input  e faz wrapper de trigger?/press?:
+#     def trigger?(button)
+#       key = buttonToKey(button)
+#       return key ? triggerex_array?(key) : _old_fl_trigger?(button)
+#     end
+# O buttonToKey() mapeia Input::C/USE para um codigo de TECLADO e desvia para
+# triggerex? (sistema de teclado do plugin), que NAO conhece o nosso latch C++.
+# Resultado: o titulo chama Input.trigger?(Input::C), o input fisico CHEGA
+# (log: "tecla detectada k=13 latch ON"), mas o wrapper nunca le o nosso latch
+# -> o titulo nunca avanca.
+#
+# O wrapper so' desvia se enabled? for true, e enabled? e':
+#     state = false if $PokemonSystem.controlinput.to_i <= 0
+# Logo, forcando controlinput=0, buttonToKey devolve nil e trigger?/press? caem
+# SEMPRE no _old_fl_trigger? = o nosso Input nativo C++ (que funciona).
+# Patch nao-invasivo (so' define uma variavel; nao mexe em scripts read-only).
+begin
+  if $PokemonSystem
+    if $PokemonSystem.respond_to?(:controlinput=)
+      $PokemonSystem.controlinput = 0
+    else
+      # garantir o acessor mesmo que o setter nao exista
+      class PokemonSystem
+        attr_accessor :controlinput unless method_defined?(:controlinput=)
+      end
+      $PokemonSystem.controlinput = 0
+    end
+    dbg "[FIX-INPUT] controlinput=0 -> Input nativo C++ ativo (override do plugin desligado)"
+  end
+rescue => e
+  dbg "[FIX-INPUT] falhou: #{e.message}"
+end
+
 # -- Settings stub -------------------------------------------------------------
 begin
   Settings
@@ -1455,6 +1550,11 @@ end
 
 # Valor de retorno seguro baseado no nome do metodo
 def _safe_return_for(name)
+  # CRITICO (loop infinito sem save): `until file.eof?` com file=nil chama
+  # NilClass#eof? -> method_missing. Se devolver false, o until NUNCA termina
+  # (loop infinito, milhares de NilClass#eof? no log). Um ficheiro nil/fechado
+  # esta' logicamente NO FIM -> eof? deve devolver TRUE para o loop parar.
+  return true  if name == "eof?"
   return nil   if name.start_with?("update","draw","dispose","refresh",
                                    "clear","create","setup","start",
                                    "terminate","pbOn","pbOff","set",
@@ -1478,23 +1578,94 @@ end
 # -- method_missing universal em Object ---------------------------------------
 # Apanha QUALQUER classe que nao tenha um metodo -- inclui classes nao listadas.
 # As subclasses com method_missing proprio prevalecem (Ruby MRO).
+#
+# SUPER DEBUG: regista informacao COMPLETA de cada metodo em falta, para depois
+# se implementar com dados certos (sem adivinhar):
+#   - classe#metodo e aridade (nº de args)
+#   - tipo de cada argumento (Integer, Float, String, Array, nil, ...)
+#   - categoria: setter (=), predicado (?), bang (!), ou normal
+#   - valor de retorno que o fallback escolheu
+#   - contagem de chamadas (quantas vezes cada metodo foi pedido) -> prioridade
+$__mm_counts = {} rescue nil
+$__mm_seen   = {} rescue nil
 begin
   class Object
     alias _original_method_missing method_missing rescue nil
     def method_missing(m, *a, &blk)
       n = m.to_s
-      key = "#{self.class}##{n}"
-      args_s = a.length > 0 ? "(#{a.map{|x| x.inspect rescue '?'}.join(',')})" : "()"
-      _log_error_once(key, "[MISSING] #{key}#{args_s}")
+      cls = self.class.to_s
+      key = "#{cls}##{n}"
+
+      # contagem de chamadas (para saber o que e' mais usado)
+      if $__mm_counts
+        $__mm_counts[key] = ($__mm_counts[key] || 0) + 1
+        # Despeja o TOP atual periodicamente (visao das prioridades em runtime).
+        # NOTA: o sort_by sobre o hash + 41 escritas e' caro; a CADA 200 chamadas
+        # isto corria dezenas de vezes no arranque (EBDX gera milhares de misses)
+        # e era uma fatia REAL dos minutos de boot no Azahar. Subir para 2000
+        # corta ~90% dos dumps mantendo visibilidade. NAO remove logging: o
+        # [MISSING-DET] (1x/metodo) e o [MISSING-TOP] final continuam intactos.
+        $__mm_total = ($__mm_total || 0) + 1
+        if ($__mm_total % 2000) == 0
+          __dump_missing_methods__ rescue nil
+        end
+      end
+
+      # so faz o log DETALHADO uma vez por metodo (evita inundar), mas conta sempre
+      unless ($__mm_seen && $__mm_seen[key])
+        $__mm_seen[key] = true if $__mm_seen
+
+        # categoria do metodo pelo sufixo
+        cat = if n.end_with?("=") then "SETTER"
+              elsif n.end_with?("?") then "PREDICADO"
+              elsif n.end_with?("!") then "BANG"
+              else "NORMAL" end
+
+        # tipos dos argumentos
+        types = a.map { |x| x.class.to_s rescue "?" }
+        types_s = types.empty? ? "-" : types.join(",")
+
+        # valores (curtos) dos argumentos
+        vals = a.map { |x| (x.inspect rescue "?").to_s[0,24] }
+        vals_s = vals.empty? ? "-" : vals.join(",")
+
+        ret = _safe_return_for(n)
+        ret_s = (ret.inspect rescue "?").to_s[0,24]
+
+        # tem bloco? (alguns metodos esperam &blk)
+        blk_s = blk ? "sim" : "nao"
+
+        _log_error_once("MMDET:#{key}",
+          "[MISSING-DET] #{key} cat=#{cat} aridade=#{a.length} " \
+          "tipos=[#{types_s}] vals=[#{vals_s}] bloco=#{blk_s} ret=#{ret_s}")
+        return ret
+      end
+
       _safe_return_for(n)
     end
     def respond_to_missing?(m, include_private=false)
       true
     end
   end
-  dbg "[PATCH] Object#method_missing universal OK"
+  dbg "[PATCH] Object#method_missing universal+SuperDebug OK"
 rescue => e
   dbg "[PATCH] Object#method_missing falhou: #{e.message}"
+end
+
+# Dump do TOP de metodos em falta (mais chamados) -- pode ser invocado a qualquer
+# momento (ex: no fim do arranque ou ao entrar no titulo) para ver prioridades.
+begin
+  def __dump_missing_methods__
+    return unless $__mm_counts
+    pairs = $__mm_counts.to_a.sort_by { |k,v| -v }
+    dbg "[MISSING-TOP] === #{pairs.length} metodos unicos em falta ==="
+    pairs.first(40).each do |k, v|
+      dbg "[MISSING-TOP] #{v}x  #{k}"
+    end
+  end
+  dbg "[PATCH] __dump_missing_methods__ disponivel OK"
+rescue => e
+  dbg "[PATCH] __dump_missing_methods__ falhou: #{e.message}"
 end
 
 # -- FIX INPUT: Input::F6/F7/F8/F9 em falta -----------------------------------
@@ -1521,6 +1692,52 @@ begin
   end
 rescue => e
   dbg "[INPUT] Input const fix falhou: #{e.class}: #{e.message}"
+end
+
+# -- FIX INPUT 2: re-forcar Input.update para no-op nativo ---------------------
+# O script base (module Input, ~1795) REDEFINE self.update para chamar
+# update_KGC_ScreenCapture + trigger?(Input::F8) a cada frame. Isto sobrepoe o
+# nosso inp_update C++ (no-op) e re-corre logica de input dentro do proprio
+# Input.update -- no loop do titulo (que chama Input.update + Input.trigger?(C)
+# por iteracao) isto interfere com o latch. Repomos Input.update como no-op:
+# o poll real ja' e' feito por grph_update (C++) antes de cada scene.update.
+begin
+  if Object.const_defined?(:Input)
+    class << Input
+      def update; end           # no-op: poll real e' feito em grph_update (C++)
+    end
+    dbg "[FIX-INPUT2] Input.update reposto como no-op (poll vem de grph_update)"
+  end
+rescue => e
+  dbg "[FIX-INPUT2] falhou: #{e.class}: #{e.message}"
+end
+
+# -- FIX INPUT 3: forcar trigger?/press? a chamar o C++ nativo diretamente ------
+# DIAGNOSTICO (do log): o input fisico chega (tecla detectada k=13 latch ON),
+# mas o nosso inp_trigger C++ NUNCA e' chamado (nao aparece "trigger? k=13").
+# Causa: o Essentials/EBDX reabrem Input e fazem
+#   alias :_old_fl_trigger? :trigger?  +  def trigger?(button) ...wrapper...
+# Se nesse momento `trigger?` ja' era uma versao Ruby (KGC/outro), o alias
+# captura ESSA -> o latch C++ nunca e' lido. O controlinput=0 nao chega porque
+# o proprio _old_fl_trigger? ja' nao e' o C++.
+# SOLUCAO DEFINITIVA: o C++ exporta trigger_native?/press_native? (nomes que
+# nenhum plugin toca). Aqui, DEPOIS de todos os scripts, redefinimos
+# Input.trigger?/press?/repeat?/release? para chamar diretamente os nativos,
+# anulando qualquer wrapper. Caminho direto e garantido ao latch C++.
+begin
+  if Object.const_defined?(:Input) && Input.respond_to?(:trigger_native?)
+    class << Input
+      def trigger?(k); trigger_native?(k); end
+      def press?(k);   press_native?(k);   end
+      def repeat?(k);  repeat_native?(k);  end
+      def release?(k); release_native?(k); end
+    end
+    dbg "[FIX-INPUT3] Input.trigger?/press?/repeat?/release? -> C++ nativo direto"
+  else
+    dbg "[FIX-INPUT3] AVISO: trigger_native? indisponivel (binding antigo?)"
+  end
+rescue => e
+  dbg "[FIX-INPUT3] falhou: #{e.class}: #{e.message}"
 end
 
 # -- Patch method_missing nas classes reais do jogo ----------------------------
@@ -1682,6 +1899,62 @@ begin
   dbg "[WSKIN] pbResolveBitmap real registado em Object (orig_disponivel=#{$__mkxp_has_orig_resolvebmp ? 'sim' : 'nao'})"
 rescue => e
   dbg "[WSKIN] pbResolveBitmap patch falhou: #{e.class}: #{e.message}"
+end
+
+# -- pbBitmap REAL (global) ---------------------------------------------------
+# CRITICO (ecra preto no titulo MODTS): o pbBitmap e' definido num PLUGIN, e
+# quando chamado de dentro de classes (ModularTitleScreen, MTS_Element_*) nao e'
+# encontrado na cadeia -> cai no method_missing universal -> _safe_return_for
+# devolve 0 (Integer). Por isso o MODTS recebia 0 onde esperava um Bitmap (dai
+# os erros Integer#width / Integer#rect no log) e nada desenhava.
+#
+# Solucao honesta: definir pbBitmap como metodo global REAL aqui, em Object +
+# Kernel, para estar SEMPRE visivel em qualquer classe. Carrega a imagem via
+# Bitmap.new(path) -- que usa o bmp_load_file C++ (stbi_load) que funciona.
+# Replica o comportamento do plugin: tenta RPG::Cache.load_bitmap primeiro
+# (com cache + ref-count), e cai para Bitmap.new(path) directo se necessario.
+begin
+  unless Object.method_defined?(:__mkxp_real_pbBitmap)
+    class Object
+      def __mkxp_real_pbBitmap(name)
+        bmp = nil
+        # 1) caminho preferido: RPG::Cache.load_bitmap (cache + ref-count)
+        begin
+          if defined?(RPG) && RPG.const_defined?(:Cache)
+            parts = name.split("/")
+            file  = parts[-1].to_s
+            dir   = parts[0...-1].join("/")
+            dir  += "/" unless dir.empty?
+            bmp = RPG::Cache.load_bitmap(dir, file)
+          end
+        rescue
+          bmp = nil
+        end
+        # 2) fallback directo: Bitmap.new(path) -> bmp_load_file C++
+        if bmp.nil? || (bmp.respond_to?(:disposed?) && (bmp.disposed? rescue false))
+          begin
+            bmp = Bitmap.new(name)
+          rescue
+            bmp = (Bitmap.new(2, 2) rescue nil)
+          end
+        end
+        bmp
+      end
+      # so' instala pbBitmap se ainda nao houver um real (o plugin pode ter
+      # definido o seu; mas como cai no method_missing dentro de classes,
+      # forcamos o nosso global, que e' visivel em todo o lado).
+      def pbBitmap(name)
+        __mkxp_real_pbBitmap(name)
+      end
+    end
+    module Kernel
+      def pbBitmap(name); __mkxp_real_pbBitmap(name); end
+      module_function :pbBitmap
+    end
+    dbg "[BMP] pbBitmap global real instalado (Object+Kernel)"
+  end
+rescue => e
+  dbg "[BMP] pbBitmap global falhou: #{e.class}: #{e.message}"
 end
 
 # Reforcar os defaults de windowskin. A camada 1 (pbResolveBitmap real) ja faz
@@ -2352,10 +2625,128 @@ end
 # $__debug_intro_count controla quantas vezes DebugIntro foi chamado.
 $__debug_intro_count = 0
 
+# ============================================================================
+# INTERRUPTOR: mostrar o fluxo NORMAL do jogo (tela de titulo -> intro do
+# professor -> criacao de personagem) em vez do bypass directo para o mapa.
+#
+# O proprio jogo, quando $DEBUG=true, faz pbCallTitle -> Scene_DebugIntro
+# (salta o titulo, modo programador). Nos forcamos $DEBUG=true no arranque, por
+# isso nunca se via o titulo. Com USE_REAL_TITLE=true, em vez do bypass corremos
+# o Scene_Intro real (a tela "PRESS ENTER") e deixamos o jogo seguir o seu fluxo.
+#
+# Se o Scene_Intro real der problemas no port, poe USE_REAL_TITLE=false para
+# voltar ao bypass que ja funcionava (entrada directa no mapa).
+# ============================================================================
+USE_REAL_TITLE = true unless defined?(USE_REAL_TITLE)
+
 class Scene_DebugIntro
   def main
     $__debug_intro_count = ($__debug_intro_count || 0) + 1
     dbg "[DebugIntro] chamada ##{$__debug_intro_count}"
+
+    # SMOKE TEST: corre UMA vez, logo na 1a entrada, com os dados ja carregados.
+    # Percorre imagens/dados/classes/audio/tiles/animacoes e grava o relatorio
+    # em sdmc:/mkxp/smoke_test.log. Controlado por SMOKE_TEST_ON (default true).
+    # Para desligar: cria $smoke_done=true antes, ou apaga smoke_test.rb.
+    if $__debug_intro_count == 1 && !$__smoke_done
+      $__smoke_done = true
+      # Reinstalar o nosso pbBitmap REAL depois dos plugins terem corrido (um
+      # plugin pode te-lo redefinido sem o fallback Bitmap.new). Garante que o
+      # titulo MODTS recebe Bitmaps reais e nao 0.
+      begin
+        if respond_to?(:__mkxp_real_pbBitmap, true)
+          Object.class_eval do
+            def pbBitmap(name); __mkxp_real_pbBitmap(name); end
+          end
+          dbg "[BMP] pbBitmap REAL reinstalado pos-plugins"
+        end
+      rescue => e
+        dbg "[BMP] reinstalar pbBitmap falhou: #{e.message}"
+      end
+      begin
+        on = (defined?(SMOKE_TEST_ON) ? SMOKE_TEST_ON : true)
+        if on && defined?(SmokeTest)
+          dbg "[SMOKE] a correr smoke test (relatorio em smoke_test.log)..."
+          SmokeTest.run_all
+          dbg "[SMOKE] smoke test concluido"
+        else
+          dbg "[SMOKE] smoke test desligado ou nao carregado"
+        end
+      rescue => e
+        dbg "[SMOKE] smoke test rebentou: #{e.class}: #{e.message}"
+      end
+    end
+
+    # -- Caminho do fluxo NORMAL: correr a tela de titulo real (Scene_Intro) --
+    if (USE_REAL_TITLE rescue false) && $__debug_intro_count == 1
+      dbg "[DebugIntro] USE_REAL_TITLE: a tentar Scene_Intro (tela de titulo real)"
+
+      # -- INSTRUMENTACAO ModularTitleScreen (Solar Eclipse) -----------------
+      # Os scripts do jogo ja estao carregados aqui, por isso ModularTitleScreen
+      # ja existe. Envolvemos new/intro/playBGM/update para o log dizer onde
+      # rebenta. Objetivo: mostrar a tela bonita, nao simplificar.
+      begin
+        if defined?(ModularTitleScreen)
+          ModularTitleScreen.class_eval do
+            unless method_defined?(:__mts_orig_init)
+              alias_method :__mts_orig_init, :initialize
+              def initialize(*a, &b)
+                dbg "[MTS] new START"
+                begin
+                  __mts_orig_init(*a, &b)
+                  dbg "[MTS] new OK sprites=#{(@sprites rescue {}).keys.inspect rescue '?'}"
+                rescue => e
+                  dbg "[MTS] new CRASH: #{e.class}: #{e.message}"
+                  dbg "[MTS] new BT: #{(e.backtrace || [])[0,8].join(' | ')}"
+                  raise
+                end
+              end
+            end
+          end
+          ["playBGM", "intro", "update"].each do |mn|
+            next unless ModularTitleScreen.method_defined?(mn.to_sym)
+            ModularTitleScreen.class_eval do
+              an = "__mts_orig_#{mn}"
+              unless method_defined?(an.to_sym)
+                alias_method an.to_sym, mn.to_sym
+                define_method(mn.to_sym) do |*a, &b|
+                  dbg "[MTS] #{mn} START"
+                  begin
+                    r = send(an.to_sym, *a, &b)
+                    dbg "[MTS] #{mn} END"
+                    r
+                  rescue => e
+                    dbg "[MTS] #{mn} CRASH: #{e.class}: #{e.message}"
+                    dbg "[MTS] #{mn} BT: #{(e.backtrace || [])[0,8].join(' | ')}"
+                    raise
+                  end
+                end
+              end
+            end
+          end
+          dbg "[MTS] instrumentacao instalada OK"
+        else
+          dbg "[MTS] ModularTitleScreen NAO definido!"
+        end
+      rescue => e
+        dbg "[MTS] instrumentacao falhou: #{e.class}: #{e.message}"
+      end
+      # -- /INSTRUMENTACAO ---------------------------------------------------
+
+      begin
+        # $DEBUG=false para o jogo seguir o fluxo normal (titulo->intro->etc)
+        # a partir daqui. Mantemos os outros globals.
+        $DEBUG = false
+        intro = Scene_Intro.new
+        $scene = intro
+        dbg "[DebugIntro] Scene_Intro criado OK -> $scene=Scene_Intro"
+        return
+      rescue => e
+        dbg "[DebugIntro] Scene_Intro FALHOU (#{e.class}: #{e.message}) -- a usar bypass"
+        $DEBUG = true
+        # cai para o bypass abaixo
+      end
+    end
 
     # A partir da 2a chamada (retorno ao titulo apos Scene_Map terminar):
     # deixar o Load Screen normal do jogo correr em vez de forcara Scene_Map.
@@ -3315,15 +3706,47 @@ end
 /* Para DESLIGAR a cache (se algum dia causar problemas), basta mudar para 0.
  * Com 0, o arranque volta ao comportamento antigo (mrb_load_nstring direto).
  *
- * NOTA IMPORTANTE: este build do mruby foi compilado com MRB_NO_STDIO, que
- * DESATIVA mrb_dump_irep (gravar bytecode). Por isso a cache gerada-no-3DS NAO
- * e' possivel com esta lib. Mantemos o codigo (desligado) para o caso de no
- * futuro se usar uma lib mruby com dump ativado, ou bytecode pre-compilado no
- * PC com mrbc (que usa mrb_load_irep_buf, esse SIM disponivel aqui).
- * => Por defeito DESLIGADO (0) para o build funcionar. */
+ * NOTA: durante muito tempo julgou-se que MRB_NO_STDIO removia mrb_dump_irep
+ * (gravar bytecode). CONFIRMADO QUE NAO: `nm libmruby.a` mostra "T mrb_dump_irep"
+ * -- a funcao de dump para MEMORIA existe (MRB_NO_STDIO so remove as variantes
+ * que escrevem para FILE* diretamente). Logo a cache de bytecode dos 376 scripts
+ * base GERA-SE no proprio 3DS, tal como a dos plugins. Por isso esta LIGADA (1).
+ * O bytecode vai para sdmc:/mkxp/cache/scripts/. 1a corrida compila+grava;
+ * seguintes carregam .mrb (rapido). Fallback seguro a mrb_load_nstring se a
+ * cache faltar/for invalida. */
 #ifndef MKXP_BYTECODE_CACHE
-#define MKXP_BYTECODE_CACHE 0
+#define MKXP_BYTECODE_CACHE 1
 #endif
+
+/* Cache dos dados .rxdata desserializados (Tilesets/CommonEvents/species/etc).
+ * 1a corrida: grava o resultado em sdmc:/mkxp/cache/rxdata/; seguintes: le de
+ * la' e salta o re-parse da fonte. Chave inclui tamanho+mtime -> auto-invalida.
+ * Poe a 0 para desligar e medir a diferenca de tempo de arranque. */
+#ifndef MKXP_RXDATA_CACHE
+#define MKXP_RXDATA_CACHE 1
+#endif
+
+/* Saltar plugins pesados que ja' falham por completo (ex.: EBDX, 485 scripts
+ * que nem compilam por causa de um SyntaxError no Setup). Compilar 485 scripts
+ * so' para falhar e' a maior fatia do tempo de boot. Saltar da' o mesmo estado
+ * funcional muito mais rapido. Poe a 0 para voltar a tentar carregar tudo. */
+#ifndef MKXP_SKIP_BROKEN_PLUGINS
+#define MKXP_SKIP_BROKEN_PLUGINS 1
+#endif
+
+/* Garante que toda a estrutura de pastas da cache existe (idempotente).
+ * FORA de qualquer #if -- usada tanto pela cache dos scripts como dos plugins:
+ *   sdmc:/mkxp/cache/scripts   (376 scripts base)
+ *   sdmc:/mkxp/cache/plugins   (559 plugins)
+ *   sdmc:/mkxp/cache/rxdata    (dados marshal -- reservado p/ futuro)
+ * Chamada uma vez no inicio de cada carregador. */
+static void mkxp_cache_ensure_tree(void) {
+    mkdir("sdmc:/mkxp",                0777);
+    mkdir("sdmc:/mkxp/cache",          0777);
+    mkdir("sdmc:/mkxp/cache/scripts",  0777);
+    mkdir("sdmc:/mkxp/cache/plugins",  0777);
+    mkdir("sdmc:/mkxp/cache/rxdata",   0777);
+}
 
 #if MKXP_BYTECODE_CACHE
 /* FNV-1a 64-bit -> hex, sobre um buffer (conteudo do script ja patchado). */
@@ -3349,13 +3772,12 @@ static void mkxp_cache_key(const char *name, const unsigned char *data,
         else safe[si++] = '_';
     }
     safe[si] = 0;
-    snprintf(out, out_sz, "sdmc:/mkxp/cache/%s_%016llx.mrb", safe, h);
+    snprintf(out, out_sz, "sdmc:/mkxp/cache/scripts/%s_%016llx.mrb", safe, h);
 }
 
 /* Garante que a pasta da cache existe (idempotente). */
 static void mkxp_cache_ensure_dir(void) {
-    mkdir("sdmc:/mkxp", 0777);        /* pode ja existir -> ignora erro */
-    mkdir("sdmc:/mkxp/cache", 0777);
+    mkxp_cache_ensure_tree();
 }
 
 /* Tenta carregar+executar bytecode da cache. Devolve true se correu (ok ou com
@@ -3437,6 +3859,428 @@ static bool mkxp_cache_compile_run(mrb_state *mrb, const char *code, size_t code
     return true;
 }
 #endif /* MKXP_BYTECODE_CACHE */
+
+/* Patch para scripts de PLUGIN. Diferente do patch_script dos 376 scripts base:
+ * NAO aplica replace_defined_keyword, porque o Modular Title Screen depende de
+ * defined?(MTS_Element_X) -- inclusive dentro de eval("defined?(...)") -- para
+ * decidir que elementos visuais carregar. Se trocassemos defined? por nil, a
+ * tela ficaria vazia. O mruby 3.2 deste port suporta defined? em runtime (a
+ * limitacao antiga era em certos contextos de parsing que aqui nao ocorrem).
+ *
+ * Por agora nao transforma nada: os plugins correm como vieram. Mantem-se a
+ * funcao como ponto unico caso um plugin especifico precise de ajuste futuro
+ * (ex: saltar um script que rebente, ou remover um loop bloqueante). */
+static void patch_plugin_script(std::vector<Bytef> &decomp, uLong dest_sz,
+                                 const char *name) {
+    (void)decomp; (void)dest_sz; (void)name;
+    /* Sem transformacoes globais. Adicionar aqui ajustes por-plugin se
+     * algum vier a precisar (com base no log [PLUGIN-ERROR]). */
+}
+
+/* =========================================================
+ * CACHE DE BYTECODE DOS PLUGINS (gerada no PC com mrbc)
+ * ---------------------------------------------------------
+ * Problema: os 559 scripts de plugin sao compilados de TEXTO a cada arranque
+ * (~20 min). A libmruby do 3DS foi compilada com MRB_NO_STDIO, logo NAO tem
+ * mrb_dump_irep (gravar bytecode) -- nao da para gerar a cache no proprio 3DS.
+ * MAS tem mrb_load_irep_buf (LER bytecode), que CHEGA para usar uma cache
+ * pre-compilada no PC.
+ *
+ * Fluxo (sem ferramentas alem do mrbc que ja existe no PC):
+ *   1a corrida (sem cache): para cada plugin, alem de o correr por texto, o 3DS
+ *      GRAVA o codigo ja-descomprimido-e-patchado em
+ *        sdmc:/mkxp/plugin_src/NNNN_nome.rb
+ *      (NNNN = indice sequencial, garante ordem de carregamento correcta).
+ *   No PC: corre-se UMA vez o mrbc sobre essa pasta -> gera
+ *        sdmc:/mkxp/cache/NNNN_nome.mrb
+ *   Corridas seguintes: o 3DS encontra o .mrb e carrega bytecode (segundos),
+ *      saltando o parsing. Se faltar o .mrb de um script, faz fallback a texto
+ *      (e volta a grava-lo em plugin_src para o PC compilar).
+ *
+ * SEGURANCA: qualquer falha (sem ficheiro, bytecode invalido, versao/boxing
+ * incompativel) cai no caminho de texto. A cache nunca parte o arranque.
+ * ========================================================= */
+
+/* Liga/desliga a cache de plugins. 1 = tenta usar .mrb e grava .rb fonte. */
+#ifndef MKXP_PLUGIN_CACHE
+#define MKXP_PLUGIN_CACHE 1
+#endif
+
+#if MKXP_PLUGIN_CACHE
+/* Garante que um directorio existe (best-effort, ignora se ja existe). */
+static void mkxp_ensure_dir(const char* dir) {
+    mkdir(dir, 0777);
+}
+
+/* Sanitiza o nome do script para nome de ficheiro seguro (sem / \ espacos). */
+static void mkxp_safe_name(const char* in, char* out, size_t out_sz) {
+    size_t j = 0;
+    for (const char* p = in; *p && j + 1 < out_sz; ++p) {
+        char c = *p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
+            out[j++] = c;
+        } else {
+            out[j++] = '_';
+        }
+    }
+    out[j] = 0;
+}
+
+/* Tenta carregar e executar o bytecode .mrb correspondente a este script.
+ * Devolve true se carregou e correu (mesmo que o script lance excecao Ruby,
+ * que e' tratada/limpa aqui). Devolve false se nao havia cache utilizavel
+ * (-> o chamador faz fallback a texto). */
+static bool mkxp_plugin_cache_run(mrb_state* mrb, const char* cache_path,
+                                  const char* script_name) {
+    FILE* cf = fopen(cache_path, "rb");
+    if (!cf) return false;
+
+    fseek(cf, 0, SEEK_END);
+    long sz = ftell(cf);
+    fseek(cf, 0, SEEK_SET);
+    if (sz <= 0) { fclose(cf); return false; }
+
+    unsigned char* buf = (unsigned char*)malloc((size_t)sz);
+    if (!buf) { fclose(cf); return false; }
+
+    size_t rd = fread(buf, 1, (size_t)sz, cf);
+    fclose(cf);
+    if (rd != (size_t)sz) { free(buf); return false; }
+
+    int arena = mrb_gc_arena_save(mrb);
+
+    /* mrb_load_irep_buf valida o cabecalho RITE (versao/boxing). Se o bytecode
+     * for incompativel devolve um valor sem proc utilizavel e/ou poe mrb->exc.
+     * Tratamos ambos como "cache invalida -> fallback". */
+    mrb_value v = mrb_load_irep_buf(mrb, buf, (size_t)sz);
+    free(buf);
+
+    if (mrb->exc) {
+        /* bytecode invalido ou erro de runtime: limpar e cair para texto */
+        mrb->exc = 0;
+        mrb_gc_arena_restore(mrb, arena);
+        return false;
+    }
+    (void)v;
+    mrb_gc_arena_restore(mrb, arena);
+    return true;
+}
+
+/* Grava o codigo-fonte (ja descomprimido e patchado) para o PC compilar com
+ * mrbc. So grava se ainda nao existir o .rb (evita reescrever a cada corrida). */
+static void mkxp_plugin_dump_src(const char* src_path,
+                                 const unsigned char* code, size_t code_len) {
+    FILE* tf = fopen(src_path, "rb");
+    if (tf) { fclose(tf); return; }   /* ja existe -> nao reescreve */
+    FILE* wf = fopen(src_path, "wb");
+    if (!wf) return;
+    fwrite(code, 1, code_len, wf);
+    fclose(wf);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * CACHE AUTOMATICA NO 3DS (sem BAT) -- Tarefa 6
+ * Compila o script em bytecode e grava o .mrb DIRETAMENTE no 3DS apos o 1o
+ * arranque. Nas corridas seguintes carrega-se o .mrb (rapido).
+ *
+ * REQUISITO: mrb_dump_irep() so existe se a libmruby for compilada SEM
+ * MRB_NO_STDIO (com STDIO). A lib atual do port tem MRB_NO_STDIO, por isso
+ * esta funcao fica protegida por MKXP_CAN_DUMP_IREP. Quando recompilares a
+ * libmruby com STDIO ativado, define MKXP_CAN_DUMP_IREP=1 (no Makefile ou
+ * aqui) e o cache passa a gerar-se SOZINHO no 3DS, sem BAT nenhum.
+ *
+ * Como ativar (recompilar mruby com dump):
+ *   No build_config/nintendo_3ds.rb, remover a flag que define MRB_NO_STDIO
+ *   (ou adicionar mruby-bin-mrbc ao conf.gem). Recompilar a lib. Depois
+ *   compilar o port com -DMKXP_CAN_DUMP_IREP=1.
+ * ───────────────────────────────────────────────────────────────────────── */
+#ifndef MKXP_CAN_DUMP_IREP
+/* LIGADO por defeito: confirmamos que a libmruby do port EXPORTA mrb_dump_irep
+ * (nm libmruby.a mostra "T mrb_dump_irep"), apesar de MRB_NO_STDIO. Logo a cache
+ * de bytecode gera-se AUTOMATICAMENTE no 3DS, sem BAT e sem flags de compilacao.
+ * Basta `make`. Se algum dia a lib for trocada por uma SEM mrb_dump_irep, o
+ * linker vai queixar-se -- nesse caso poe isto a 0 (volta ao metodo do PC). */
+#define MKXP_CAN_DUMP_IREP 1
+#endif
+
+#if MKXP_CAN_DUMP_IREP
+/* mrb_dump_irep vem de <mruby/dump.h> (ja incluido no topo). Confirmado que a
+ * lib o exporta (nm: "T mrb_dump_irep"). Usamos as constantes do header
+ * (DUMP_ENDIAN_NAT / MRB_DUMP_OK), iguais a' cache dos 376 scripts, para as
+ * duas caches serem consistentes e o bytecode compativel. */
+
+/* Compila 'code' e, se compilar limpo, grava o bytecode em cache_path.
+ * Devolve true se gerou o .mrb. Best-effort: qualquer falha -> false. */
+static bool mkxp_plugin_dump_bytecode(mrb_state* mrb, const char* cache_path,
+                                      const unsigned char* code, size_t code_len) {
+    int arena = mrb_gc_arena_save(mrb);
+    mrbc_context* c = mrbc_context_new(mrb);
+    if (!c) { mrb_gc_arena_restore(mrb, arena); return false; }
+    c->no_exec = TRUE;   /* so compila, nao executa */
+
+    mrb_value vp = mrb_load_nstring_cxt(mrb, (const char*)code, code_len, c);
+    if (mrb->exc || !mrb_proc_p(vp)) {
+        mrb->exc = 0;
+        mrbc_context_free(mrb, c);
+        mrb_gc_arena_restore(mrb, arena);
+        return false;
+    }
+    struct RProc* proc = mrb_proc_ptr(vp);
+
+    unsigned char* bin = NULL;
+    size_t   bin_sz = 0;
+    int rc = mrb_dump_irep(mrb, proc->body.irep, DUMP_ENDIAN_NAT, &bin, &bin_sz);
+    bool ok = false;
+    if (rc == MRB_DUMP_OK && bin && bin_sz > 0) {
+        FILE* wf = fopen(cache_path, "wb");
+        if (wf) {
+            ok = (fwrite(bin, 1, bin_sz, wf) == bin_sz);
+            fclose(wf);
+        }
+    }
+    if (bin) mrb_free(mrb, bin);
+    mrbc_context_free(mrb, c);
+    mrb_gc_arena_restore(mrb, arena);
+    return ok;
+}
+#endif /* MKXP_CAN_DUMP_IREP */
+#endif /* MKXP_PLUGIN_CACHE */
+
+
+/* =========================================================
+ * CARREGADOR DE PLUGINS (PluginScripts.rxdata)
+ * ---------------------------------------------------------
+ * O PluginManager original do Essentials esta desligado (stub vazio) neste
+ * port. Por isso os plugins (incluindo o Modular Title Screen, que desenha a
+ * tela bonita do Solar Eclipse) nunca eram carregados, e o jogo caia na tela
+ * de titulo base (splashes do Essentials).
+ *
+ * Esta funcao faz o que o PluginManager.runPlugins original faz:
+ *   - carrega Data/PluginScripts.rxdata (Ruby Marshal)
+ *   - formato: Array de plugins. Cada plugin = [nome, meta, scripts]
+ *     onde scripts = Array de [caminho, codigo_comprimido_zlib]
+ *   - descomprime cada script com zlib e executa-o com mrb_load_nstring
+ *   - aplica os mesmos patches (patch_script) que os scripts base, para
+ *     manter as mesmas correcoes/skip-list a funcionar nos plugins
+ *
+ * Abordagem honesta: executa o codigo real do plugin, sem reimplementar a
+ * tela a mao. Se um plugin especifico falhar, regista [PLUGIN-ERROR] e
+ * continua (como o loop dos 376 scripts), para o boot nao morrer.
+ * ========================================================= */
+static void run_plugin_scripts(mrb_state* mrb, const char* game_path) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/Data/PluginScripts.rxdata", game_path);
+    FILE* fp = fopen(path, "rb");
+    if (!fp) {
+        DBGLOG("[PLUGINS] PluginScripts.rxdata nao encontrado -- sem plugins\n");
+        return;
+    }
+
+    mrb_value plugins = marshalLoadInt(mrb, fp);
+    fclose(fp);
+
+    /* GUARDA: se o marshal lancou excecao (ficheiro corrompido/formato
+     * inesperado), limpar antes de continuar para nao contaminar os
+     * mrb_load_nstring seguintes. */
+    if (mrb->exc) {
+        show_error(mrb, "PluginScripts.rxdata marshal");
+        mrb->exc = 0;
+        return;
+    }
+
+    if (!mrb_array_p(plugins)) {
+        DBGLOG("[PLUGINS] PluginScripts.rxdata nao e um array -- ignorado\n");
+        return;
+    }
+
+    mrb_gc_register(mrb, plugins);
+    int num_plugins = (int)RARRAY_LEN(plugins);
+    DBGLOG("[PLUGINS] %d plugins a carregar\n", num_plugins);
+
+    int ok_scripts = 0, fail_scripts = 0;
+
+#if MKXP_PLUGIN_CACHE
+    /* Preparar a estrutura de pastas da cache (scripts/plugins/rxdata).
+     * Tudo dentro de sdmc:/mkxp/cache/. seq = indice global para garantir que a
+     * ordem de carregamento e' sempre a mesma (critico: os plugins dependem uns
+     * dos outros e das classes base). Com a cache automatica (mrb_dump_irep) os
+     * .mrb geram-se no proprio 3DS; o .rb so se grava como fallback p/ o PC. */
+    mkxp_cache_ensure_tree();
+    int cache_seq = 0;
+    int cache_hits = 0, cache_miss = 0;
+    int cache_dumped = 0;
+#endif
+
+    for (int pi = 0; pi < num_plugins; pi++) {
+        mrb_value plugin = mrb_ary_entry(plugins, pi);
+        if (!mrb_array_p(plugin) || RARRAY_LEN(plugin) < 3) {
+            DBGLOG("[PLUGINS] plugin %d invalido (estrutura)\n", pi);
+            continue;
+        }
+
+        /* plugin = [name, meta, scripts] */
+        mrb_value name_val    = mrb_ary_entry(plugin, 0);
+        mrb_value scripts_val = mrb_ary_entry(plugin, 2);
+
+        const char* pname = mrb_string_p(name_val) ? RSTRING_PTR(name_val) : "?";
+
+        if (!mrb_array_p(scripts_val)) {
+            DBGLOG("[PLUGINS] plugin '%s' sem array de scripts\n", pname);
+            continue;
+        }
+
+        int nscr = (int)RARRAY_LEN(scripts_val);
+
+#if MKXP_SKIP_BROKEN_PLUGINS
+        /* SALTAR plugins pesados que JA' falham por completo -----------------
+         * O EBDX (Elite Battle: DX) sao 485 dos 559 scripts (87%!) e o seu
+         * EBDX Setup.rb da SyntaxError -> cascata -> o plugin INTEIRO ja' nao
+         * funciona hoje. Compilar/executar 485 scripts so' para falhar custa a
+         * maior fatia do tempo de boot (cada script = parse + bytecode no mruby).
+         * Saltar da' EXATAMENTE o mesmo estado funcional (batalha base do
+         * Essentials, que ja' e' o que ha' sem EBDX) mas muito mais rapido.
+         * Lista por prefixo de nome; poe MKXP_SKIP_BROKEN_PLUGINS a 0 p/ reativar. */
+        {
+            static const char* kSkip[] = {
+                "Elite Battle: DX",   /* 485 scripts, Setup.rb SyntaxError, nao funciona */
+                0
+            };
+            bool skip = false;
+            for (int k = 0; kSkip[k]; k++)
+                if (strcmp(pname, kSkip[k]) == 0) { skip = true; break; }
+            if (skip) {
+                DBGLOG("[PLUGINS] SKIP '%s' (%d scripts) -- plugin partido, "
+                       "saltado p/ acelerar boot\n", pname, nscr);
+                continue;
+            }
+        }
+#endif
+
+        DBGLOG("[PLUGINS] plugin '%s' (%d scripts)\n", pname, nscr);
+
+        for (int si = 0; si < nscr; si++) {
+            mrb_value scr = mrb_ary_entry(scripts_val, si);
+            if (!mrb_array_p(scr) || RARRAY_LEN(scr) < 2) continue;
+
+            /* scr = [filepath, zlib_code] */
+            mrb_value spath_val = mrb_ary_entry(scr, 0);
+            mrb_value code_val  = mrb_ary_entry(scr, 1);
+            if (!mrb_string_p(code_val)) continue;
+
+            const char* compressed = RSTRING_PTR(code_val);
+            int compressed_len     = (int)RSTRING_LEN(code_val);
+
+            /* nome do ficheiro do script (so a parte final, p/ logs/patches) */
+            char sname[128] = "plugin_script";
+            if (mrb_string_p(spath_val)) {
+                const char* sp = RSTRING_PTR(spath_val);
+                const char* base = sp;
+                for (const char* c = sp; *c; c++) {
+                    if (*c == '/' || *c == '\\') base = c + 1;
+                }
+                snprintf(sname, sizeof(sname), "%s", base);
+            }
+
+            /* descomprimir zlib (igual ao loop dos 376 scripts) */
+            uLongf dest_len = (compressed_len > 0 ? compressed_len : 1) * 4;
+            std::vector<Bytef> decomp(dest_len);
+            int ret = uncompress(decomp.data(), &dest_len,
+                                 (const Bytef*)compressed, compressed_len);
+            while (ret == Z_BUF_ERROR) {
+                dest_len *= 2;
+                decomp.resize(dest_len);
+                ret = uncompress(decomp.data(), &dest_len,
+                                 (const Bytef*)compressed, compressed_len);
+            }
+            if (ret != Z_OK) {
+                DBGLOG("[PLUGIN-ERROR] uncompress falhou em '%s'/'%s'\n", pname, sname);
+                fail_scripts++;
+                continue;
+            }
+            decomp.resize(dest_len);
+
+            /* patch especifico de plugins: NAO mexe em defined? (o MODTS
+             * precisa dele). Ver patch_plugin_script. */
+            patch_plugin_script(decomp, (uLong)decomp.size(), sname);
+
+#if MKXP_PLUGIN_CACHE
+            /* Chave de ficheiro: NNNN_nome (indice sequencial preserva ordem). */
+            int seq = cache_seq++;
+            char safe[96];
+            mkxp_safe_name(sname, safe, sizeof(safe));
+            /* Remover a extensao .rb do nome (o sname ja a inclui), senao os
+             * ficheiros ficavam com extensao dupla: 0127_GRUDGE.rb.rb /
+             * 0127_GRUDGE.rb.mrb. Cortamos no ultimo ".rb" final. */
+            {
+                size_t sl = strlen(safe);
+                if (sl >= 3 && strcmp(safe + sl - 3, ".rb") == 0) {
+                    safe[sl - 3] = 0;
+                }
+            }
+            char cache_path[256];
+            char src_path[256];
+            snprintf(cache_path, sizeof(cache_path),
+                     "sdmc:/mkxp/cache/plugins/%04d_%s.mrb", seq, safe);
+            snprintf(src_path, sizeof(src_path),
+                     "sdmc:/mkxp/cache/plugins/%04d_%s.rb", seq, safe);
+
+            /* 1) Tentar bytecode pre-compilado (rapido). */
+            if (mkxp_plugin_cache_run(mrb, cache_path, sname)) {
+                cache_hits++;
+                ok_scripts++;
+                continue;
+            }
+
+            /* 2) Sem cache: gravar o fonte para o PC compilar com mrbc... */
+            cache_miss++;
+            mkxp_plugin_dump_src(src_path, decomp.data(), decomp.size());
+#if MKXP_CAN_DUMP_IREP
+            /* ...e, se a lib suportar dump, gerar o .mrb AUTOMATICAMENTE no 3DS
+             * (sem BAT). Na proxima corrida este script ja sai da cache. */
+            if (mkxp_plugin_dump_bytecode(mrb, cache_path,
+                                          decomp.data(), decomp.size())) {
+                cache_dumped++;
+            }
+#endif
+            /* ...e correr por texto desta vez (caminho normal abaixo). */
+#endif
+
+            /* executar */
+            mrb_value result = mrb_load_nstring(mrb, (const char*)decomp.data(),
+                                                decomp.size());
+            (void)result;
+            if (mrb->exc) {
+                /* regista o erro detalhado mas continua (boot resiliente) */
+                char ctx[200];
+                snprintf(ctx, sizeof(ctx), "plugin '%s' / %s", pname, sname);
+                show_error(mrb, ctx);
+                mrb->exc = 0;
+                fail_scripts++;
+            } else {
+                ok_scripts++;
+            }
+        }
+    }
+
+    mrb_gc_unregister(mrb, plugins);
+#if MKXP_PLUGIN_CACHE
+    DBGLOG("[PLUGINS] cache: %d hits (.mrb), %d miss (texto)\n",
+           cache_hits, cache_miss);
+#if MKXP_CAN_DUMP_IREP
+    DBGLOG("[PLUGINS] cache: %d .mrb gerados AUTOMATICAMENTE no 3DS\n", cache_dumped);
+    if (cache_dumped > 0)
+        DBGLOG("[PLUGINS] >> proxima corrida sera' rapida (sem BAT)\n");
+#else
+    if (cache_miss > 0) {
+        DBGLOG("[PLUGINS] >> Fontes em sdmc:/mkxp/plugin_src/ (compilar no PC com mrbc)\n");
+        DBGLOG("[PLUGINS] >> Ou recompilar libmruby c/ STDIO + -DMKXP_CAN_DUMP_IREP=1 p/ cache automatica\n");
+    }
+#endif
+#endif
+    DBGLOG("[PLUGINS] concluido: %d scripts OK, %d falharam\n",
+           ok_scripts, fail_scripts);
+}
 
 /* =========================================================
  * ENTRY POINT
@@ -3617,6 +4461,12 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
     mrb_gc_unregister(mrb, scripts_array);
     DBGLOG("[SCRIPTS] Loaded %d scripts\n", num_scripts);
 
+    /* CARREGAR PLUGINS (PluginScripts.rxdata) -- DEPOIS dos 376 scripts base.
+     * Os plugins dependem das classes base (Sprite, Viewport, GameData, etc),
+     * por isso tem de correr aqui. E' isto que define ModularTitleScreen e a
+     * tela bonita do Solar Eclipse. Sem isto o jogo cai na tela base. */
+    run_plugin_scripts(mrb, game_path);
+
     /* Carregar debug_probe.rb DEPOIS dos scripts do jogo.
      * CRITICO: tem de ser aqui. Scene_Map, mainFunctionDebug e todas as
      * classes do jogo so existem depois dos 376 scripts terem sido
@@ -3638,10 +4488,31 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
             DBGLOG("[PROBE] debug_probe.rb nao encontrado -- modo normal\n");
         }
     }
+
+    /* Carregar smoke_test.rb (define o modulo SmokeTest). NAO corre aqui --
+     * a execucao (SmokeTest.run_all) e' feita mais tarde, no Scene_DebugIntro,
+     * quando GameData e todas as classes ja estao prontos. Aqui so' define.
+     * Para desactivar: apagar/renomear smoke_test.rb. */
+    {
+        FILE *kf = fopen("sdmc:/mkxp/smoke_test.rb", "rb");
+        if (kf) {
+            fseek(kf, 0, SEEK_END); long ksz = ftell(kf); fseek(kf, 0, SEEK_SET);
+            char *kbuf = (char*)malloc(ksz + 1);
+            fread(kbuf, 1, ksz, kf); fclose(kf); kbuf[ksz] = 0;
+            mrb_load_string(mrb, kbuf); free(kbuf);
+            if (mrb->exc) { show_error(mrb, "smoke_test"); mrb->exc = 0; }
+            else DBGLOG("[SMOKE] smoke_test.rb carregado (corre no Scene_DebugIntro)\n");
+        } else {
+            DBGLOG("[SMOKE] smoke_test.rb nao encontrado -- sem smoke test\n");
+        }
+    }
 }
 
 /* base path do jogo (ex.: "sdmc:/mkxp/game"), usado pelo load_data real */
 static char g_game_base[300] = {0};
+/* Caminho do ficheiro de cache rxdata pendente de gravacao (preenchido na
+ * leitura do load_data quando ha MISS; usado no fim para gravar o resultado). */
+char g_rxcache_pending[600] = {0};
 
 int binding_3ds_run(const char *game_path) {
     dbglog_open();
@@ -3699,7 +4570,14 @@ int binding_3ds_run(const char *game_path) {
      *
      * Implementacao RGSS real: resolve <base>/<path> e desserializa via
      * marshalLoadInt (que ja reconstroi RPG::Table nativamente). Registado
-     * ANTES de run_rmxp_scripts -> o stub do rgss_stubs.rb e ignorado. */
+     * ANTES de run_rmxp_scripts -> o stub do rgss_stubs.rb e ignorado.
+     *
+     * CACHE RXDATA (MKXP_RXDATA_CACHE): a 1a corrida grava o resultado ja
+     * desserializado em sdmc:/mkxp/cache/rxdata/<chave>.mrx via marshalDumpInt;
+     * as seguintes leem desse ficheiro e SALTAM o .rxdata da fonte. A chave
+     * inclui tamanho+mtime do rxdata original, por isso se editares os Data/
+     * a cache invalida-se sozinha. Logs [RXCACHE] permitem medir o ganho.
+     * Poe MKXP_RXDATA_CACHE a 0 para desligar e comparar tempos. */
     mrb_define_method(mrb, mrb->kernel_module,
         "load_data",
         [](mrb_state *mrb2, mrb_value) -> mrb_value {
@@ -3713,6 +4591,45 @@ int binding_3ds_run(const char *game_path) {
                 snprintf(path, sizeof(path), "%s/%s", g_game_base, fname ? fname : "");
 
             DBGLOG("[load_data] req='%s' -> '%s'\n", fname ? fname : "(nil)", path);
+
+#if MKXP_RXDATA_CACHE
+            /* --- tentativa de leitura da cache de rxdata -------------------
+             * Chave: nome sanitizado + tamanho + mtime do ficheiro fonte.
+             * Se a fonte nao existir (ex.: path do romfs), saltamos a cache. */
+            g_rxcache_pending[0] = 0;
+            {
+                struct stat st_src;
+                if (fname && stat(path, &st_src) == 0) {
+                    char safe[256]; size_t si = 0;
+                    for (const char *p = fname; *p && si < sizeof(safe)-1; ++p)
+                        safe[si++] = (*p=='/'||*p=='\\'||*p==':') ? '_' : *p;
+                    safe[si] = 0;
+                    snprintf(g_rxcache_pending, sizeof(g_rxcache_pending),
+                             "sdmc:/mkxp/cache/rxdata/%s.%lu.%lu.mrx",
+                             safe, (unsigned long)st_src.st_size,
+                             (unsigned long)st_src.st_mtime);
+
+                    FILE *cf = fopen(g_rxcache_pending, "rb");
+                    if (cf) {
+                        DBGLOG("[RXCACHE] HIT '%s'\n", fname);
+                        mrb_value cv = mrb_nil_value();
+                        bool ok = true;
+                        try { cv = marshalLoadInt(mrb2, cf); }
+                        catch (...) { ok = false; }
+                        fclose(cf);
+                        if (ok && !mrb_nil_p(cv)) {
+                            DBGLOG("[RXCACHE]   load OK (sem re-parse da fonte)\n");
+                            g_rxcache_pending[0] = 0;   /* ja' resolvido */
+                            return cv;
+                        }
+                        DBGLOG("[RXCACHE]   cache corrompida -> recarrega da fonte\n");
+                        remove(g_rxcache_pending);
+                    } else {
+                        DBGLOG("[RXCACHE] MISS '%s' -> grava apos load\n", fname);
+                    }
+                }
+            }
+#endif
 
             FILE *fp = fopen(path, "rb");
             const char *src = "game";
@@ -3759,6 +4676,36 @@ int binding_3ds_run(const char *game_path) {
                 const char *cn = mrb_class_name(mrb2, mrb_class(mrb2, v));
                 DBGLOG("[load_data] '%s' -> %s\n", fname ? fname : "?", cn ? cn : "?");
             }
+
+#if MKXP_RXDATA_CACHE
+            /* --- grava o resultado na cache de rxdata (apos load da fonte) -
+             * Escreve para um ficheiro temporario e so' o renomeia no fim,
+             * para que uma escrita interrompida nao deixe cache corrompida. */
+            if (g_rxcache_pending[0] && !mrb_nil_p(v)) {
+                char tmp[620];
+                snprintf(tmp, sizeof(tmp), "%s.tmp", g_rxcache_pending);
+                FILE *wf = fopen(tmp, "wb");
+                if (wf) {
+                    bool ok = true;
+                    try { marshalDumpInt(mrb2, wf, v); }
+                    catch (...) { ok = false; }
+                    fclose(wf);
+                    if (ok) {
+                        remove(g_rxcache_pending);          /* Windows/3DS: rename falha se destino existe */
+                        if (rename(tmp, g_rxcache_pending) == 0)
+                            DBGLOG("[RXCACHE] gravado '%s' (proxima corrida le da cache)\n",
+                                   g_rxcache_pending);
+                        else { DBGLOG("[RXCACHE] rename falhou -> apaga tmp\n"); remove(tmp); }
+                    } else {
+                        DBGLOG("[RXCACHE] dump falhou -> apaga tmp\n");
+                        remove(tmp);
+                    }
+                } else {
+                    DBGLOG("[RXCACHE] nao consegui abrir tmp para escrita\n");
+                }
+                g_rxcache_pending[0] = 0;
+            }
+#endif
             return v;
         },
         MRB_ARGS_REQ(1));

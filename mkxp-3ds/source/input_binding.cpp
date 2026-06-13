@@ -2,10 +2,24 @@
 #include <mruby/class.h>
 #include <mruby/array.h>
 #include "input_3ds.h"
+#include "debug_3ds.h"
 
 static bool s_pressed[RMXP_KEY_COUNT];
 static bool s_triggered[RMXP_KEY_COUNT];
 static bool s_released[RMXP_KEY_COUNT];
+
+/* LATCH de input:
+ * O grph_update (C++) chama inputBindingUpdate() MUITAS vezes por cada
+ * scene.update logico do jogo (ex: na tela de titulo, ~146 grph_update por
+ * cada EventScene#update). Se s_triggered fosse so sobrescrito a cada chamada,
+ * um toque no botao A (Input::USE) registado num frame intermedio seria
+ * apagado antes de o jogo chamar Input.trigger?, perdendo-se.
+ *
+ * Solucao: acumular ("latch") o trigger/release num buffer que SO e limpo
+ * quando o Ruby o le (em inp_trigger / inp_release). Assim qualquer toque
+ * entre duas leituras do jogo fica guardado ate ser consumido. */
+static bool s_trigger_latch[RMXP_KEY_COUNT];
+static bool s_release_latch[RMXP_KEY_COUNT];
 
 /* Chamado UMA vez por frame, exclusivamente por grph_update (C++).
  * Input.update (Ruby) e um no-op para evitar double-poll. */
@@ -18,8 +32,18 @@ void inputBindingUpdate() {
     for (int i = 0; i < RMXP_KEY_COUNT; i++) {
         s_triggered[i] = new_triggered[i];
         s_released[i]  = new_released[i];
+        /* acumula no latch: uma vez true, fica true ate o Ruby ler */
+        if (new_triggered[i]) s_trigger_latch[i] = true;
+        if (new_released[i])  s_release_latch[i]  = true;
         if (new_triggered[i]) s_pressed[i] = true;
         if (new_released[i])  s_pressed[i] = false;
+        /* Super Debug: registar QUALQUER tecla fisica detectada. Mostra no log
+         * se o input do 3DS/Azahar esta a chegar ao binding. Se carregas em A
+         * e NAO aparece "tecla detectada k=13", o problema e' a montante
+         * (input_3ds_poll / mapeamento / foco da janela). */
+        if (new_triggered[i] && DBGV(DBG_INPUT)) {
+            DBG(DBG_INPUT, "tecla detectada k=%d (latch ON)", i);
+        }
     }
 }
 
@@ -34,7 +58,18 @@ static mrb_value inp_press(mrb_state *mrb, mrb_value self) {
 }
 static mrb_value inp_trigger(mrb_state *mrb, mrb_value self) {
     (void)self; mrb_int k; mrb_get_args(mrb, "i", &k);
-    return (k>=0&&k<RMXP_KEY_COUNT&&s_triggered[k]) ? mrb_true_value() : mrb_false_value();
+    if (k>=0 && k<RMXP_KEY_COUNT && s_trigger_latch[k]) {
+        s_trigger_latch[k] = false;   /* consome o latch ao ler */
+        DBG(DBG_INPUT, "trigger? k=%d -> TRUE (latch consumido)", (int)k);
+        return mrb_true_value();
+    }
+    /* DIAGNOSTICO: registar TODAS as leituras de trigger? para ver a sequencia
+     * exata (quem le o que, e se o latch de 13 e' consumido por outra leitura).
+     * So loga teclas relevantes (k<=18) ou fora de limites, p/ nao inundar. */
+    if (DBGV(DBG_INPUT) && (k < 0 || k > RMXP_KEY_COUNT || k == 13 || k == 12 || k == 11)) {
+        DBG(DBG_INPUT, "trigger? k=%d -> false (latch off ou fora de limites)", (int)k);
+    }
+    return mrb_false_value();
 }
 static mrb_value inp_repeat(mrb_state *mrb, mrb_value self) {
     (void)self; mrb_int k; mrb_get_args(mrb, "i", &k);
@@ -42,7 +77,11 @@ static mrb_value inp_repeat(mrb_state *mrb, mrb_value self) {
 }
 static mrb_value inp_release(mrb_state *mrb, mrb_value self) {
     (void)self; mrb_int k; mrb_get_args(mrb, "i", &k);
-    return (k>=0&&k<RMXP_KEY_COUNT&&s_released[k]) ? mrb_true_value() : mrb_false_value();
+    if (k>=0 && k<RMXP_KEY_COUNT && s_release_latch[k]) {
+        s_release_latch[k] = false;   /* consome o latch ao ler */
+        return mrb_true_value();
+    }
+    return mrb_false_value();
 }
 static mrb_value inp_dir4(mrb_state *mrb, mrb_value self) {
     (void)self;
@@ -65,6 +104,18 @@ void inputBindingInit(mrb_state *mrb) {
     mrb_define_module_function(mrb, mod, "release?", inp_release, MRB_ARGS_REQ(1));
     mrb_define_module_function(mrb, mod, "dir4",     inp_dir4,    MRB_ARGS_NONE());
     mrb_define_module_function(mrb, mod, "dir8",     inp_dir8,    MRB_ARGS_NONE());
+
+    /* ALIASES NATIVOS: os mesmos metodos C++ sob nomes que NENHUM plugin toca.
+     * O Essentials/EBDX reabrem `module Input` e fazem
+     *   alias :_old_fl_trigger? :trigger?  +  def trigger?(button) ...wrapper...
+     * Se nesse instante o `trigger?` ja' era uma versao Ruby (KGC, etc.), o alias
+     * captura ESSA, nao o nosso C++ -> o nosso latch nunca e' lido. Com nomes
+     * proprios (trigger_native? etc.), garantimos um caminho direto ao C++ que
+     * podemos repor por cima de qualquer wrapper depois dos scripts carregarem. */
+    mrb_define_module_function(mrb, mod, "trigger_native?", inp_trigger, MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, mod, "press_native?",   inp_press,   MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, mod, "repeat_native?",  inp_repeat,  MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, mod, "release_native?", inp_release, MRB_ARGS_REQ(1));
 
     mrb_define_const(mrb, mod, "DOWN",  mrb_int_value(mrb, RMXP_DOWN));
     mrb_define_const(mrb, mod, "LEFT",  mrb_int_value(mrb, RMXP_LEFT));

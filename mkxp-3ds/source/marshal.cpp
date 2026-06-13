@@ -443,8 +443,8 @@ static mrb_value read_value(ReadCtx *c){
         case TYPE_LINK:    v=read_link(c);   break;
         case TYPE_USERDEF: v=read_userdef(c); c->objects.add(v); break;
         default:
-            MZLOG("[marshal] ERRO: tipo nao suportado '%c' (0x%02x) @offset\n",
-                  (char)type,(unsigned char)type);
+            MZLOG("[marshal] ERRO: tipo nao suportado '%c' (0x%02x) @pos=%d/%d\n",
+                  (char)type,(unsigned char)type,(int)c->rb->pos,(int)c->rb->size);
             throw MarshalException(MarshalException::MKXPError,"unsupported type '%c'",(char)type);
     }
     mrb_gc_arena_restore(mrb,arena); return v;
@@ -564,11 +564,23 @@ mrb_value marshalLoadInt(mrb_state *mrb, FILE *fp){
     fread(buf.data(),1,sz,fp);
     ReadBuf rb(buf.data(),sz); ReadCtx c; c.rb=&rb; c.mrb=mrb;
     s_tbl_built=0; s_udef_seen=0;
-    verify_header(&c);
-    mrb_value v=read_value(&c);
-    MZLOG("[marshal] load OK (%ld bytes): userdefs=%d tables=%d top_type=%d\n",
-          sz,s_udef_seen,s_tbl_built,(int)mrb_type(v));
-    return v;
+    /* try/catch para registar EXATAMENTE onde o marshal falha (tipo + posicao).
+     * Sem isto, a MarshalException propagava-se como excecao C++ pura e o erro
+     * detalhado nunca chegava ao log -- so se via "marshal falhou" sem causa.
+     * Agora convertemos em erro mruby (como mrb_marshal_load faz) e logamos o
+     * ponto de falha, para poder corrigir a causa raiz. */
+    try {
+        verify_header(&c);
+        mrb_value v=read_value(&c);
+        MZLOG("[marshal] load OK (%ld bytes): userdefs=%d tables=%d top_type=%d\n",
+              sz,s_udef_seen,s_tbl_built,(int)mrb_type(v));
+        return v;
+    } catch(const MarshalException &e){
+        MZLOG("[marshal] FALHA @pos=%d/%ld apos %d tables, %d userdefs: %s\n",
+              (int)rb.pos,sz,s_tbl_built,s_udef_seen,e.msg);
+        raiseMrbExc(mrb,e);   /* converte em erro mruby (mrb->exc fica setado) */
+        return mrb_nil_value();
+    }
 }
 
 /* ====== MRB BINDINGS ============================================== */
