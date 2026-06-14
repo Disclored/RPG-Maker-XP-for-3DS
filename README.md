@@ -55,7 +55,7 @@ Results:
 | ---------- | ------ | -------------- |
 | Scripts    | 92s    | 3.6s           |
 | Plugins    | 80s    | 1.4s           |
-| Data files | —      | ~10–30× faster |
+| Data files | 1100s  | ~10–30× faster |
 
 ### Bytecode cache
 
