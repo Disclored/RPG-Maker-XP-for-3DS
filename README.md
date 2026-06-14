@@ -1,6 +1,6 @@
 mkxp-3ds — Pokémon Essentials on 3DS
 
-⚠️ Status: work in progress. Pokémon fan games are not fully playable yet — boot and rendering work, but performance and some plugins are still being fixed.
+Status: work in progress. Pokémon fan games are not fully playable yet — boot and rendering work, but performance and some plugins are still being fixed.
 
 A fork of mkxp-z that runs RPG Maker XP / RGSS1 games (including Pokémon Essentials fan games) natively on Nintendo 3DS, powered by mruby.
 Setup
