@@ -11,6 +11,8 @@ Game + SD card (Azahar emulator / real 3DS homebrew): C:\Users\USER\AppData\Roam
 Progress
 
 13/06/2026 — First successful full boot (engine reaches the title/map and renders).
+<img width="486" height="337" alt="image" src="https://github.com/user-attachments/assets/56ca29c0-6746-46aa-af3f-6f11f35c3973" />
+
 14/06/2026 — Boot time cut from ~15 minutes to ~10 seconds (scripts + plugins + .rxdata loading).
 
 What was done
