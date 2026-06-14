@@ -13,12 +13,40 @@ rescue
 end
 
 module Probe
+  # Throttle de escrita: o gargalo de FPS no 3DS e' o fwrite+flush no cartao
+  # SD a cada linha. Mantemos TODO o logging, mas (1) sem flush por linha
+  # (flush so' a cada N), e (2) colapsando linhas IDENTICAS consecutivas
+  # (o spam de Map000/EV exec repete a mesma linha centenas de vezes).
+  @last_line = nil
+  @dup_count = 0
+  @since_flush = 0
   def self.log(msg)
     line = "[PRB] #{msg}"
+    # colapsar duplicados consecutivos: em vez de escrever a mesma linha
+    # 300x, escrevemos 1x e depois "(xN)" quando muda.
+    if line == @last_line
+      @dup_count += 1
+      return if @dup_count < 200   # deixa passar 1 em cada 200 repeticoes
+      line = "#{line} (x#{@dup_count})"
+      @dup_count = 0
+    else
+      if @dup_count > 0
+        flush_line("#{@last_line} (x#{@dup_count})")
+        @dup_count = 0
+      end
+      @last_line = line
+    end
+    flush_line(line)
+  end
+  def self.flush_line(line)
     begin
       if $_probe_file
         $_probe_file.write(line + "\n")
-        $_probe_file.flush rescue nil
+        @since_flush += 1
+        if @since_flush >= 40          # flush em lotes, nao por linha
+          $_probe_file.flush rescue nil
+          @since_flush = 0
+        end
       end
     rescue; end
     begin; printf("#{line}\n"); rescue; end
