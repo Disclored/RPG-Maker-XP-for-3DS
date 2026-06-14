@@ -15,7 +15,7 @@ volatile int g_dbg_frame = 0;
 uint32_t g_dbg_mask =
     DBG_INPUT | DBG_DISPLAY | DBG_RENDER | DBG_BITMAP | DBG_VRAM |
     DBG_SCALE | DBG_CACHE | DBG_COMPILE | DBG_TIMING | DBG_RESOURCE |
-    DBG_STATE | DBG_ERROR | DBG_MARSHAL | DBG_AUDIO;
+    DBG_STATE | DBG_ERROR | DBG_MARSHAL | DBG_AUDIO | DBG_DIALOG;
 
 const char* dbg_cat_name(uint32_t cat) {
     switch (cat) {
@@ -36,6 +36,7 @@ const char* dbg_cat_name(uint32_t cat) {
         case DBG_ERROR:    return "ERROR";
         case DBG_MARSHAL:  return "MARSHAL";
         case DBG_AUDIO:    return "AUDIO";
+        case DBG_DIALOG:   return "DIALOG";
         default:           return "DBG";
     }
 }

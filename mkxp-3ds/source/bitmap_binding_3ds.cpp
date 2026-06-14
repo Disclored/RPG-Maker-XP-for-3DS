@@ -1,5 +1,6 @@
 #include "bitmap_binding_3ds.h"
 #include "display_3ds.h"
+#include "debug_3ds.h"
 #include <3ds.h>
 #include <citro2d.h>
 #include <mruby.h>
@@ -412,6 +413,11 @@ static mrb_value bmp_blt(mrb_state *mrb, mrb_value self) {
         }
     }
     dst->tex_dirty = true;
+    /* LOG (DBG_DIALOG): imagem copiada (retrato, moldura) -- origem WxH + rect,
+     * destino WxH + posicao. Revela tamanhos das imagens das caixas. */
+    DBG(DBG_DIALOG, "[BLT] src=%dx%d rect=(%d,%d,%d,%d) -> dst=%dx%d @(%d,%d) op=%d",
+        src->width, src->height, sx0, sy0, sw, sh,
+        dst->width, dst->height, (int)dx, (int)dy, (int)opacity);
     return mrb_nil_value();
 }
 
@@ -464,6 +470,12 @@ static mrb_value bmp_stretch_blt(mrb_state *mrb, mrb_value self) {
         }
     }
     dst->tex_dirty = true;
+    /* LOG (DBG_DIALOG): esticamento -- e' assim que a windowskin (ex: 96x48) e'
+     * redimensionada para a moldura da caixa. O retangulo DESTINO (dx,dy,dw,dh)
+     * = dimensoes reais da janela desenhada. Compara com o tamanho esperado. */
+    DBG(DBG_DIALOG, "[STRETCH] src=%dx%d s=(%d,%d,%d,%d) -> dst=%dx%d d=(%d,%d,%d,%d)",
+        src->width, src->height, sx0, sy0, sw, sh,
+        dst->width, dst->height, dx, dy, dw, dh);
     return mrb_nil_value();
 }
 
@@ -726,6 +738,11 @@ static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
     int drawY = ay + ((ah > lineH) ? (ah - lineH) / 2 : 0);
 
     fnt_draw_into_bitmap(b, drawX, drawY, str, (int)slen, R, G, B, A);
+    /* LOG DIAGNOSTICO (DBG_DIALOG): o TEXTO que esta a ser desenhado, em que
+     * retangulo, em que bitmap (tamanho), com que cor e largura medida. Mostra
+     * o conteudo real das caixas e se o letra-a-letra avanca (strings a crescer). */
+    DBG(DBG_DIALOG, "[TXT] '%.50s' rect=(%d,%d,%d,%d) al=%d -> bmp=%dx%d rgba=%d,%d,%d,%d tw=%d",
+        str, ax, ay, aw, ah, align, b->width, b->height, R, G, B, A, tw);
     return mrb_nil_value();
 }
 

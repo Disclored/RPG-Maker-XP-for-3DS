@@ -59,6 +59,7 @@ enum {
     DBG_ERROR     = 1u << 14,  /* erros silenciosos, fallbacks                 */
     DBG_MARSHAL   = 1u << 15,  /* marshal load/reconstrucao                     */
     DBG_AUDIO     = 1u << 16,  /* (futuro) audio                                */
+    DBG_DIALOG    = 1u << 17,  /* caixas de dialogo: texto, tamanhos, janelas   */
     DBG_ALL       = 0xFFFFFFFFu
 };
 

@@ -1076,30 +1076,15 @@ begin
   end
 rescue; end
 
-# -- Regexp (mruby 3.2 nao tem Regexp built-in) -------------------------------
-begin
-  class Regexp
-    IGNORECASE = 1
-    EXTENDED   = 2
-    MULTILINE  = 4
-    def initialize(src, flags=0); @src = src.to_s; end
-    def ===(s); false; end
-    def =~(s); nil; end
-    def match(s); nil; end
-    def source; @src; end
-    def to_s; "/#{@src}/"; end
-    def inspect; "/#{@src}/"; end
-    def self.compile(src, flags=0); new(src, flags); end
-    def self.last_match; nil; end
-    def self.escape(str); str.to_s; end
-    def self.quote(str); str.to_s; end
-    def self.union(*args); new(args.map(&:to_s).join("|")); end
-    # FIX: Regexp#to_str -- chamado [x41] quando codigo faz string + regexp
-    # ex: Sprite_Timer usa format() com regexp como argumento.
-    # to_str permite conversao implicita para String.
-    def to_str; @src.to_s; end
-  end
-rescue; end
+# -- Regexp -------------------------------------------------------------------
+# [REGEXP-REAL] Stub no-op de Regexp REMOVIDO. O mruby-onig-regexp faz
+# 'Regexp = OnigRegexp' no mrb_open (cedo). Como o COMPAT_STUBS_RUBY corre
+# DEPOIS, este 'class Regexp ... end' reabria o PROPRIO OnigRegexp e injetava-lhe
+# no-ops (===->false, =~->nil, match->nil) e um to_str->String. Esse to_str fazia
+# o gsub nativo tentar converter o OnigRegexp para String -> "TypeError: OnigRegexp
+# cannot be converted to String" em getFormattedTextForDims/resizeToFit, rebentando
+# (em rescue silencioso) a criacao da janela de mensagem -> intro com caixa vazia.
+# O onig ja fornece Regexp/OnigRegexp real e completo; nao mexer aqui.
 
 # -- Kernel --------------------------------------------------------------------
 # Metodos aqui ficam disponiveis em qualquer instancia (Kernel e mixado em Object)

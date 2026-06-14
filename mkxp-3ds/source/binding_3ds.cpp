@@ -704,6 +704,54 @@ static void patch_script(std::vector<Bytef> &decomp, uLong dest_sz, const char *
         remove_unless_block(buf, dest_sz, "unless defined?(update_KGC_SpecialTransition)");
     }
 
+    /* [DEFCHK] DIAGNOSTICO + FIX da forma "defined? expr" (SEM parentese colado).
+     * O replace_defined_keyword (abaixo) so apanha "defined?(". A forma sem
+     * parentese -- ex: "X = Y unless defined? Z" -- escapa, e o mruby tenta
+     * chamar 'defined?' como metodo -> NoMethodError (rebenta o script, ex:
+     * 003_Dialogue_Specific.rb:9). Aqui localizamos cada ocorrencia BARE, logamos
+     * script:linha+contexto (para isolar), e substituimos os 8 bytes "defined?"
+     * por "false &&" (exatamente 8 chars): curto-circuita (a expr NAO e avaliada)
+     * e e falsy -- mesma semantica do replace que poe nil. Sem mudanca de tamanho. */
+    {
+        char *q = buf;
+        size_t blen = (size_t)dest_sz;
+        while ((size_t)(q - buf) + 8 <= blen) {
+            if (memcmp(q, "defined?", 8) != 0) { q++; continue; }
+            /* excluir sufixos de nome de metodo: method_defined?, const_defined?, obj.defined? */
+            if (q > buf) {
+                char pc = q[-1];
+                bool ident = (pc >= 'a' && pc <= 'z') || (pc >= 'A' && pc <= 'Z') ||
+                             (pc >= '0' && pc <= '9') || pc == '_' || pc == '.';
+                if (ident) { q += 8; continue; }
+            }
+            /* excluir comentario de linha */
+            {
+                char *ls0 = q; bool cmt = false;
+                while (ls0 > buf && ls0[-1] != '\n') ls0--;
+                for (char *c = ls0; c < q; c++) { if (*c == '#') { cmt = true; break; } }
+                if (cmt) { q += 8; continue; }
+            }
+            /* proximo char nao-espaco depois de "defined?" */
+            char *r = q + 8;
+            while ((size_t)(r - buf) < blen && (*r == ' ' || *r == '\t')) r++;
+            char nx = ((size_t)(r - buf) < blen) ? *r : '\0';
+            if (nx != '(') {
+                /* forma BARE -> escapa ao replace_defined_keyword. Logar + corrigir. */
+                int line = 1;
+                for (char *c = buf; c < q; c++) if (*c == '\n') line++;
+                char *ls = q; while (ls > buf && ls[-1] != '\n') ls--;
+                char *le = q; while ((size_t)(le - buf) < blen && *le != '\n') le++;
+                int n = (int)(le - ls); if (n > 90) n = 90;
+                char ctx[96];
+                memcpy(ctx, ls, n); ctx[n] = '\0';
+                DBGLOG("[DEFCHK] %s:%d defined? SEM parentese -> corrigido (false &&): %s\n",
+                       name, line, ctx);
+                memcpy(q, "false &&", 8);   /* 8 bytes, mesmo tamanho */
+            }
+            q += 8;
+        }
+    }
+
     /* Substituir defined?(...) por nil em TODOS os scripts -- fix global para mruby.
      * Feito APOS os remove_unless_block acima para preservar os marcadores. */
     replace_defined_keyword(buf, (size_t)dest_sz);
@@ -1103,19 +1151,9 @@ def safeIsDirectory?(f)
   ret
 end
 
-# FIX: Regexp#to_str -- [x41] no log -- conversao implicita quando codigo faz
-# "string" + regexp_obj ou format() com regexp. Adicionar aqui (pos-scripts)
-# garante override mesmo que algum script reabra Regexp.
-begin
-  class Regexp
-    unless method_defined?(:to_str)
-      def to_str; @src.to_s rescue ""; end
-    end
-    unless method_defined?(:length)
-      def length; (@src.to_s rescue "").length; end
-    end
-  end
-rescue; end
+# [REGEXP-REAL] Regexp#to_str/length removidos: o mruby agora tem Regexp real
+# (mruby-onig-regexp). O antigo shim devolvia "" e fazia o sub/gsub abaixo tratar
+# o regex como string vazia. Sem ele, sub/gsub/[] usam o regex nativo.
 
 # FIX: Object#timer / Game_System#timer -- [x1] no log
 # Sprite_Timer chama $game_system.timer para obter o valor do timer.
@@ -1140,71 +1178,11 @@ begin
 rescue; end
 
 # -- String#[] override pos-scripts -------------------------------------------
-# TypeError: Regexp cannot be converted to Integer em _slice_c.
-# PE usa str[/regex/, 1] para extrair grupos de captura.
-# Redefinir aqui pos-scripts garante override mesmo que algum script reabra String.
-begin
-  class String
-    def [](idx, len=nil)
-      unless idx.is_a?(Integer) || idx.is_a?(String) ||
-             (idx.respond_to?(:exclude_end?))
-        return nil
-      end
-      begin
-        len.nil? ? slice(idx) : slice(idx, len)
-      rescue TypeError
-        nil
-      rescue
-        nil
-      end
-    end
-
-    alias_method :_native_sub,  :sub
-    alias_method :_native_gsub, :gsub
-
-    def sub(pat, rep=nil, &blk)
-      if pat.is_a?(String)
-        blk ? _native_sub(pat, &blk) : _native_sub(pat, rep.to_s)
-      elsif pat.respond_to?(:to_str)
-        blk ? _native_sub(pat.to_str, &blk) : _native_sub(pat.to_str, rep.to_s)
-      else
-        self.dup
-      end
-    rescue
-      self.dup
-    end
-
-    def sub!(pat, rep=nil, &blk)
-      r = sub(pat, rep, &blk)
-      return nil if r == self
-      replace(r)
-      self
-    rescue
-      nil
-    end
-
-    def gsub(pat, rep=nil, &blk)
-      if pat.is_a?(String)
-        blk ? _native_gsub(pat, &blk) : _native_gsub(pat, rep.to_s)
-      elsif pat.respond_to?(:to_str)
-        blk ? _native_gsub(pat.to_str, &blk) : _native_gsub(pat.to_str, rep.to_s)
-      else
-        self.dup
-      end
-    rescue
-      self.dup
-    end
-
-    def gsub!(pat, rep=nil, &blk)
-      r = gsub(pat, rep, &blk)
-      return nil if r == self
-      replace(r)
-      self
-    rescue
-      nil
-    end
-  end
-rescue; end
+# [REGEXP-REAL] Overrides de String#[]/sub/sub!/gsub/gsub! removidos.
+# Eram band-aids da era do Regexp no-op: o [] devolvia nil para indices Regexp
+# (partia text[FORMATREGEXP] e str[/regex/,1]) e o sub/gsub tratava o regex via
+# to_str (string vazia). Com o mruby-onig-regexp, os metodos nativos de String ja
+# aceitam Regexp corretamente ([], sub, gsub, scan, match, =~, split testados).
 
 # -- Array#[] post-scripts: suporte a 3 args estilo Table ---------------------
 # CRITICO: o Marshal do mruby desserializa RPG::Map#data como Array nativo em vez
@@ -1762,17 +1740,9 @@ module Game
   def self.set_up_system; end
 end
 
-class Regexp
-  IGNORECASE = 1
-  EXTENDED   = 2
-  MULTILINE  = 4
-  def initialize(src, flags=0); @src = src.to_s; end
-  def ===(s); false; end
-  def =~(s); nil; end
-  def match(s); nil; end
-  def source; @src; end
-  def to_s; "/#{@src}/"; end
-end
+# [REGEXP-REAL] class Regexp no-op removida. O mruby-onig-regexp ja fornece
+# Regexp real (===, =~, match, source, IGNORECASE/EXTENDED/MULTILINE, escape,
+# captures, /i). Reabrir a classe com no-ops anulava o regex.
 
 module Graphics
   def self.update_KGC_SpecialTransition; end
@@ -4782,6 +4752,136 @@ end
         if (mrb->exc) { mrb->exc = 0; }
     }
 
+    /* ===========================================================================
+     * DIAGNOSTICO DE CAIXAS DE DIALOGO (DBG_DIALOG no lado C++ trata texto/blits;
+     * aqui ligamos o lado Ruby). Intercepta Window_AdvancedTextPokemon#text= --
+     * dispara UMA vez por mensagem (volume baixo, nao por-frame) e regista:
+     *   - o TEXTO da mensagem (ate 60 chars, \n visivel)
+     *   - a GEOMETRIA da janela (x,y,largura,altura,bordas)
+     *   - a windowskin (existe? tamanho) e se e' letra-a-letra / a escrever
+     * Combinado com [TXT]/[BLT]/[STRETCH] (C++), da' o quadro completo: que
+     * texto, que tamanho de caixa, que imagem, e (pelos intervalos entre logs +
+     * o log [INPUT]) se espera pelo A. Tudo defensivo (rescue) -- se a classe
+     * nao existir ou algo falhar, so' regista e continua. ====================== */
+    {
+        const char *dlg_hook =
+            "begin\n"
+            "  if defined?(Window_AdvancedTextPokemon)\n"
+            "    class Window_AdvancedTextPokemon\n"
+            "      alias_method :__diag_text_set, :text= unless method_defined?(:__diag_text_set)\n"
+            "      def text=(v)\n"
+            "        __diag_text_set(v)\n"
+            "        begin\n"
+            "          t = v.to_s.gsub(\"\\n\", \"\\\\n\")\n"
+            "          t = t[0,60] if t.length > 60\n"
+            "          sk = (self.windowskin rescue nil)\n"
+            "          ss = sk ? \"#{sk.width}x#{sk.height}\" : 'NIL'\n"
+            "          bx = (self.borderX rescue '?')\n"
+            "          by = (self.borderY rescue '?')\n"
+            "          MKXPDebug.log(\"[DLG] msg='#{t}' win=(#{self.x},#{self.y}) #{self.width}x#{self.height} border=#{bx},#{by} skin=#{ss} lbl=#{@letterbyletter} disp=#{@displaying}\")\n"
+            "        rescue => e\n"
+            "          MKXPDebug.log(\"[DLG] log-err #{e.class}: #{e.message}\")\n"
+            "        end\n"
+            "      end\n"
+            "    end\n"
+            "    MKXPDebug.log('[DLG] hook instalado em Window_AdvancedTextPokemon#text=')\n"
+            "  else\n"
+            "    MKXPDebug.log('[DLG] Window_AdvancedTextPokemon nao existe -- hook nao instalado')\n"
+            "  end\n"
+            "rescue => e\n"
+            "  MKXPDebug.log(\"[DLG] hook falhou: #{e.class}: #{e.message}\")\n"
+            "end\n";
+        mrb_load_string(mrb, dlg_hook);
+        if (mrb->exc) { mrb->exc = 0; }
+    }
+
+    /* [PBMSG] Diagnostico do fluxo de mensagens da intro:
+     *  - hook em Object#pbMessage  -> capta CADA chamada + texto (a intro chama?)
+     *  - hook em Window_AdvancedTextPokemon#initialize -> a janela e' criada?
+     * Combinado com o [DLG] (text=), diz-nos onde o texto da intro se perde. */
+    {
+        static const char *pbmsg_hook = R"PBMSG(
+begin
+  unless $__pbmsg_hooked
+    $__pbmsg_hooked = true
+    begin
+      class ::Object
+        alias_method :__diag_pbmessage, :pbMessage
+        def pbMessage(*args, &block)
+          begin
+            t = (args[0]).to_s
+            tt = t.length > 80 ? t[0,80] : t
+            tt = tt.gsub("\n", " / ")
+            MKXPDebug.log("[PBMSG] len=#{t.length} '#{tt}'")
+          rescue
+          end
+          begin
+            __diag_pbmessage(*args, &block)
+          rescue Exception => e
+            MKXPDebug.log("[PBMSG] EXCECAO no pbMessage: #{e.class}: #{e.message}")
+            begin
+              bt = e.backtrace
+              if bt.is_a?(Array)
+                bt[0,8].each_with_index { |l, i| MKXPDebug.log("[PBMSG]   bt[#{i}]: #{l}") }
+              end
+            rescue
+            end
+            raise
+          end
+        end
+      end
+      MKXPDebug.log('[PBMSG] hook instalado em Object#pbMessage')
+    rescue => e
+      MKXPDebug.log("[PBMSG] pbMessage indisponivel: #{e.class}: #{e.message}")
+    end
+    # Hook em pbCreateMessageWindow -- e' AQUI que a janela e' realmente criada.
+    begin
+      class ::Object
+        alias_method :__diag_pbcmw, :pbCreateMessageWindow
+        def pbCreateMessageWindow(*args, &block)
+          MKXPDebug.log("[PBCMW] pbCreateMessageWindow chamado (args=#{args.length})")
+          begin
+            r = __diag_pbcmw(*args, &block)
+            MKXPDebug.log("[PBCMW] -> #{r.class}")
+            r
+          rescue Exception => e
+            MKXPDebug.log("[PBCMW] EXCECAO: #{e.class}: #{e.message}")
+            begin
+              (e.backtrace || [])[0,8].each_with_index { |l,i| MKXPDebug.log("[PBCMW]   bt[#{i}]: #{l}") }
+            rescue
+            end
+            raise
+          end
+        end
+      end
+      MKXPDebug.log('[PBCMW] hook instalado em Object#pbCreateMessageWindow')
+    rescue => e
+      MKXPDebug.log("[PBCMW] pbCreateMessageWindow indisponivel: #{e.class}: #{e.message}")
+    end
+  end
+  if defined?(Window_AdvancedTextPokemon)
+    class Window_AdvancedTextPokemon
+      unless method_defined?(:__diag_winit)
+        alias_method :__diag_winit, :initialize
+        def initialize(*a)
+          __diag_winit(*a)
+          begin
+            MKXPDebug.log("[DLGINIT] Window_AdvancedTextPokemon.new -> (#{self.x},#{self.y}) #{self.width}x#{self.height}")
+          rescue
+          end
+        end
+      end
+    end
+    MKXPDebug.log('[DLGINIT] hook instalado em Window_AdvancedTextPokemon#initialize')
+  end
+rescue => e
+  MKXPDebug.log("[PBMSG] bloco falhou: #{e.class}: #{e.message}")
+end
+)PBMSG";
+        mrb_load_string(mrb, pbmsg_hook);
+        if (mrb->exc) { mrb->exc = 0; }
+    }
+
     for (;;) {
         DBGLOG("[loop] calling %s\n", entry_name);
         mrb_value retval = mrb_funcall_argv(mrb, top, entry_sym, 0, NULL);
@@ -5590,32 +5690,9 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
         }
     }
 
-    /* Injectar stub de Regexp ANTES do ios_compat_3ds.rb (que usa Regexp) */
-    {
-        static const char *regexp_stub =
-            "begin\n"
-            "  class Regexp\n"
-            "    IGNORECASE = 1\n"
-            "    EXTENDED   = 2\n"
-            "    MULTILINE  = 4\n"
-            "    def initialize(src, flags=0); @src = src.to_s; end\n"
-            "    def ===(s); false; end\n"
-            "    def =~(s); nil; end\n"
-            "    def match(s); nil; end\n"
-            "    def source; @src; end\n"
-            "    def to_s; \"/#{@src}/\"; end\n"
-            "    def inspect; \"/#{@src}/\"; end\n"
-            "    def self.compile(src, flags=0); new(src, flags); end\n"
-            "    def self.last_match; nil; end\n"
-            "    def self.escape(str); str.to_s; end\n"
-            "    def self.quote(str); str.to_s; end\n"
-            "    def self.union(*args); new(args.map(&:to_s).join(\"|\")); end\n"
-            "  end\n"
-            "rescue; end\n";
-        mrb_load_string(mrb, regexp_stub);
-        if (mrb->exc) { show_error(mrb, "regexp_stub_early"); mrb->exc = 0; }
-        else DBGLOG("[STUBS] Regexp stub pre-carregado OK\n");
-    }
+    /* [REGEXP-REAL] Injecao do stub no-op de Regexp removida. O mruby agora tem
+     * Regexp real (mruby-onig-regexp), por isso o ios_compat_3ds.rb passa a usar
+     * o regex nativo em vez do stub que devolvia nil/false. */
 
     /* Carregar ios_compat_3ds.rb -- compat layer portado do iOS */
     {
@@ -5760,6 +5837,50 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
      * Os plugins dependem das classes base (Sprite, Viewport, GameData, etc),
      * por isso tem de correr aqui. E' isto que define ModularTitleScreen e a
      * tela bonita do Solar Eclipse. Sem isto o jogo cai na tela base. */
+    /* [DEFINED-EARLY] Instalar defined?/const_missing/MKXP_UNDEF ANTES dos plugins.
+     * Os plugins (ex: Modular Title Screen via eval, e 003_Dialogue_Specific da
+     * intro) usam defined? em RUNTIME. O [DEFINED-FIX] do bloco MFD so corre
+     * DEPOIS dos plugins -> tarde demais -> NoMethodError 'defined?' e a fala da
+     * intro nunca e criada. Mesma definicao, instalada aqui antes dos plugins.
+     * (O [DEFINED-FIX] posterior reinstala de forma idempotente -- inofensivo.) */
+    {
+        static const char *defined_early = R"DEFEARLY(
+begin
+  unless Object.const_defined?(:MKXP_UNDEF)
+    undef_obj = Object.new
+    class << undef_obj
+      def inspect; "#<undef>"; end
+      def to_s; ""; end
+      def to_str; ""; end
+      def nil?; true; end
+      def empty?; true; end
+      def method_missing(m, *a, &b); self; end
+      def respond_to_missing?(m, p = false); true; end
+      def coerce(o); [o.is_a?(Numeric) ? o : 0, 0]; end
+      def ==(o); o.nil? || o.equal?(self); end
+      def !; true; end
+    end
+    Object.const_set(:MKXP_UNDEF, undef_obj)
+  end
+  module ::Kernel
+    def defined?(*args)
+      return nil if args.empty?
+      args[0].equal?(MKXP_UNDEF) ? nil : "expression"
+    end
+  end
+  class ::Object
+    def self.const_missing(name)
+      MKXP_UNDEF
+    end
+  end
+rescue
+end
+)DEFEARLY";
+        mrb_load_string(mrb, defined_early);
+        if (mrb->exc) { show_error(mrb, "defined_early"); mrb->exc = 0; }
+        else DBGLOG("[DEFINED-EARLY] defined?/const_missing instalados ANTES dos plugins\n");
+    }
+
     run_plugin_scripts(mrb, game_path);
 
     /* Carregar debug_probe.rb DEPOIS dos scripts do jogo.
