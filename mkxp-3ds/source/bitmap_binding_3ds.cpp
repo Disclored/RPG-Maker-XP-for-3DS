@@ -104,6 +104,11 @@ void __attribute__((used)) bmp_flush(Bitmap3DS *b) {
         b->tex = display_3ds_create_texture(b->width, b->height, b->pixels);
         if (!b->tex)
             printf("[BMP] AVISO: create_texture falhou %dx%d\n", b->width, b->height);
+        else if (b->has_text) {
+            /* texto: LINEAR no downscale (GPU, custo zero) -> legivel em vez de papa */
+            display_3ds_set_texture_filter(b->tex, true);
+            b->tex->has_text = true;   /* DIAG: marca a textura p/ log TEXFLOW no ecra */
+        }
     }
     b->tex_dirty = false;
 }
@@ -413,6 +418,16 @@ static mrb_value bmp_blt(mrb_state *mrb, mrb_value self) {
         }
     }
     dst->tex_dirty = true;
+    /* DIAG TEXFLOW: copia que ENVOLVE texto (origem ou destino). Mostra a cadeia:
+     * bitmap-de-texto -> contents/janela. Incondicional (so' p/ bitmaps de texto,
+     * nao inunda com o tilemap). Se a origem tem texto, o destino passa a ter
+     * (segue a cadeia + faz o destino usar LINEAR). */
+    if (src->has_text || dst->has_text) {
+        printf("[TEXFLOW|BLT] src=%dx%d(txt=%d) rect=(%d,%d,%d,%d) -> dst=%dx%d(txt=%d) @(%d,%d) op=%d\n",
+            src->width, src->height, src->has_text?1:0, sx0, sy0, sw, sh,
+            dst->width, dst->height, dst->has_text?1:0, (int)dx, (int)dy, (int)opacity);
+        if (src->has_text) dst->has_text = true;
+    }
     /* LOG (DBG_DIALOG): imagem copiada (retrato, moldura) -- origem WxH + rect,
      * destino WxH + posicao. Revela tamanhos das imagens das caixas. */
     DBG(DBG_DIALOG, "[BLT] src=%dx%d rect=(%d,%d,%d,%d) -> dst=%dx%d @(%d,%d) op=%d",
@@ -470,6 +485,16 @@ static mrb_value bmp_stretch_blt(mrb_state *mrb, mrb_value self) {
         }
     }
     dst->tex_dirty = true;
+    /* DIAG TEXFLOW: ESTICAMENTO que envolve texto. ESTE e' o suspeito principal:
+     * se o bitmap de texto (ex: 216x32) for esticado para a janela (ex: 512x96),
+     * o fator de stretch >1 explica o borrao. Incondicional p/ bitmaps de texto. */
+    if (src->has_text || dst->has_text) {
+        printf("[TEXFLOW|STRETCH] src=%dx%d(txt=%d) s=(%d,%d,%d,%d) -> dst=%dx%d(txt=%d) d=(%d,%d,%d,%d) stretch=x%.2f,y%.2f\n",
+            src->width, src->height, src->has_text?1:0, sx0, sy0, sw, sh,
+            dst->width, dst->height, dst->has_text?1:0, dx, dy, dw, dh,
+            (sw>0?(float)dw/sw:0.0f), (sh>0?(float)dh/sh:0.0f));
+        if (src->has_text) dst->has_text = true;
+    }
     /* LOG (DBG_DIALOG): esticamento -- e' assim que a windowskin (ex: 96x48) e'
      * redimensionada para a moldura da caixa. O retangulo DESTINO (dx,dy,dw,dh)
      * = dimensoes reais da janela desenhada. Compara com o tamanho esperado. */
@@ -546,7 +571,7 @@ static u32 fnt_utf8_next(const char *s, int len, int *i) {
 /* Escala do texto. A fonte do sistema e' grande (~30px de linha); o RGSS usa
  * tipicamente ~24-32px de altura de linha. Usamos uma escala que da' ~22px de
  * altura, adequada para caber nas caixas do Essentials. */
-static const float FNT_SCALE = 0.5f;
+static const float FNT_SCALE = 0.70f;
 
 /* Garante que a fonte do sistema esta' carregada e mapeada. fontGetSystemFont()
  * pode devolver a fonte mas as sheets de glifos so' ficam acessiveis apos
@@ -738,6 +763,7 @@ static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
     int drawY = ay + ((ah > lineH) ? (ah - lineH) / 2 : 0);
 
     fnt_draw_into_bitmap(b, drawX, drawY, str, (int)slen, R, G, B, A);
+    b->has_text = true;   /* -> textura usa filtro LINEAR (texto legivel no downscale) */
     /* LOG DIAGNOSTICO (DBG_DIALOG): o TEXTO que esta a ser desenhado, em que
      * retangulo, em que bitmap (tamanho), com que cor e largura medida. Mostra
      * o conteudo real das caixas e se o letra-a-letra avanca (strings a crescer). */

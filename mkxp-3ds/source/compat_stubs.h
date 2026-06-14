@@ -79,7 +79,11 @@ end
 # normal -- alias_method pode nao funcionar sobre ele em mruby.
 begin
   class String
-    def scan(pat)
+    # [REGEXP-REAL] capturar o scan do onig ANTES de redefinir (onig carrega
+    # antes do compat_stubs). Regexp -> onig real; String -> manual (o scan do
+    # onig com argumento String rebenta neste build: 'string_scan' inexistente).
+    alias_method :__onig_scan, :scan unless method_defined?(:__onig_scan)
+    def scan(pat, &block)
       return [] if pat.nil?
       if pat.is_a?(String)
         results = []
@@ -91,10 +95,14 @@ begin
         end
         results
       else
-        # Regexp ou outro tipo nao suportado -- devolver [] sem crash
-        []
+        if $__strregex_n.to_i < 8
+          $__strregex_n = $__strregex_n.to_i + 1
+          (dbg "[STRREGEX] scan(#{pat.class})" rescue nil)
+        end
+        __onig_scan(pat, &block)
       end
-    rescue
+    rescue => e
+      (dbg "[STRREGEX] scan ERRO #{e.class}: #{e.message}" rescue nil)
       []
     end
   end
@@ -104,6 +112,7 @@ rescue; end
 # Se o separador for um Regexp stub (ou qualquer nao-String), o C explode
 # com TypeError: expected String.  Override completo em Ruby evita isso.
 class String
+  alias_method :__onig_split, :split unless method_defined?(:__onig_split)
   def split(sep=nil, limit=nil)
     if sep.nil?
       # Split em whitespace, omitindo tokens vazios (comportamento Ruby padrao)
@@ -141,9 +150,17 @@ class String
       end
       result
     else
-      # Separador nao-String (Regexp stub, Symbol, etc.)
-      # Nao podemos passar ao C binding -- devolver [self] e conservador mas seguro.
-      [self.dup]
+      # [REGEXP-REAL] Separador Regexp -> delegar ao onig (split real regex-aware)
+      if $__strregex_n.to_i < 8
+        $__strregex_n = $__strregex_n.to_i + 1
+        (dbg "[STRREGEX] split(#{sep.class})" rescue nil)
+      end
+      begin
+        limit ? __onig_split(sep, limit) : __onig_split(sep)
+      rescue => e
+        (dbg "[STRREGEX] split ERRO #{e.class}: #{e.message}" rescue nil)
+        [self.dup]
+      end
     end
   end
 end
@@ -155,19 +172,31 @@ end
 # e o nome alternativo do C binding e nao e afectado pelo override de [].
 begin
   class String
+    # [REGEXP-REAL] capturar o [] do onig antes de redefinir; Regexp -> onig
+    # (match real, incl. str[/re/,1] para grupos); resto -> slice nativo.
+    alias_method :__onig_sqbr, :[] unless method_defined?(:__onig_sqbr)
     def [](idx, len=nil)
-      # Regexp ou outro tipo nao suportado -> nil (evita TypeError no C binding)
-      unless idx.is_a?(Integer) || idx.is_a?(String) ||
-             (idx.respond_to?(:exclude_end?))  # Range
-        return nil
-      end
-      # Usar slice() -- alias C nativo de [] que nao e afectado por este override
-      begin
-        len.nil? ? slice(idx) : slice(idx, len)
-      rescue TypeError
-        nil
-      rescue => e
-        nil
+      if idx.is_a?(Integer) || idx.is_a?(String) ||
+         (idx.respond_to?(:exclude_end?))  # Range
+        begin
+          len.nil? ? slice(idx) : slice(idx, len)
+        rescue TypeError
+          nil
+        rescue => e
+          nil
+        end
+      else
+        # Regexp -> delegar ao onig
+        if $__strregex_n.to_i < 8
+          $__strregex_n = $__strregex_n.to_i + 1
+          (dbg "[STRREGEX] [](#{idx.class},#{len.inspect})" rescue nil)
+        end
+        begin
+          len.nil? ? __onig_sqbr(idx) : __onig_sqbr(idx, len)
+        rescue => e
+          (dbg "[STRREGEX] [] ERRO #{e.class}: #{e.message}" rescue nil)
+          nil
+        end
       end
     end
   end

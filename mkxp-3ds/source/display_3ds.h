@@ -8,6 +8,8 @@ struct DS3Texture {
     int     width;
     int     height;
     bool    valid;
+    bool    has_text = false;  /* DIAG/fix: bitmap de origem teve draw_text */
+    unsigned pot_bytes = 0;    /* DIAG: bytes POT alocados (p/ contabilidade de heap) */
 };
 
 void        display_3ds_init();
@@ -15,6 +17,10 @@ void        display_3ds_begin_frame();
 void        display_3ds_end_frame();
 DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba);
 void        display_3ds_free_texture(DS3Texture* t);
+/* Define o filtro de amostragem da textura na GPU (custo zero).
+ * linear=true -> GPU_LINEAR (suave, bom p/ downscale de TEXTO);
+ * linear=false -> GPU_NEAREST (nitido, bom p/ pixel-art/tilemaps). */
+void        display_3ds_set_texture_filter(DS3Texture* t, bool linear);
 void        display_3ds_blit(DS3Texture* t,
                              float dst_x, float dst_y,
                              float src_x, float src_y,

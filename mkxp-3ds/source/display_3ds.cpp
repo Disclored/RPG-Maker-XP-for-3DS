@@ -51,6 +51,28 @@ static int s_tex_created   = 0;
 static int s_tex_failed    = 0;
 static int s_blit_skipped  = 0;
 
+/* [DIAG] Contabilidade de texturas VIVAS (criadas - libertadas) e bytes POT
+ * alocados no heap linear. Permite ver, no momento de uma falha de TexInit,
+ * se e' fuga (vivas cresce sem parar) ou pico legitimo (muitas grandes vivas). */
+static int    s_tex_alive  = 0;
+static size_t s_tex_bytes  = 0;
+static int    s_tex_alive_peak = 0;
+static size_t s_tex_bytes_peak = 0;
+
+/* [DIAG] Histograma de texturas VIVAS por tamanho (bytes POT). Decide se os
+ * 30MB sao POUCAS gigantes (tilemap 1024x1024=4MB -> facil cortar) ou MUITAS
+ * medias (working-set -> precisa VRAM/memoria estendida). */
+static int s_tex_hist[6] = {0,0,0,0,0,0};
+static int s_tex_big_w = 0, s_tex_big_h = 0;   /* maior textura POT ja vista */
+static inline int tex_bucket(unsigned b) {
+    if (b <=   16u*1024) return 0;
+    if (b <=   64u*1024) return 1;
+    if (b <=  256u*1024) return 2;
+    if (b <= 1024u*1024) return 3;
+    if (b <= 4096u*1024) return 4;
+    return 5;
+}
+
 /* ── Accessor público para grph_update comparar antes/depois de sprites_draw_all ── */
 int display_3ds_blit_count() { return s_blit_total; }
 
@@ -92,6 +114,14 @@ void display_3ds_begin_frame() {
         printf("[DISPLAY|FRAME] begin #%d "
                "(tex_ok=%d tex_fail=%d blit_total=%d)\n",
                s_frame_count, s_tex_created, s_tex_failed, s_blit_total);
+        printf("[TEX|MEM] VIVAS=%d (pico %d) bytes_tex=%.0fKB (pico %.0fKB) | "
+               "linear_livre=%.0fKB vram_livre=%.0fKB\n",
+               s_tex_alive, s_tex_alive_peak,
+               s_tex_bytes/1024.0, s_tex_bytes_peak/1024.0,
+               linearSpaceFree()/1024.0, vramSpaceFree()/1024.0);
+        printf("[TEX|HIST] vivas: <=16K=%d <=64K=%d <=256K=%d <=1M=%d <=4M=%d >4M=%d | maior_POT=%dx%d\n",
+               s_tex_hist[0], s_tex_hist[1], s_tex_hist[2], s_tex_hist[3],
+               s_tex_hist[4], s_tex_hist[5], s_tex_big_w, s_tex_big_h);
     }
 
     /* [DBG] CRÍTICO: render target nulo = crash silencioso ou ecrã preto */
@@ -239,8 +269,15 @@ void display_3ds_end_frame() {
     PROF_BEGIN(PROF_FRAME_UPDATE);   /* abre o intervalo de update ate' ao proximo begin_frame */
 }
 
-int display_3ds_screen_width()  { return TOP_W; }
-int display_3ds_screen_height() { return TOP_H; }
+/* IMPORTANTE: estes alimentam Graphics.width/height (e poke_width/height).
+ * Um jogo RMXP usa Graphics.width/height para posicionar TODO o UI (caixas de
+ * mensagem, menus...), a' espera da resolucao LOGICA em que desenha -- aqui
+ * 512x384 (GAME_W/GAME_H), NAO o ecra fisico do 3DS (400x240). Devolver 400x240
+ * fazia a caixa de mensagem cair a meio (y=240-96=144) e so' 400 de largura.
+ * O downscale 512x384 -> 400x240 e' feito no blit (DISP_SCALE), transparente
+ * para o jogo. NAO usar TOP_W/TOP_H aqui. */
+int display_3ds_screen_width()  { return (int)GAME_W; }   /* 512 (logico) */
+int display_3ds_screen_height() { return (int)GAME_H; }   /* 384 (logico) */
 
 /* ── Morton tiling ─────────────────────────────────────────────────────────── */
 static inline int morton_offset(int x, int y, int tw) {
@@ -284,11 +321,21 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba) 
 
     /* [DBG] C3D_TexInit: falha mais comum = falta de VRAM */
     if (!C3D_TexInit(&tex->tex, (u16)tw, (u16)th, GPU_RGBA8)) {
-        printf("[TEX|CREATE] ERRO C3D_TexInit FALHOU: src=%dx%d POT=%dx%d\n",
-               w, h, tw, th);
-        printf("[TEX|CREATE]   → Causas: VRAM esgotada, dimensão inválida, ou C3D não iniciado\n");
-        printf("[TEX|CREATE]   → tex_ok=%d tex_fail=%d até agora\n",
-               s_tex_created, s_tex_failed + 1);
+        if ((s_tex_failed % 100) == 0) {
+            printf("[TEX|CREATE] ERRO C3D_TexInit FALHOU: src=%dx%d POT=%dx%d (1 em cada 100)\n",
+                   w, h, tw, th);
+            printf("[TEX|CREATE]   → Causas: VRAM esgotada, dimensão inválida, ou C3D não iniciado\n");
+            printf("[TEX|CREATE]   → tex_ok=%d tex_fail=%d até agora\n",
+                   s_tex_created, s_tex_failed + 1);
+            printf("[TEX|MEM] VIVAS=%d (pico %d) bytes_tex=%.0fKB (pico %.0fKB) | "
+                   "linear_livre=%.0fKB vram_livre=%.0fKB\n",
+                   s_tex_alive, s_tex_alive_peak,
+                   s_tex_bytes/1024.0, s_tex_bytes_peak/1024.0,
+                   linearSpaceFree()/1024.0, vramSpaceFree()/1024.0);
+            printf("[TEX|HIST] vivas: <=16K=%d <=64K=%d <=256K=%d <=1M=%d <=4M=%d >4M=%d | maior_POT=%dx%d\n",
+                   s_tex_hist[0], s_tex_hist[1], s_tex_hist[2], s_tex_hist[3],
+                   s_tex_hist[4], s_tex_hist[5], s_tex_big_w, s_tex_big_h);
+        }
         s_tex_failed++;
         delete tex;
         return nullptr;
@@ -340,7 +387,14 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba) 
     C3D_TexFlush(&tex->tex);
 
     tex->valid = true;
+    tex->pot_bytes = (unsigned)(tw * th * 4);
     s_tex_created++;
+    s_tex_alive++;
+    s_tex_bytes += tex->pot_bytes;
+    if (s_tex_alive > s_tex_alive_peak) s_tex_alive_peak = s_tex_alive;
+    if (s_tex_bytes > s_tex_bytes_peak) s_tex_bytes_peak = s_tex_bytes;
+    s_tex_hist[tex_bucket(tex->pot_bytes)]++;
+    if ((long)tw * th > (long)s_tex_big_w * s_tex_big_h) { s_tex_big_w = tw; s_tex_big_h = th; }
     s_blit_total += 0;  /* não conta aqui, só em blit() */
     s_tex_log_count++;
 
@@ -373,8 +427,25 @@ void display_3ds_free_texture(DS3Texture* t) {
         printf("[TEX|FREE]   AVISO: a libertar textura que nunca foi válida\n");
         printf("[TEX|FREE]   → create_texture falhou e caller não verificou nullptr?\n");
     }
-    if (t->valid) C3D_TexDelete(&t->tex);
+    if (t->valid) {
+        C3D_TexDelete(&t->tex);
+        s_tex_alive--;
+        s_tex_hist[tex_bucket(t->pot_bytes)]--;
+        if (s_tex_bytes >= t->pot_bytes) s_tex_bytes -= t->pot_bytes;
+        else                             s_tex_bytes = 0;
+    }
     delete t;
+}
+
+/* Define o filtro de amostragem da textura (mag, min). Custo zero: e' so' um
+ * estado de hardware da GPU PICA200. Usado para por TEXTO em GPU_LINEAR (suave
+ * no downscale 0.625x -> legivel) sem tocar nos tilemaps/sprites (GPU_NEAREST). */
+void display_3ds_set_texture_filter(DS3Texture* t, bool linear) {
+    if (!t || !t->valid) return;
+    /* inline (sem nomear o enum) para nao depender do nome do tipo entre versoes
+     * do libctru; GPU_LINEAR/GPU_NEAREST sao os mesmos valores que a linha ~315. */
+    if (linear) C3D_TexSetFilter(&t->tex, GPU_LINEAR,  GPU_LINEAR);
+    else        C3D_TexSetFilter(&t->tex, GPU_NEAREST, GPU_NEAREST);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -547,6 +618,16 @@ void display_3ds_blit_ex(DS3Texture* t,
     float u1 = (sx + sw) / tw;
     float v_top    = 1.0f - (sy / th);
     float v_bottom = 1.0f - ((sy + sh) / th);
+
+    /* DIAG TEXFLOW: blit de um bitmap COM TEXTO para o ecra. Mapeamento EXACTO
+     * src->dst + fator de stretch. Throttle 1x/12 frames (mapeamento constante
+     * durante a mensagem). Incondicional. */
+    if (t->has_text && (s_frame_count % 12 == 0)) {
+        printf("[TEXFLOW|SCR] f%d texbmp=%dx%d src=(%.0f,%.0f,%.0fx%.0f) -> dst=%.1fx%.1f @(%.1f,%.1f) stretch=x%.2f,y%.2f\n",
+               s_frame_count, t->width, t->height, sx, sy, sw, sh,
+               fdw, fdh, fdx, fdy,
+               (sw>0?fdw/sw:0.0f), (sh>0?fdh/sh:0.0f));
+    }
 
     /* Super Debug: sprites GRANDES (logo/fundo) -- dimensoes e UVs reais.
      * Diagnostica o "corte a meio": ver se U[..] cobre a imagem toda e se

@@ -93,6 +93,17 @@ void sprites_draw_all() {
             if (s->bitmap->pixels && s->bitmap->width > 0 && s->bitmap->height > 0) {
                 s->bitmap->tex = display_3ds_create_texture(
                     s->bitmap->width, s->bitmap->height, s->bitmap->pixels);
+                /* FIX BORRAO: este caminho (sprites) cria a textura DIRETAMENTE,
+                 * sem passar pelo bmp_flush -> o filtro LINEAR p/ texto NUNCA era
+                 * aplicado aqui. Resultado: o conteudo de texto das caixas (que e'
+                 * um sprite) ficava sempre em NEAREST e virava papa no downscale
+                 * 0.625. Replicamos a logica do bmp_flush: LINEAR (custo GPU zero)
+                 * SO quando o bitmap teve draw_text (has_text); todo o resto
+                 * (tiles, personagens, fundos) fica em NEAREST por omissao, nitido. */
+                if (s->bitmap->tex && s->bitmap->has_text) {
+                    display_3ds_set_texture_filter(s->bitmap->tex, true);
+                    s->bitmap->tex->has_text = true;
+                }
             }
             s->bitmap->tex_dirty = false;
         }

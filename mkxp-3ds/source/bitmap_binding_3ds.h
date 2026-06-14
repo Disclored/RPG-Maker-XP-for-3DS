@@ -14,6 +14,10 @@ struct Bitmap3DS {
     DS3Texture    *tex;       /* textura GPU (nullptr se não fez flush) */
     bool           tex_dirty; /* true = pixels modificados desde o último flush */
     bool           disposed;  /* true = disposed(), não usar */
+    bool           has_text;  /* true = teve draw_text -> usar filtro LINEAR no
+                               * downscale (texto pequeno fica legivel; o NEAREST
+                               * larga pixeis e parte as letras). Filtro de GPU =
+                               * custo zero (sem CPU/RAM extra). */
 };
 
 extern const mrb_data_type Bitmap3DSType;
