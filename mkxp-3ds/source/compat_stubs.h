@@ -272,7 +272,8 @@ rescue; end
 begin
   class Font
     @@dn="Arial"; @@ds=22; @@db=false; @@di=false
-    @@dc=nil; @@dsh=false; @@dol=false; @@doc=nil
+    @@dc=(Color.new(255,255,255,255) rescue nil); @@dsh=false; @@dol=false
+    @@doc=(Color.new(0,0,0,255) rescue nil)
     def self.default_name;          @@dn;    end
     def self.default_name=(v);      @@dn=v;  end
     def self.default_size;          @@ds;    end
@@ -281,20 +282,26 @@ begin
     def self.default_bold=(v);      @@db=v;  end
     def self.default_italic;        @@di;    end
     def self.default_italic=(v);    @@di=v;  end
-    def self.default_color;         @@dc;    end
+    def self.default_color;         @@dc ||= (Color.new(255,255,255,255) rescue nil); end
     def self.default_color=(v);     @@dc=v;  end
     def self.default_shadow;        @@dsh;   end
     def self.default_shadow=(v);    @@dsh=v; end
     def self.default_outline;       @@dol;   end
     def self.default_outline=(v);   @@dol=v; end
-    def self.default_out_color;     @@doc;   end
+    def self.default_out_color;     @@doc ||= (Color.new(0,0,0,255) rescue nil); end
     def self.default_out_color=(v); @@doc=v; end
     def self.exist?(n); false; end
-    attr_accessor :name,:size,:bold,:italic,:color,:shadow,:outline,:out_color
+    attr_accessor :name,:size,:bold,:italic,:shadow,:outline,:out_color
     def initialize(name=@@dn,size=@@ds)
       @name=name; @size=size; @bold=@@db; @italic=@@di
-      @color=@@dc; @shadow=@@dsh; @outline=@@dol; @out_color=@@doc
+      @color=(@@dc || (Color.new(255,255,255,255) rescue nil))
+      @shadow=@@dsh; @outline=@@dol; @out_color=@@doc
     end
+    # color nunca nil: cria a pedido (senao font.color.set rebenta no menu)
+    def color
+      @color ||= (Color.new(255,255,255,255) rescue nil)
+    end
+    def color=(v); @color=v; end
   end
 rescue; end
 
@@ -911,6 +918,13 @@ begin
       attr_accessor :battler_name, :battler_hue
       attr_accessor :start_map_id, :start_x, :start_y
       attr_accessor :test_troop_id, :edit_map_id
+      # SE de interface (RMXP): sem estes campos, $data_system.decision_se etc.
+      # caem no method_missing -> 0 -> pbSEPlay(0) nao toca som nenhum nos menus.
+      # Adicionados com os nomes/volumes padrao do RPG Maker XP.
+      attr_accessor :cursor_se, :decision_se, :cancel_se, :buzzer_se
+      attr_accessor :equip_se, :shop_se, :save_se, :load_se
+      attr_accessor :battle_start_se, :escape_se, :actor_collapse_se, :enemy_collapse_se
+      attr_accessor :windowskin_name
       def initialize
         @title_bgm       = RPG::BGM.new
         @battle_bgm      = RPG::BGM.new
@@ -933,6 +947,19 @@ begin
         @test_troop_id   = 1
         @edit_map_id     = 1
         @windowskin_name = ""
+        # SE de UI com defaults do RMXP (estes ficheiros existem no Audio/SE/).
+        @cursor_se          = RPG::SE.new("Cursor1", 80)
+        @decision_se        = RPG::SE.new("Decision", 80)
+        @cancel_se          = RPG::SE.new("Cancel1", 80)
+        @buzzer_se          = RPG::SE.new("Buzzer1", 80)
+        @equip_se           = RPG::SE.new("Equip", 80)
+        @shop_se            = RPG::SE.new("Shop", 80)
+        @save_se            = RPG::SE.new("Save", 80)
+        @load_se            = RPG::SE.new("Load", 80)
+        @battle_start_se    = RPG::SE.new("", 80)
+        @escape_se          = RPG::SE.new("", 80)
+        @actor_collapse_se  = RPG::SE.new("", 80)
+        @enemy_collapse_se  = RPG::SE.new("", 80)
       end
       def windowskin_name
         @windowskin_name.is_a?(String) ? @windowskin_name : ""
@@ -1015,7 +1042,20 @@ begin
     def self.exists?(p);      _try_open(p); end
     def self.file?(p);        _try_open(p); end
     def self.directory?(p);   false; end
-    def self.audio_exist?(p); _try_open(p); end
+    # CRITICO p/ o AUDIO funcionar: o jogo chama audio_exist?("Audio/SE/NOME")
+    # SEM extensao. Os ficheiros reais sao NOME.ogg / .wav / .mp3. Se so'
+    # tentassemos o caminho exacto, audio_exist? devolvia false e Audio.se_play
+    # NUNCA seria chamado (som nenhum). Tentamos o caminho tal-qual E com as
+    # extensoes de audio.
+    def self.audio_exist?(p)
+      return false if p.nil? || p.to_s.empty?
+      return true if _try_open(p)
+      base = p.to_s
+      [".ogg", ".wav", ".mp3", ".OGG", ".WAV"].each do |ext|
+        return true if _try_open(base + ext)
+      end
+      false
+    end
     def self.size?(p);        nil;   end
     def self.zero?(p);        !_try_open(p); end
     def self.readable?(p);    _try_open(p); end

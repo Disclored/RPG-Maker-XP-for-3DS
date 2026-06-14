@@ -73,7 +73,7 @@ extern uint32_t g_dbg_mask;
 #define DBG(cat, fmt, ...) do { \
     if (g_dbglog && (g_dbg_mask & (cat))) { \
         fprintf(g_dbglog, "[%s|f%d] " fmt "\n", dbg_cat_name(cat), g_dbg_frame, ##__VA_ARGS__); \
-        if (++g_dbglog_flushc >= 64) { g_dbglog_flushc = 0; fflush(g_dbglog); } \
+        if (++g_dbglog_flushc >= 512) { g_dbglog_flushc = 0; fflush(g_dbglog); } \
     } \
 } while (0)
 

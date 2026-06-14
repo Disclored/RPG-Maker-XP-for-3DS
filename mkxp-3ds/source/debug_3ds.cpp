@@ -15,7 +15,7 @@ volatile int g_dbg_frame = 0;
 uint32_t g_dbg_mask =
     DBG_INPUT | DBG_DISPLAY | DBG_RENDER | DBG_BITMAP | DBG_VRAM |
     DBG_SCALE | DBG_CACHE | DBG_COMPILE | DBG_TIMING | DBG_RESOURCE |
-    DBG_STATE | DBG_ERROR | DBG_MARSHAL;
+    DBG_STATE | DBG_ERROR | DBG_MARSHAL | DBG_AUDIO;
 
 const char* dbg_cat_name(uint32_t cat) {
     switch (cat) {

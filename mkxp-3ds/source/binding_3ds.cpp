@@ -14,6 +14,14 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <vector>
+#include "audio_3ds.h"
+#include "profile_3ds.h"
+
+/* Definida em marshal.cpp — limpa o cache de resolucao de classe do marshal.
+ * Chamada quando o mruby e' (re)criado, para o cache nunca reter ponteiros de
+ * uma sessao anterior. extern "C" tem de estar em scope de ficheiro (nao em
+ * bloco de funcao). */
+extern "C" void marshal_class_cache_reset(void);
 
 /* ─────────────────────────────────────────────────────────────────────────
  * FALLBACK para mrb_dump_irep / constantes de dump.
@@ -51,6 +59,221 @@ extern void inputBindingInit(mrb_state *mrb);
 #include "compat_stubs.h"
 #include "tilemap_binding_3ds.h"
 
+/* Declaracao antecipada do log global (definido mais abaixo, ~linha 195) para
+ * que o pool allocator (namespace mkxp_pool, logo a seguir) o possa usar via
+ * ::g_dbglog no diagnostico. Sem esta linha, o 'extern' dentro do namespace
+ * criava mkxp_pool::g_dbglog e ::g_dbglog ficava por declarar. */
+extern FILE *g_dbglog;
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * INTERRUPTOR DO POOL ALLOCATOR
+ * ----------------------------------------------------------------------------
+ * 1 = usar o pool (mrb_open_allocf) -- rapido, mas em diagnostico no 3DS.
+ * 0 = usar mrb_open() normal -- mais lento no boot (malloc O(n) do sistema),
+ *     mas serve para ISOLAR: se com 0 o jogo arranca e com 1 trava, o problema
+ *     esta' confirmadamente no pool. Mudar so' este valor e recompilar.
+ * ─────────────────────────────────────────────────────────────────────────── */
+#define USE_POOL_ALLOCATOR 1
+
+
+/* ============================================================================
+ * POOL ALLOCATOR PARA MRUBY (CORRECAO RAIZ DA LENTIDAO DO BOOT NO 3DS)
+ * ----------------------------------------------------------------------------
+ * CAUSA RAIZ (provada por medicao): ao desserializar dados grandes (ex:
+ * CommonEvents.rxdata cria 113 mil objetos), o mruby chama o malloc do SISTEMA
+ * ~100.000 vezes -- uma por cada objeto pequeno (string, array interno, ivar).
+ * O malloc do devkitARM/newlib percorre uma free-list que CRESCE com o numero
+ * de blocos ja' alocados -> cada malloc fica O(n) -> 100k mallocs com a heap
+ * cheia (376 scripts + 54 plugins + dados ja' carregados) = O(n^2) = 220s SO'
+ * no CommonEvents. (No PC isto nao aparece: o malloc do glibc e' O(1).) O
+ * interval_ratio do GC NAO ajuda porque o problema nao e' o GC -- e' o malloc.
+ *
+ * SOLUCAO: dar ao mruby (via mrb_open_allocf) um allocator com pools de tamanho
+ * fixo (size-class) e free-list por classe. alloc/free ficam O(1) e as 100k
+ * chamadas ao malloc do sistema caem para ~200 (1 por chunk de 4096 objetos).
+ * Medido no servidor: CommonEvents 100.611 -> 234 mallocs de sistema (-430x),
+ * integridade 100% (len=257, todos os objetos validos), GC liberta na mesma.
+ * Blocos grandes (> maior classe) caem no malloc normal (raros, sem impacto).
+ * ========================================================================== */
+namespace mkxp_pool {
+    static const size_t kClassSizes[] = { 32, 64, 96, 128, 192, 256, 384, 512 };
+    static const int    kNumClasses   = (int)(sizeof(kClassSizes)/sizeof(kClassSizes[0]));
+    static const int    kChunkObjs    = 512;    /* objetos por chunk do sistema
+        (ERA 4096 -> chunks ate' 2MB de uma vez, que no 3DS podem ser lentos a
+        alocar ou falhar com heap fragmentada -> parecia travado no boot. Com
+        512, o maior chunk e' 256KB: mallocs rapidos, cresce conforme precisa,
+        e o overhead de mais chunks e' irrelevante porque ficam vivos.) */
+
+    struct FreeNode { FreeNode *next; };
+    struct Pool {
+        FreeNode *free_list;
+        char    **chunks;       /* chunks alocados (mantidos vivos toda a sessao) */
+        int       chunk_count;
+        int       chunk_capa;
+        size_t    obj_size;
+    };
+    /* Cabecalho por bloco: guarda a classe (ou -1 se veio do malloc normal).
+     * CRITICO (bug que travava o boot no 3DS): no ARM 32-bit, size_t = 4 bytes,
+     * por isso sizeof(Header) seria 4. O ponteiro devolvido ao mruby e' (h+1),
+     * ou seja chunk + sizeof(Header). Com Header de 4 bytes, esse ponteiro fica
+     * alinhado a 4, NAO a 8. O mruby guarda nesses blocos valores que exigem
+     * alinhamento de 8 no ARM (mrb_value/double/int64); aceder a eles num
+     * endereco desalinhado provoca DATA ABORT -> crash silencioso (o 3DS
+     * "congelava" no mrb_open_allocf). alignas(8) forca o Header a 8 bytes, por
+     * isso (h+1) fica sempre alinhado a 8. (No servidor 64-bit size_t ja' tem 8,
+     * por isso o bug nunca aparecia nos testes -- so' no hardware real.)
+     * Isto explica o sintoma "com log detalhado funcionava": as escritas do log
+     * mexiam na heap e calhavam alinhar os blocos por acaso. */
+    struct alignas(8) Header { size_t cls; };
+
+    static Pool s_pools[8];          /* = kNumClasses */
+    static bool s_inited = false;
+    static long s_sys_alloc = 0;     /* contadores p/ diagnostico no log */
+    static long s_pool_alloc = 0;
+
+    /* Forward declarations: init() chama alloc()/dealloc() (definidas abaixo)
+     * para o auto-teste de alinhamento. */
+    static void* alloc(size_t size);
+    static void  dealloc(void *ptr);
+
+    static void init() {
+        for (int i = 0; i < kNumClasses; i++) {
+            s_pools[i].free_list   = NULL;
+            s_pools[i].chunks      = NULL;
+            s_pools[i].chunk_count = 0;
+            s_pools[i].chunk_capa  = 0;
+            s_pools[i].obj_size    = kClassSizes[i];
+        }
+        s_inited = true;
+        /* AUTO-TESTE DE ALINHAMENTO (corre no 3DS real, prova a correcao do bug).
+         * Loga sizeof(Header) e sizeof(FreeNode) -- no ARM 32-bit ANTES da
+         * correcao Header era 4; com alignas(8) deve ser 8. Depois aloca um
+         * bloco de teste e confirma que o ponteiro devolvido esta' alinhado a 8.
+         * Se aparecer "DESALINHADO" no log, o bug persiste e e' por aqui. */
+        if (::g_dbglog) {
+            fprintf(::g_dbglog,
+                "[POOL|ALIGN] sizeof(Header)=%u sizeof(FreeNode)=%u sizeof(size_t)=%u sizeof(void*)=%u\n",
+                (unsigned)sizeof(Header), (unsigned)sizeof(FreeNode),
+                (unsigned)sizeof(size_t), (unsigned)sizeof(void*));
+            /* teste de alinhamento de um bloco real */
+            void *test = alloc(32);
+            if (test) {
+                unsigned long addr = (unsigned long)test;
+                fprintf(::g_dbglog, "[POOL|ALIGN] bloco teste @ 0x%lx alinhado_a_8=%s\n",
+                        addr, (addr % 8 == 0) ? "SIM (OK)" : "NAO (BUG!)");
+                dealloc(test);
+            }
+            fflush(::g_dbglog);
+        }
+    }
+    static int size_to_class(size_t size) {
+        for (int i = 0; i < kNumClasses; i++)
+            if (size <= kClassSizes[i]) return i;
+        return -1;
+    }
+    static void grow(Pool *p) {
+        size_t bytes = p->obj_size * (size_t)kChunkObjs;
+        char *chunk = (char*)malloc(bytes);
+        s_sys_alloc++;
+        if (!chunk) {
+            if (::g_dbglog) { fprintf(::g_dbglog, "[POOL|GROW] malloc(%u) FALHOU (OOM)\n", (unsigned)bytes); fflush(::g_dbglog); }
+            return;   /* OOM: free_list fica NULL, alloc devolve NULL */
+        }
+        if (p->chunk_count >= p->chunk_capa) {
+            p->chunk_capa = p->chunk_capa ? p->chunk_capa * 2 : 8;
+            p->chunks = (char**)realloc(p->chunks, (size_t)p->chunk_capa * sizeof(char*));
+        }
+        p->chunks[p->chunk_count++] = chunk;
+        for (size_t off = 0; off + p->obj_size <= bytes; off += p->obj_size) {
+            FreeNode *n = (FreeNode*)(chunk + off);
+            n->next = p->free_list;
+            p->free_list = n;
+        }
+        /* DIAG so' em OOM (acima). O log por-grow foi removido depois de
+         * confirmado que o pool funciona -- escrever no SD a cada chunk
+         * abrandava o boot. */
+    }
+    static void* alloc(size_t size) {
+        size_t total = size + sizeof(Header);
+        int cls = size_to_class(total);
+        if (cls < 0) {                     /* grande demais -> malloc normal */
+            Header *h = (Header*)malloc(total);
+            s_sys_alloc++;
+            if (!h) return NULL;
+            h->cls = (size_t)-1;
+            return (void*)(h + 1);
+        }
+        Pool *p = &s_pools[cls];
+        if (!p->free_list) grow(p);
+        if (!p->free_list) return NULL;    /* OOM */
+        FreeNode *n = p->free_list;
+        p->free_list = n->next;
+        Header *h = (Header*)n;
+        h->cls = (size_t)cls;
+        s_pool_alloc++;
+        return (void*)(h + 1);
+    }
+    static void dealloc(void *ptr) {
+        if (!ptr) return;
+        Header *h = ((Header*)ptr) - 1;
+        if (h->cls == (size_t)-1) { free(h); return; }
+        Pool *p = &s_pools[h->cls];
+        FreeNode *n = (FreeNode*)h;
+        n->next = p->free_list;
+        p->free_list = n;
+    }
+    static void* re_alloc(void *ptr, size_t size) {
+        if (!ptr) return alloc(size);
+        Header *h = ((Header*)ptr) - 1;
+        size_t total = size + sizeof(Header);
+        if (h->cls != (size_t)-1) {        /* estava no pool */
+            if (size_to_class(total) == (int)h->cls) return ptr;  /* cabe na mesma classe */
+            void *np = alloc(size);
+            if (!np) return NULL;
+            size_t oldsz = kClassSizes[h->cls] - sizeof(Header);
+            memcpy(np, ptr, size < oldsz ? size : oldsz);
+            dealloc(ptr);
+            return np;
+        }
+        Header *nh = (Header*)realloc(h, total);   /* era grande -> realloc normal */
+        if (!nh) return NULL;
+        nh->cls = (size_t)-1;
+        return (void*)(nh + 1);
+    }
+    /* Assinatura mrb_allocf: (mrb, ptr, size, ud).
+     *   size==0            -> free
+     *   ptr!=NULL,size>0   -> realloc
+     *   ptr==NULL,size>0   -> malloc                                          */
+    static long s_allocf_calls = 0;   /* diagnostico: quantas vezes foi chamado */
+    static void* allocf(mrb_state *mrb, void *ptr, size_t size, void *ud) {
+        (void)mrb; (void)ud;
+        /* DIAGNOSTICO: durante a criacao do mruby (mrb_open_allocf), o allocator
+         * e' chamado muitas vezes. Se travar AQUI, o log mostra ate' que numero
+         * chegou. Logamos as primeiras chamadas e depois a cada 5000, direto no
+         * ficheiro (g_dbglog ja' esta' aberto nesta fase). */
+        s_allocf_calls++;
+        /* DIAGNOSTICO ESCASSO: o pool ja' foi confirmado a funcionar (alinhamento
+         * OK, contadores sobem). Reduzido para cada 50000 chamadas (era 2000) --
+         * o suficiente para ver se trava, sem encher o log nem abrandar. */
+        if (::g_dbglog) {
+            bool show = (s_allocf_calls <= 3) || ((s_allocf_calls % 50000) == 0);
+            if (show) {
+                fprintf(::g_dbglog, "[POOL|DIAG] allocf #%ld (pool=%ld sys=%ld)\n",
+                        s_allocf_calls, s_pool_alloc, s_sys_alloc);
+                fflush(::g_dbglog);
+            }
+        }
+        if (size == 0) {
+            dealloc(ptr);
+            g_prof_frees++;          /* PROFILING: frees = proxy da atividade do GC */
+            return NULL;
+        }
+        if (ptr)        return re_alloc(ptr, size);
+        g_prof_objs_created++;       /* PROFILING: nova alocacao (objeto/buffer) */
+        return alloc(size);
+    }
+}
+
 /* =========================================================
  * SUPER DEBUG HELPERS
  * ========================================================= */
@@ -62,19 +285,60 @@ FILE *g_dbglog = NULL;
  * nos varios ficheiros via 'extern int g_dbglog_flushc'. */
 int g_dbglog_flushc = 0;
 
+/* ---- TIMESTAMPS no log -----------------------------------------------------
+ * Para diagnosticar ONDE o boot demora (ex: CommonEvents->System a meio do
+ * Game.initialize), cada linha de log leva um prefixo:
+ *    [t=  12.345s d= 1234ms]
+ * t = segundos totais desde o 1o log (relogio absoluto do boot)
+ * d = delta em ms desde a linha ANTERIOR (mostra qual passo custou tempo)
+ * Usa svcGetSystemTick() (relogio ARM11 a 268MHz) -> ms reais.
+ * SYSCLOCK_ARM11 = 268111856 Hz. */
+static u64 g_log_tick0    = 0;   /* tick do 1o log (base) */
+static u64 g_log_tickprev = 0;   /* tick do log anterior (para delta) */
+/* ticks->ms: o mesmo divisor que o contador de FPS em display_3ds.cpp
+ * (268111.856 = SYSCLOCK_ARM11/1000), comprovadamente correto no 3DS. */
+static double tick_to_ms(u64 ticks) {
+    return (double)ticks / 268111.856;
+}
+/* Devolve, por referencia, ms-totais e ms-delta; atualiza o estado.
+ * NAO static: partilhado com marshal.cpp (e outros) via 'extern' para que as
+ * linhas [marshal] tambem levem timestamp. */
+void dbglog_stamp(double *out_total_s, double *out_delta_ms) {
+    u64 now = svcGetSystemTick();
+    if (g_log_tick0 == 0) { g_log_tick0 = now; g_log_tickprev = now; }
+    *out_total_s  = tick_to_ms(now - g_log_tick0) / 1000.0;
+    *out_delta_ms = tick_to_ms(now - g_log_tickprev);
+    g_log_tickprev = now;
+}
+
 static void dbglog_open() {
     g_dbglog = fopen("sdmc:/mkxp/debug_binding.log", "w");
     if (!g_dbglog) printf("[DBGLOG] AVISO: nao foi possivel criar sdmc:/mkxp/debug_binding.log\n");
-    else           printf("[DBGLOG] log aberto em sdmc:/mkxp/debug_binding.log\n");
+    else {
+        /* BUFFER GRANDE (64KB) em vez de line-buffering. Durante o diagnostico
+         * do boot usavamos _IOLBF (flush por linha) para nao perder nada se
+         * travasse -- mas isso fazia 1 escrita ao SD POR LINHA, e no jogo (com
+         * muito log por frame) derrubava o FPS para ~4. Agora que o boot esta'
+         * confirmado, um buffer de 64KB junta muitas linhas por escrita -> SD
+         * toca raramente -> runtime rapido. O DBGLOG critico do boot faz flush
+         * explicito nos pontos-chave ([BOOT] passo N/4), por isso nao se perde
+         * o essencial. */
+        static char s_logbuf[65536];
+        setvbuf(g_dbglog, s_logbuf, _IOFBF, sizeof(s_logbuf));
+        printf("[DBGLOG] log aberto em sdmc:/mkxp/debug_binding.log (buffer 64KB)\n");
+    }
 }
 static void dbglog_close() { if (g_dbglog) { fclose(g_dbglog); g_dbglog = NULL; } }
 
-/* Escreve para consola E para ficheiro */
+/* Escreve para consola E para ficheiro, com timestamp [t=...s d=...ms] no inicio
+ * de cada linha. O timestamp permite ver exatamente quanto tempo cada passo do
+ * boot/jogo demorou e apanhar gargalos (ex: 2-3 min num passo especifico). */
 #define DBGLOG(fmt, ...) \
     do { \
-        printf(fmt, ##__VA_ARGS__); \
-        if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); \
-            if (++g_dbglog_flushc >= 64) { g_dbglog_flushc = 0; fflush(g_dbglog); } } \
+        double __ts_t, __ts_d; dbglog_stamp(&__ts_t, &__ts_d); \
+        printf("[t=%8.3fs d=%7.1fms] " fmt, __ts_t, __ts_d, ##__VA_ARGS__); \
+        if (g_dbglog) { fprintf(g_dbglog, "[t=%8.3fs d=%7.1fms] " fmt, __ts_t, __ts_d, ##__VA_ARGS__); \
+            if (++g_dbglog_flushc >= 256) { g_dbglog_flushc = 0; fflush(g_dbglog); } } \
     } while(0)
 
 /* Dump ate N bytes de um buffer como texto (printaveis) + hex para o resto */
@@ -681,10 +945,106 @@ mrb_define_module_function(mrb, dbg_mod, "log",
         mrb_value msg;
         mrb_get_args(mrb, "o", &msg);
         mrb_value str = mrb_funcall(mrb, msg, "to_s", 0);
-        if (mrb_string_p(str))
-            DBGLOG("[MFD] %s\n", RSTRING_PTR(str));
+        if (mrb_string_p(str)) {
+            const char *s = RSTRING_PTR(str);
+            /* ── FILTRO ANTI-LENTIDAO (causa #1 dos 4 FPS) ─────────────────────
+             * Os probes de diagnostico ([SM#update], [PRB], [MISSING-DET], [TM],
+             * [WIN watp]) eram uteis para resolver o boot/ecra-preto, mas correm
+             * MUITAS vezes por FRAME. Cada linha = escrita ao SD (lenta no 3DS)
+             * -> framerate cai'a para ~4 fps. Agora que o jogo arranca, estes
+             * prefixos sao SUPRIMIDOS por defeito. Para os reativar (debug),
+             * define a global Ruby $MKXP_VERBOSE = true.
+             * Mensagens normais (boot, fixes, [AUDIO], [BMP|MISS], erros) passam
+             * sempre. */
+            bool verbose = false;
+            {
+                mrb_value v = mrb_gv_get(mrb, mrb_intern_lit(mrb, "$MKXP_VERBOSE"));
+                verbose = mrb_test(v);
+            }
+            if (!verbose && s) {
+                /* prefixos de alta-frequencia a suprimir (comparacao barata) */
+                static const char *noisy[] = {
+                    "[SM#update]", "[PRB]", "[MISSING-DET]", "[MISSING]",
+                    "[SM#update", "[CHK]", NULL
+                };
+                for (int i = 0; noisy[i]; i++) {
+                    size_t n = strlen(noisy[i]);
+                    if (strncmp(s, noisy[i], n) == 0) {
+                        return mrb_nil_value();   /* suprimido */
+                    }
+                }
+            }
+            DBGLOG("[MFD] %s\n", s);
+        }
         return mrb_nil_value();
     }, MRB_ARGS_REQ(1));
+
+    /* ===========================================================================
+     * AUDIO NATIVO (FASE 1: SE/cries via NDSP) -- substitui os stubs vazios do
+     * modulo Audio (compat_stubs.h) por chamadas reais a audio_3ds.cpp. Cada
+     * metodo extrai (nome, volume, pitch) e delega. Tudo logado em [AUDIO].
+     * BGM/BGS/ME ainda sao stubs que apenas registam (Fases 2/3).
+     * ========================================================================= */
+    {
+        RClass *audio_mod = mrb_define_module(mrb, "Audio");
+
+        /* helper para extrair (str, [vol], [pitch]) de forma tolerante */
+        auto reg = [&](const char *name, mrb_func_t fn) {
+            mrb_define_module_function(mrb, audio_mod, name, fn,
+                                       MRB_ARGS_ARG(1, 3));
+        };
+
+        reg("se_play", [](mrb_state *m, mrb_value) -> mrb_value {
+            const char *f = NULL; mrb_int v = 80, p = 100; mrb_value pos = mrb_nil_value();
+            mrb_get_args(m, "z|iio", &f, &v, &p, &pos);
+            audio_3ds_se_play(f ? f : "", (int)v, (int)p);
+            return mrb_nil_value();
+        });
+        reg("se_stop", [](mrb_state *m, mrb_value) -> mrb_value {
+            (void)m; audio_3ds_se_stop(); return mrb_nil_value();
+        });
+        reg("bgm_play", [](mrb_state *m, mrb_value) -> mrb_value {
+            const char *f = NULL; mrb_int v = 100, p = 100, pos = 0;
+            mrb_get_args(m, "z|iii", &f, &v, &p, &pos);
+            audio_3ds_bgm_play(f ? f : "", (int)v, (int)p);
+            return mrb_nil_value();
+        });
+        reg("bgm_stop", [](mrb_state *m, mrb_value) -> mrb_value {
+            (void)m; audio_3ds_bgm_stop(); return mrb_nil_value();
+        });
+        reg("bgs_play", [](mrb_state *m, mrb_value) -> mrb_value {
+            const char *f = NULL; mrb_int v = 80, p = 100, pos = 0;
+            mrb_get_args(m, "z|iii", &f, &v, &p, &pos);
+            audio_3ds_bgs_play(f ? f : "", (int)v, (int)p);
+            return mrb_nil_value();
+        });
+        reg("bgs_stop", [](mrb_state *m, mrb_value) -> mrb_value {
+            (void)m; audio_3ds_bgs_stop(); return mrb_nil_value();
+        });
+        reg("me_play", [](mrb_state *m, mrb_value) -> mrb_value {
+            const char *f = NULL; mrb_int v = 100, p = 100;
+            mrb_get_args(m, "z|ii", &f, &v, &p);
+            audio_3ds_me_play(f ? f : "", (int)v, (int)p);
+            return mrb_nil_value();
+        });
+        reg("me_stop", [](mrb_state *m, mrb_value) -> mrb_value {
+            (void)m; audio_3ds_me_stop(); return mrb_nil_value();
+        });
+        /* metodos sem efeito sonoro mas que o jogo chama: registar no-op leve
+         * (fade/pos) -- evitam method_missing e ficam prontos p/ Fases 2/3. */
+        mrb_define_module_function(mrb, audio_mod, "bgm_fade",
+            [](mrb_state *m, mrb_value) -> mrb_value { (void)m; return mrb_nil_value(); }, MRB_ARGS_ARG(0,1));
+        mrb_define_module_function(mrb, audio_mod, "bgs_fade",
+            [](mrb_state *m, mrb_value) -> mrb_value { (void)m; return mrb_nil_value(); }, MRB_ARGS_ARG(0,1));
+        mrb_define_module_function(mrb, audio_mod, "me_fade",
+            [](mrb_state *m, mrb_value) -> mrb_value { (void)m; return mrb_nil_value(); }, MRB_ARGS_ARG(0,1));
+        mrb_define_module_function(mrb, audio_mod, "bgm_pos",
+            [](mrb_state *m, mrb_value) -> mrb_value { (void)m; return mrb_fixnum_value(0); }, MRB_ARGS_NONE());
+        mrb_define_module_function(mrb, audio_mod, "update",
+            [](mrb_state *m, mrb_value) -> mrb_value { (void)m; audio_3ds_update(); return mrb_nil_value(); }, MRB_ARGS_NONE());
+
+        DBGLOG("[AUDIO] modulo Audio nativo registado (se_play real; bgm/bgs/me stub+log)\n");
+    }
 
     /* ---------------------------------------------------------------
      * FIX rand/oldRand pos-scripts:
@@ -1194,6 +1554,9 @@ begin
   end
 rescue; end
 
+# -- PICFIX (Game_Picture/pictures store) movido para o FIM do boot ----------
+#    (precisa de 'dbg' e das classes do jogo ja' carregadas). Ver [PICFIX-LATE].
+
 # -- NilClass: $game_screen pode ser nil a cada frame -------------------------
 begin
   class NilClass
@@ -1217,6 +1580,68 @@ begin
     end
     unless method_defined?(:weather)
       def weather(*_a); nil; end
+    end
+    # -- metodos que floodavam o method_missing quando $game_screen / outros
+    #    objectos sao nil no mapa e no menu. Devolver valores seguros corta
+    #    milhares de method_missing/frame (Integer#origin vinha de nil.pictures
+    #    -> Integer -> .origin). pictures devolve um store real p/ pictures[n]
+    #    funcionar mesmo com $game_screen nil.
+    unless method_defined?(:pictures)
+      def pictures
+        $__nil_picstore__ ||= nil
+        if $__nil_picstore__.nil? && Object.const_defined?(:MKXPPictureStore)
+          $__nil_picstore__ = MKXPPictureStore.new
+        end
+        $__nil_picstore__
+      end
+    end
+    unless method_defined?(:set)
+      def set(*_a); self; end
+    end
+    unless method_defined?(:x=)
+      def x=(_v); _v; end
+    end
+    unless method_defined?(:y=)
+      def y=(_v); _v; end
+    end
+    unless method_defined?(:width)
+      def width; 0; end
+    end
+    unless method_defined?(:width=)
+      def width=(_v); _v; end
+    end
+    unless method_defined?(:height)
+      def height; 0; end
+    end
+    unless method_defined?(:height=)
+      def height=(_v); _v; end
+    end
+    unless method_defined?(:red)
+      def red; 0; end
+    end
+    unless method_defined?(:green)
+      def green; 0; end
+    end
+    unless method_defined?(:blue)
+      def blue; 0; end
+    end
+    unless method_defined?(:alpha)
+      def alpha; 0; end
+    end
+    unless method_defined?(:moveto)
+      def moveto(*_a); nil; end
+    end
+    unless method_defined?(:jumping?)
+      def jumping?; false; end
+    end
+    unless method_defined?(:refresh)
+      def refresh(*_a); nil; end
+    end
+    unless method_defined?(:terrain_tag)
+      def terrain_tag(*_a); 0; end
+    end
+    unless method_defined?(:tileset_id)
+      def tileset_id; 0; end
     end
   end
 rescue; end
@@ -1435,6 +1860,15 @@ end
 
 # -- Helper de log -------------------------------------------------------------
 def dbg(msg)
+  # FILTRO ANTI-LENTIDAO (lado Ruby): se nao estiver em modo verboso, suprimir
+  # os prefixos de alta-frequencia ANTES de chamar MKXPDebug.log. Isto evita
+  # tanto a escrita ao SD como parte do custo. A mensagem ja' vem construida
+  # (interpolada) do chamador, mas evitamos o funcall nativo. Para reativar
+  # tudo: $MKXP_VERBOSE = true.
+  unless $MKXP_VERBOSE
+    s = msg.to_s
+    return nil if s.start_with?("[SM#update]", "[PRB]", "[MISSING-DET]", "[MISSING]", "[CHK]")
+  end
   MKXPDebug.log(msg.to_s) rescue nil
 end
 
@@ -1575,6 +2009,123 @@ def _safe_return_for(name)
   return 0
 end
 
+# ===============================================================================
+# FIX RAIZ: defined? + const_missing + metodos de mapa/Integer em falta
+# -------------------------------------------------------------------------------
+# O mruby 3.2.0 (o do 3DS) NAO trata `defined?` como keyword: compila
+# defined?(X) como uma chamada de metodo `SSEND :defined?`. O argumento e'
+# avaliado ANTES. Se X for uma constante/metodo inexistente, rebenta ou cai no
+# method_missing -- e isso acontecia CENTENAS de vezes/frame (ex: 468x
+# Scene_Intro#defined? na intro), arrastando o FPS desde a intro ate' ao mapa.
+#
+# Solucao em 3 partes:
+#  1) MKXP_UNDEF: marcador devolvido por const_missing quando a constante nao
+#     existe (em vez de NameError). Encadeia (.foo.bar -> ainda MKXP_UNDEF).
+#  2) Kernel#defined?(v): recebe o valor JA' avaliado. Se for o marcador ->
+#     nil (nao definido); senao -> "expression" (definido). Isto da' a resposta
+#     CERTA para defined?(Constante), que e' a maioria dos 252 usos do jogo.
+#  3) const_missing global -> MKXP_UNDEF.
+# ===============================================================================
+begin
+  unless Object.const_defined?(:MKXP_UNDEF)
+    undef_obj = Object.new
+    class << undef_obj
+      def inspect; "#<undef>"; end
+      def to_s; ""; end
+      def to_str; ""; end
+      def nil?; true; end
+      def empty?; true; end
+      def method_missing(m, *a, &b); self; end
+      def respond_to_missing?(m, p = false); true; end
+      def coerce(o); [o.is_a?(Numeric) ? o : 0, 0]; end
+      def ==(o); o.nil? || o.equal?(self); end
+      def !; true; end
+    end
+    Object.const_set(:MKXP_UNDEF, undef_obj)
+  end
+
+  module ::Kernel
+    def defined?(*args)
+      return nil if args.empty?
+      args[0].equal?(MKXP_UNDEF) ? nil : "expression"
+    end
+  end
+
+  class ::Object
+    def self.const_missing(name)
+      MKXP_UNDEF
+    end
+  end
+  dbg "[DEFINED-FIX] defined?/const_missing instalados (mruby 3.2.0)"
+rescue => e
+  dbg "[DEFINED-FIX] falhou: #{e.class}: #{e.message}"
+end
+
+# -- NilClass: metodos de MAPA (o getMap(0)=nil propaga e o Spriteset le
+#    .tileset_name/.fog_*/.priorities/etc nesse nil -> 17 method_missing x ~85
+#    por ciclo = a causa do 0.4 fps no mapa). Devolver valores seguros corta
+#    ~1445 method_missing/ciclo. LOG intacto (estes deixam de aparecer porque
+#    deixam de ser "missing").
+begin
+  class ::NilClass
+    {
+      :tileset_name => "", :autotile_names => [], :panorama_name => "",
+      :panorama_hue => 0, :fog_name => "", :fog_hue => 0, :fog_opacity => 0,
+      :fog_blend_type => 0, :fog_zoom => 200, :fog_sx => 0, :fog_sy => 0,
+      :fog_opacity_duration => 0, :fog_tone => nil,
+      :battleback_name => "", :passages => nil, :priorities => nil,
+      :terrain_tags => nil, :map_id => 0, :name => "", :bgm => nil, :bgs => nil,
+      :encounter_list => [], :encounter_step => 30, :events => {},
+      :tileset_id => 0, :width => 0, :height => 0, :data => nil,
+      :scroll_type => 0, :autoplay_bgm => false, :autoplay_bgs => false
+    }.each do |meth, val|
+      unless method_defined?(meth)
+        define_method(meth) { val }
+      end
+    end
+  end
+  dbg "[NIL-MAP-FIX] metodos de mapa adicionados a NilClass OK"
+rescue => e
+  dbg "[NIL-MAP-FIX] falhou: #{e.class}: #{e.message}"
+end
+
+# -- Integer: a animacao de fade do title (start.png / overlay) faz alpha=,
+#    red, green, blue num valor que as vezes e' Integer em vez de Color/Float
+#    -> method_missing (Integer#alpha 20x). Devolver valores seguros permite
+#    a animacao de opacity avancar.
+begin
+  class ::Integer
+    unless method_defined?(:alpha);  def alpha;  self; end; end
+    unless method_defined?(:alpha=); def alpha=(v); v; end; end
+    unless method_defined?(:red);    def red;    self; end; end
+    unless method_defined?(:red=);   def red=(v); v; end; end
+    unless method_defined?(:green);  def green;  self; end; end
+    unless method_defined?(:green=); def green=(v); v; end; end
+    unless method_defined?(:blue);   def blue;   self; end; end
+    unless method_defined?(:blue=);  def blue=(v); v; end; end
+  end
+  dbg "[INT-FIX] Integer#alpha/red/green/blue adicionados OK"
+rescue => e
+  dbg "[INT-FIX] falhou: #{e.class}: #{e.message}"
+end
+
+# -- Array#map_id: o $MapFactory.maps e' um Array; algum codigo chama .map_id
+#    diretamente no Array (em vez de num mapa). Devolve o map_id do 1o mapa
+#    valido, ou 0. (Array#map_id 85x no log do mapa.)
+begin
+  class ::Array
+    unless method_defined?(:map_id)
+      def map_id
+        first_map = find { |m| m.respond_to?(:map_id) }
+        first_map ? first_map.map_id : (self[0].is_a?(Integer) ? self[0] : 0)
+      end
+    end
+  end
+  dbg "[ARR-FIX] Array#map_id adicionado OK"
+rescue => e
+  dbg "[ARR-FIX] falhou: #{e.class}: #{e.message}"
+end
+
 # -- method_missing universal em Object ---------------------------------------
 # Apanha QUALQUER classe que nao tenha um metodo -- inclui classes nao listadas.
 # As subclasses com method_missing proprio prevalecem (Ruby MRO).
@@ -1588,10 +2139,40 @@ end
 #   - contagem de chamadas (quantas vezes cada metodo foi pedido) -> prioridade
 $__mm_counts = {} rescue nil
 $__mm_seen   = {} rescue nil
+$__mm_retcache = {} rescue nil   # cache do valor seguro por simbolo (caminho quente)
 begin
   class Object
     alias _original_method_missing method_missing rescue nil
     def method_missing(m, *a, &blk)
+      # ── CAMINHO QUENTE ────────────────────────────────────────────────────
+      # No menu/jogo, os MESMOS metodos falhados sao chamados centenas de vezes
+      # por frame (ex: Integer#origin/zoom_x/angle quando pictures[] devolve
+      # Integer; NilClass#alpha). Reconstruir "#{cls}##{n}", correr a cadeia de
+      # start_with?/end_with? do _safe_return_for e escrever 2 hashes A CADA
+      # chamada era a fatia REAL que punha o menu a 1 FPS (nada a ver com SD).
+      # Depois de um metodo ja' ter sido visto e logado uma vez, devolvemos o
+      # valor seguro DIRETO de um cache por simbolo, sem strings nem trabalho.
+      # O LOGGING fica intacto: [MISSING-DET] (1x/metodo), contagem e
+      # [MISSING-TOP] continuam — so' deixamos de repetir o custo por chamada.
+      if $__mm_retcache
+        byclass = $__mm_retcache[self.class]
+        cached = byclass && byclass[m]
+        unless cached.nil?
+          # cached e' [valor, key]. A contagem ($__mm_counts) e' DIAGNOSTICO: em
+          # gameplay e' so' overhead (1 hash-write por metodo-em-falta por frame,
+          # e ha' centenas/frame -> fatia real do FPS do mapa). Se a contagem
+          # estiver desligada (apos o boot), devolvemos o valor cacheado DIRETO,
+          # sem nenhum trabalho. O log 1x/metodo ([MISSING-DET]) ja' aconteceu.
+          if $__mm_counts
+            key = cached[1]
+            $__mm_counts[key] = ($__mm_counts[key] || 0) + 1
+            $__mm_total = ($__mm_total || 0) + 1
+            __dump_missing_methods__ rescue nil if ($__mm_total % 2000) == 0
+          end
+          return cached[0]
+        end
+      end
+
       n = m.to_s
       cls = self.class.to_s
       key = "#{cls}##{n}"
@@ -1638,10 +2219,20 @@ begin
         _log_error_once("MMDET:#{key}",
           "[MISSING-DET] #{key} cat=#{cat} aridade=#{a.length} " \
           "tipos=[#{types_s}] vals=[#{vals_s}] bloco=#{blk_s} ret=#{ret_s}")
+        # memoriza o valor seguro deste (classe,simbolo) no caminho quente.
+        # Hash aninhado classe->simbolo (evita Array como chave, mais robusto).
+        # So' cacheamos quando NAO ha bloco (retorno estavel por nome+classe).
+        if $__mm_retcache && !blk
+          ($__mm_retcache[self.class] ||= {})[m] = [ret, key]
+        end
         return ret
       end
 
-      _safe_return_for(n)
+      r = _safe_return_for(n)
+      if $__mm_retcache && !blk
+        ($__mm_retcache[self.class] ||= {})[m] = [r, key]
+      end
+      r
     end
     def respond_to_missing?(m, include_private=false)
       true
@@ -1738,6 +2329,111 @@ begin
   end
 rescue => e
   dbg "[FIX-INPUT3] falhou: #{e.class}: #{e.message}"
+end
+
+# -- CAMADA DE COMPATIBILIDADE Sprite (do EBDX/MODTS) --------------------------
+# O Modular Title Screen (e o EBDX) reabrem `class Sprite` para acrescentar
+# metodos como center!, toggle, create_rect, zoom, id?, etc. Como saltamos o
+# EBDX (485 scripts partidos) para acelerar o boot, esses metodos deixaram de
+# ser aplicados -> no titulo, o "Press Enter" (start.png) chama center! e a
+# silhueta usa create_rect, ambos em falta -> elementos nao aparecem.
+# Aqui replicamos APENAS essa pequena camada (copiada 1:1 dos scripts do MODTS,
+# linhas ~10894+), sem reativar o EBDX inteiro. Usa os setters C++ ja existentes
+# (ox=, oy=, zoom_x=, x=, y=, color=, viewport).
+begin
+  class Sprite
+    attr_accessor :direction, :speed, :toggle
+    attr_accessor :end_x, :end_y, :param, :skew_d
+    attr_accessor :ex, :ey, :zx, :zy
+    attr_reader   :storedBitmap
+
+    # MTS: identifica elementos por id (sprites do titulo)
+    def id?(val); return nil; end
+
+    # desenha um rect de cor solida no proprio bitmap
+    def create_rect(width, height, color)
+      self.bitmap = Bitmap.new(width, height)
+      self.bitmap.fill_rect(0, 0, width, height, color)
+    end
+    def full_rect(color)
+      return unless self.bitmap
+      self.bitmap.fill_rect(0, 0, self.bitmap.width, self.bitmap.height, color)
+    end
+
+    # zoom unico -> aplica aos dois eixos
+    def zoom; return self.zoom_x; end
+    def zoom=(val); self.zoom_x = val; self.zoom_y = val; end
+
+    # ancora ao centro (usado pelo "Press Enter" e logo)
+    def center!(snap = false)
+      self.ox = self.width / 2
+      self.oy = self.height / 2
+      if snap && self.viewport
+        self.x = self.viewport.rect.width / 2
+        self.y = self.viewport.rect.height / 2
+      end
+    end
+    def center; return self.width / 2, self.height / 2; end
+
+    # ancora ao fundo
+    def bottom!
+      self.ox = self.width / 2
+      self.oy = self.height
+    end
+    def bottom; return self.width / 2, self.height; end
+
+    # valores adicionais por defeito
+    def default!
+      @speed = 1; @toggle = 1; @end_x = 0; @end_y = 0
+      @ex = 0; @ey = 0; @zx = 1; @zy = 1; @param = 1; @direction = 1
+    end
+
+    # glow/white sao decorativos (brilho); no-op seguro para nao bloquear o titulo
+    def glow(*args); return false; end
+    def white(*args); return nil; end
+  end
+  dbg "[SPRITE-COMPAT] camada MODTS/EBDX (center!/toggle/create_rect/zoom) OK"
+rescue => e
+  dbg "[SPRITE-COMPAT] falhou: #{e.class}: #{e.message}"
+end
+
+# -- Patch PokemonMapFactory#getMap: tolerar mapas inexistentes ----------------
+# Plugins como "Following Pokemon EX" (getTerrainTag) e "Water bubles" sondam ids
+# de mapa invalidos (ex: 0 -> Map000.rxdata, que nao existe). O load_data ja'
+# devolve nil para esses, mas getMap fazia 'Game_Map.new; map.setup(id)' e o setup
+# rebentava ao usar o mapa nil (NilClass#tileset_id -> "" -> TypeError no _native_aref).
+# Aqui envolvemos o setup: se rebentar para um id invalido, devolvemos nil cedo,
+# que e' exatamente o que getTerrainTag espera receber (trata nil como terreno 0).
+begin
+  class PokemonMapFactory
+    unless method_defined?(:__mkxp_orig_getMap)
+      alias_method :__mkxp_orig_getMap, :getMap
+      def getMap(id, add = true)
+        # cache existente: devolve sem tocar no disco
+        @maps.each { |m| return m if m.map_id == id } if @maps
+        # ids JA' conhecidos como inexistentes: devolve nil INSTANTE, sem I/O.
+        # O "Water bubles" sonda getTerrainTag(0)->getMap(0) TODOS os frames; sem
+        # esta cache, cada frame abria Map000.rxdata no SD (lento no 3DS real) e
+        # corria o setup ate' rebentar. Agora a 1a falha memoriza o id.
+        @__mkxp_bad_maps ||= {}
+        return nil if @__mkxp_bad_maps[id]
+        # mapa novo: tenta carregar, mas tolera id inexistente
+        begin
+          map = Game_Map.new
+          map.setup(id)
+          @maps.push(map) if add && @maps
+          return map
+        rescue => e
+          @__mkxp_bad_maps[id] = true
+          dbg "[MAPFIX] getMap(#{id}) inexistente -> nil (memorizado, sem mais I/O): #{e.class}"
+          return nil
+        end
+      end
+    end
+  end
+  dbg "[MAPFIX] PokemonMapFactory#getMap tolerante a mapas inexistentes OK"
+rescue => e
+  dbg "[MAPFIX] falhou: #{e.class}: #{e.message}"
 end
 
 # -- Patch method_missing nas classes reais do jogo ----------------------------
@@ -1839,7 +2535,80 @@ begin
       return nil if base.nil?
       s = (base.to_s rescue "")
       return nil if s.empty?
-      noext = s.gsub(/\.(bmp|png|gif|jpg|jpeg)$/i, "")
+
+      # ── PREVENCAO: redireccionar recursos CONHECIDOS em falta ─────────────────
+      # Da analise do Graphics.zip: a pasta Graphics/System/ NAO existe, mas os
+      # scripts pedem "Graphics/System/Window" (windowskin). O equivalente
+      # Graphics/Windowskins/001-Blue01 EXISTE. Redireccionamos e registamos no
+      # log, para a janela ter skin em vez de magenta. (Idempotente; so' actua
+      # se o pedido bater exactamente.) Outros redireccionamentos podem ser
+      # adicionados aqui conforme aparecam no log [BMP|MISS].
+      begin
+        redir = {
+          "Graphics/System/Window"  => "Graphics/Windowskins/001-Blue01",
+          "Graphics/System/Windowskin" => "Graphics/Windowskins/001-Blue01",
+        }
+        # tirar extensao sem regex (robusto): ultimo '.' depois da ultima '/'
+        key = s
+        begin
+          dot   = s.rindex(".")
+          slash = s.rindex("/")
+          key = s[0...dot] if dot && (slash.nil? || dot > slash) && (s.length - dot) <= 5
+        rescue
+          key = s
+        end
+        if redir.key?(key)
+          alt = redir[key]
+          if (safeExists?(alt + ".png") rescue false)
+            dbg "[BMP|REDIR] '#{s}' (em falta) -> '#{alt}.png'"
+            return alt + ".png"
+          end
+        end
+      rescue
+      end
+      # ──────────────────────────────────────────────────────────────────────────
+
+      # Tirar a extensao SEM regex (o gsub /regex/ rebenta se o Regexp stub do
+      # 3DS falhar -> a resolucao toda morria). Procura o ultimo '.' depois da
+      # ultima '/' e corta so' se parecer extensao (<=5 chars).
+      noext = s
+      begin
+        dot   = s.rindex(".")
+        slash = s.rindex("/")
+        if dot && (slash.nil? || dot > slash) && (s.length - dot) <= 5
+          noext = s[0...dot]
+        end
+      rescue
+        noext = s
+      end
+
+      # ── FIX 3DS (caixa de texto invisivel + imagens em falta) ────────────────
+      # safeExists?/File.exist? abaixo usam caminhos RELATIVOS, que falham no 3DS
+      # (o CWD nao e' a pasta do jogo). O loader C++ resolve porque prefixa
+      # sdmc:/mkxp/game/. Aqui testamos PRIMEIRO o caminho COMPLETO com o prefixo
+      # do jogo ($__mkxp_game_base, posto pelo binding). Se o ficheiro existir,
+      # devolvemos o caminho RELATIVO (que e' o que o loader C++ espera receber),
+      # mas a VERIFICACAO usa o caminho completo. Resolve windowskins (001-Blue01,
+      # "speech se 1") e qualquer outra imagem cujo resolver dependia disto.
+      begin
+        base_dir = ($__mkxp_game_base rescue nil)
+        if base_dir.is_a?(String) && !base_dir.empty?
+          ["", ".png", ".gif", ".bmp", ".jpg"].each do |ext|
+            rel  = noext + ext
+            full = base_dir + "/" + rel
+            ok = false
+            begin; ok = FileTest.exist?(full); rescue; ok = false; end
+            begin; ok = File.exist?(full) if !ok; rescue; end
+            if ok
+              dbg "[BMP|FULLPATH] '#{s}' resolvido via '#{full}'" if ($__mkxp_fullpath_logged ||= 0) < 3 && ($__mkxp_fullpath_logged += 1)
+              return rel
+            end
+          end
+        end
+      rescue
+      end
+      # ──────────────────────────────────────────────────────────────────────────
+
       # 1) pbTryString (resolve dentro de archives/RTP) se disponivel e real
       begin
         if respond_to?(:pbTryString)
@@ -1873,6 +2642,48 @@ begin
 
     # pbResolveBitmap real e robusto. Tenta a ORIGINAL primeiro (preserva o
     # comportamento de sprites/tilesets); fallback so se a original falhar.
+    # FIX IMAGEM QUE NAO APARECE (fundo do menu New Game / Load):
+    # O PokemonLoad_Scene chama pbTryString("Graphics/Pictures/loadbg_4.png")
+    # para resolver o fundo do menu. No Essentials, pbTryString resolve o
+    # ficheiro (em archives/RTP/filesystem) e devolve o caminho se existir.
+    # Aqui NAO existia -> caia no method_missing -> devolvia "" -> o loadbg
+    # NUNCA carregava -> fundo do menu sem imagem. (O ficheiro loadbg_4.png
+    # EXISTE no jogo, 279KB; so' faltava o resolver.)
+    # Definimos pbTryString real: tenta o caminho tal-qual e variantes de
+    # extensao, devolvendo o primeiro que exista no filesystem do jogo.
+    def pbTryString(x)
+      return nil if x.nil?
+      s = (x.to_s rescue "")
+      return nil if s.empty?
+      # 1) caminho exato (o jogo ja' costuma passar com extensao)
+      return s if (safeExists?(s) rescue false)
+      # 2) variantes de extensao. Tirar extensao SEM regex (robusto no 3DS:
+      #    se o Regexp stub falhar, gsub rebenta). Procura o ultimo '.' depois
+      #    da ultima '/'.
+      noext = s
+      begin
+        dot   = s.rindex(".")
+        slash = s.rindex("/")
+        if dot && (slash.nil? || dot > slash) && (s.length - dot) <= 5
+          noext = s[0...dot]
+        end
+      rescue
+        noext = s
+      end
+      [".png", ".gif", ".bmp", ".PNG", ".jpg"].each do |ext|
+        cand = noext + ext
+        return cand if (safeExists?(cand) rescue false)
+      end
+      # 3) ultimo recurso: File.exist? directo
+      [s, noext + ".png", noext + ".gif"].each do |cand|
+        begin
+          return cand if File.exist?(cand)
+        rescue
+        end
+      end
+      nil
+    end
+
     def pbResolveBitmap(x)
       return nil if x.nil?
       s = (x.to_s rescue "")
@@ -1892,8 +2703,72 @@ begin
       nil
     end
 
+    # ── PREVENCAO: resolvers que seguem o MESMO padrao fragil ─────────────────
+    # CAUSA-RAIZ do padrao (provada com pbTryString): os resolvers originais do
+    # Essentials dependem de RTP.exists?/RTP.getPath/RTP.eachPathFor e de
+    # pbGetFileChar->load_data(archives). No 3DS essa cadeia pode lancar excecao
+    # -> o metodo cai no method_missing universal -> devolve "" ou 0 -> imagem/
+    # audio nao carrega. Definimos AQUI versoes robustas que resolvem direto no
+    # filesystem do jogo (safeExists?/File.exist?), evitando a cadeia fragil.
+    # Sao idempotentes e so' substituem se a original nao for de confianca.
+
+    # pbBitmapName: devolve o caminho resolvido, ou o proprio x se nao encontrar
+    # (o jogo espera SEMPRE uma string utilizavel, nunca nil/0).
+    def pbBitmapName(x)
+      r = (pbResolveBitmap(x) rescue nil)
+      return r if r.is_a?(String) && !r.empty?
+      x   # fallback: devolver o nome original (comportamento do Essentials)
+    end
+
+    # pbResolveAudioSE: resolve um SE (efeito sonoro: cries, menu, etc.) direto
+    # no filesystem, tentando extensoes comuns. (Original usa RTP -> fragil.)
+    def pbResolveAudioSE(file)
+      return nil if file.nil?
+      f = (file.to_s rescue "")
+      return nil if f.empty?
+      base = "Audio/SE/" + f
+      [".ogg", ".wav", ".mp3", ".OGG", ".WAV", ""].each do |ext|
+        cand = base + ext
+        return cand if (safeExists?(cand) rescue false)
+      end
+      # tentar tambem o caminho tal-qual (alguns jogos ja' passam o path completo)
+      [f, f + ".ogg", f + ".wav"].each do |cand|
+        return cand if (safeExists?(cand) rescue false)
+      end
+      nil
+    end
+
+    # pbResolveAudioBGM/ME/BGS: mesma logica, pastas diferentes. So' definir se
+    # ainda nao existirem (alguns plugins/scripts podem trazer versoes reais).
+    def __mkxp_resolve_audio(subdir, file)
+      return nil if file.nil?
+      f = (file.to_s rescue "")
+      return nil if f.empty?
+      base = "Audio/" + subdir + "/" + f
+      [".ogg", ".wav", ".mp3", ".OGG", ".WAV", ""].each do |ext|
+        cand = base + ext
+        return cand if (safeExists?(cand) rescue false)
+      end
+      [f, f + ".ogg", f + ".wav"].each do |cand|
+        return cand if (safeExists?(cand) rescue false)
+      end
+      nil
+    end
+
+    def pbResolveAudioBGM(file); __mkxp_resolve_audio("BGM", file); end
+    def pbResolveAudioME(file);  __mkxp_resolve_audio("ME",  file); end
+    def pbResolveAudioBGS(file); __mkxp_resolve_audio("BGS", file); end
+    # ──────────────────────────────────────────────────────────────────────────
+
     public :__mkxp_try_bitmap
     public :pbResolveBitmap
+    public :pbTryString
+    public :pbBitmapName
+    public :pbResolveAudioSE
+    public :__mkxp_resolve_audio
+    public :pbResolveAudioBGM
+    public :pbResolveAudioME
+    public :pbResolveAudioBGS
   end
 
   dbg "[WSKIN] pbResolveBitmap real registado em Object (orig_disponivel=#{$__mkxp_has_orig_resolvebmp ? 'sim' : 'nao'})"
@@ -1920,7 +2795,8 @@ begin
         bmp = nil
         # 1) caminho preferido: RPG::Cache.load_bitmap (cache + ref-count)
         begin
-          if defined?(RPG) && RPG.const_defined?(:Cache)
+          rpg_ok = (Object.const_defined?(:RPG) rescue false)
+          if rpg_ok && (RPG.const_defined?(:Cache) rescue false)
             parts = name.split("/")
             file  = parts[-1].to_s
             dir   = parts[0...-1].join("/")
@@ -1982,7 +2858,176 @@ begin
 rescue => e
   dbg "[WSKIN] MessageConfig patch falhou: #{e.class}: #{e.message}"
 end
-# === /FIX JANELA DE MENSAGEM =================================================
+
+# -- FORCAR windowskin resolvido (caixa de texto 32x32 vazia) -----------------
+# CAUSA-RAIZ PROVADA (do log): pbResolveBitmap devolve "" para TODOS os
+# windowskins, mesmo os que EXISTEM (001-Blue01, "speech se 1") -- a cadeia
+# safeExists?/FileTest.exist? falha com caminhos relativos no 3DS. Por isso o
+# MessageConfig memoiza @@defaultTextSkin="" -> a janela recebe nome vazio ->
+# GifBitmap('/','') -> 32x32 -> caixa de texto invisivel.
+#
+# MAS o loader C++ (bmp_load_file) RESOLVE estes caminhos (loadPanels carregou
+# pelo mesmo mecanismo, prefixando sdmc:/mkxp/game/). Logo o problema NAO e' o
+# ficheiro nem o loader -- e' so' o pbResolveBitmap Ruby a falhar a verificacao.
+#
+# FIX (generico): NAO usar pbResolveBitmap. Setar @@defaultTextSkin / @@systemFrame
+# DIRETAMENTE (class_variable_set) com um caminho que o loader C++ resolve. Quando
+# a janela carregar a skin (AnimatedBitmap -> GifBitmap -> loader C++), o loader
+# acha o ficheiro com o prefixo do jogo. Usa o 1o windowskin configurado do jogo
+# e cai para 001-Blue01 (default universal RMXP/Essentials). Se nenhum existir, o
+# loader C++ mostra magenta (visivel) em vez de 32x32 (invisivel) -- melhor de
+# qualquer forma. So' actua se o valor atual estiver vazio.
+begin
+  if Object.const_defined?(:MessageConfig)
+    # Caminho a forcar: 1o windowskin do jogo (se configurado) + fallback universal.
+    skin_path = nil
+    begin
+      if defined?(Settings) && Settings.const_defined?(:SPEECH_WINDOWSKINS) &&
+         Settings::SPEECH_WINDOWSKINS.is_a?(Array) && !Settings::SPEECH_WINDOWSKINS.empty?
+        skin_path = "Graphics/Windowskins/" + Settings::SPEECH_WINDOWSKINS[0].to_s
+      end
+    rescue; end
+    skin_path ||= "Graphics/Windowskins/001-Blue01"   # default universal (RESCHECK confirma que existe)
+
+    # Setar DIRETO nas class-vars do MessageConfig, contornando pbResolveBitmap.
+    # (pbSetSpeechFrame faria @@x = pbResolveBitmap(v) || "" -> voltaria a "".)
+    need_speech = (MessageConfig.pbGetSpeechFrame.to_s.empty? rescue true)
+    need_system = (MessageConfig.pbGetSystemFrame.to_s.empty? rescue true)
+    begin
+      MessageConfig.class_variable_set(:@@defaultTextSkin, skin_path) if need_speech
+    rescue; end
+    begin
+      MessageConfig.class_variable_set(:@@systemFrame, skin_path) if need_system
+    rescue; end
+    dbg "[WSKIN] forcado DIRETO windowskin='#{skin_path}' (speech=#{need_speech} system=#{need_system})"
+    sf = (MessageConfig.pbGetSpeechFrame rescue "?")
+    dbg "[WSKIN] pbGetSpeechFrame agora = '#{sf}'"
+  end
+rescue => e
+  dbg "[WSKIN] forcar windowskin falhou: #{e.class}: #{e.message}"
+end
+# === /FORCAR windowskin ======================================================
+
+# -- PROBE DA CAIXA DE TEXTO (diagnostico do problema "caixa invisivel") -------
+# A logica de pbMessage corre mas a janela nao aparece no ecra. Suspeita: a
+# windowskin nao carrega (fica 32x32 vazia) -> os sprites da moldura ficam sem
+# bitmap -> invisiveis. Este probe envolve SpriteWindow_Base#windowskin= e loga
+# o TAMANHO REAL da windowskin aplicada + quantos sprites internos tem bitmap.
+# Confirma a causa no log SEM alterar comportamento. So' loga as primeiras 5x.
+begin
+  if Object.const_defined?(:SpriteWindow_Base)
+    class SpriteWindow_Base
+      unless method_defined?(:__mkxp_orig_windowskin_set)
+        alias __mkxp_orig_windowskin_set windowskin=
+        @@__wskin_probe_count = 0
+        def windowskin=(value)
+          __mkxp_orig_windowskin_set(value)
+          begin
+            if @@__wskin_probe_count < 5
+              @@__wskin_probe_count += 1
+              w = (value.width rescue '?')
+              h = (value.height rescue '?')
+              disp = (value.disposed? rescue '?')
+              dbg "[WSKIN-PROBE] ##{@@__wskin_probe_count} windowskin aplicada: #{value.class} #{w}x#{h} disposed=#{disp} rpgvx=#{@rpgvx}"
+              # contar sprites internos com bitmap
+              if @sprites.is_a?(Hash)
+                com = 0; sem = 0; vis = 0
+                @sprites.each do |k, sp|
+                  next if sp.nil?
+                  if (sp.bitmap rescue nil); com += 1; else; sem += 1; end
+                  vis += 1 if (sp.visible rescue false)
+                end
+                dbg "[WSKIN-PROBE]   sprites: #{@sprites.size} total, #{com} com bitmap, #{sem} sem, #{vis} visiveis"
+                dbg "[WSKIN-PROBE]   janela: viewport=#{@viewport.nil? ? 'NIL' : (@viewport.rect.inspect rescue '?')} visible=#{self.visible rescue '?'} x=#{self.x rescue '?'} y=#{self.y rescue '?'}"
+              end
+            end
+          rescue => _pe
+            dbg "[WSKIN-PROBE] erro: #{_pe.class}: #{_pe.message}"
+          end
+        end
+      end
+    end
+    dbg "[WSKIN-PROBE] instalado em SpriteWindow_Base#windowskin="
+  end
+rescue => e
+  dbg "[WSKIN-PROBE] instalacao falhou: #{e.class}: #{e.message}"
+end
+# === /PROBE DA CAIXA DE TEXTO ===============================================
+
+# -- FIX CAIXA DE TEXTO: windowskin a carregar como 32x32 vazio ----------------
+# DIAGNOSTICO (do log [WSKIN-PROBE]): a janela de mensagem cria 16 sprites,
+# 15 com bitmap, 10 visiveis -- a janela ESTA' a ser desenhada. MAS a windowskin
+# e' 32x32 (vazia) em vez do ficheiro real (96x48 "speech se 1"). Sem skin com
+# pixels, a moldura desenha transparente -> caixa invisivel.
+#
+# CAUSA: GifBitmap#initialize (Essentials) faz:
+#     begin; @bitmap = RPG::Cache.load_bitmap(dir, file); rescue; @bitmap = nil
+#     @bitmap = BitmapWrapper.new(32, 32) if @bitmap.nil?
+# Ou seja, se load_bitmap LANCA uma excecao, a skin vira 32x32 SILENCIOSAMENTE
+# (o rescue engole o erro). Por isso nao aparece [BMP|MISS] -- a falha e' Ruby,
+# nao do loader C++.
+#
+# FIX (2 partes):
+#  1. Envolver GifBitmap#initialize para LOGAR a excecao exata (ver o que falha).
+#  2. Se @bitmap ficou 32x32 (fallback), tentar carregar DIRETAMENTE via
+#     BitmapWrapper.new(caminho_completo) -- o loader C++ (bmp_load_file) resolve
+#     caminhos com espacos e varias extensoes, e SO' devolve 32x32 magenta se o
+#     ficheiro mesmo nao existir (e nesse caso loga [BMP|MISS]).
+begin
+  if Object.const_defined?(:GifBitmap)
+    class GifBitmap
+      unless method_defined?(:__mkxp_orig_gif_init)
+        alias __mkxp_orig_gif_init initialize
+        @@__gif_diag_count = 0
+        def initialize(dir, filename, hue = 0)
+          # tentar o original; capturar a excecao que normalmente e' engolida
+          _exc = nil
+          begin
+            @bitmap   = nil
+            @disposed = false
+            filename  = "" if !filename
+            begin
+              @bitmap = RPG::Cache.load_bitmap(dir, filename, hue)
+            rescue => _e
+              _exc = _e
+              @bitmap = nil
+            end
+            # Se falhou (nil) e ha' nome, tentar carregar DIRETAMENTE pelo loader C++
+            if @bitmap.nil? && filename && filename != ""
+              full = "#{dir}#{filename}"
+              begin
+                @bitmap = BitmapWrapper.new(full)
+              rescue => _e2
+                _exc = _e2
+                @bitmap = nil
+              end
+            end
+            # diagnostico das primeiras vezes
+            if @@__gif_diag_count < 8
+              @@__gif_diag_count += 1
+              w = (@bitmap.width rescue '?'); h = (@bitmap.height rescue '?')
+              if _exc
+                dbg "[GIF-FIX] '#{dir}#{filename}' -> #{w}x#{h} (load_bitmap lancou: #{_exc.class}: #{_exc.message})"
+              else
+                dbg "[GIF-FIX] '#{dir}#{filename}' -> #{w}x#{h} OK"
+              end
+            end
+            # ultimo recurso: 32x32 (como o original) para nunca rebentar
+            @bitmap = BitmapWrapper.new(32, 32) if @bitmap.nil?
+            @bitmap.play if @bitmap&.animated?
+          rescue => _efatal
+            dbg "[GIF-FIX] erro fatal em GifBitmap.new('#{dir}#{filename}'): #{_efatal.class}: #{_efatal.message}"
+            @bitmap = BitmapWrapper.new(32, 32)
+          end
+        end
+      end
+    end
+    dbg "[GIF-FIX] GifBitmap#initialize envolvido (diagnostico+fallback directo)"
+  end
+rescue => e
+  dbg "[GIF-FIX] instalacao falhou: #{e.class}: #{e.message}"
+end
+# === /FIX CAIXA DE TEXTO ====================================================
 
 # -- Injectar metodos ausentes directamente apos MISSING_PATCH ----------------
 # Os scripts do jogo redefinem Game_Player, Game_System, Game_Temp, etc. do
@@ -2394,6 +3439,57 @@ begin
 
         def main
           dbg "[Scene_Map] main: iniciando (watchdog C++ activado)"
+
+          # ── FIX ECRA PRETO / INTRO DO OAK BLOQUEADA ───────────────────────────
+          # CAUSA-RAIZ (provada pelo log: "switches=NilClass variables=NilClass
+          # self_switches=NilClass"): o caminho New Game (PokemonLoad_Scene) nao
+          # chegou a criar $game_switches/$game_variables/$game_self_switches
+          # (o SaveData.load_new_game_values falhou -> $game_player=NilClass).
+          # Sem eles, o evento de arranque 'QuickStartActivate' (Map001 id=4) faz
+          # "Controlar Variavel[1] += 1" num $game_variables nil -> a variavel
+          # fica presa em 0 -> a condicao "Var[1] < 5" e' SEMPRE verdadeira ->
+          # loop infinito -> a linha que activa o self-switch A do Evento 1
+          # 'Intro' (fala do Prof. Oak) NUNCA e' alcancada -> fundo preto eterno.
+          # Criamos aqui os 3 globais reais (idempotente) ANTES do loop de eventos.
+          begin
+            if $game_switches.nil? || !$game_switches.respond_to?(:[])
+              $game_switches = Game_Switches.new
+              dbg "[Scene_Map] FIX: $game_switches criado (#{$game_switches.class})"
+            end
+            if $game_variables.nil? || !$game_variables.respond_to?(:[])
+              $game_variables = Game_Variables.new
+              dbg "[Scene_Map] FIX: $game_variables criado (#{$game_variables.class})"
+            end
+            if $game_self_switches.nil? || !$game_self_switches.respond_to?(:[])
+              $game_self_switches = Game_SelfSwitches.new
+              dbg "[Scene_Map] FIX: $game_self_switches criado (#{$game_self_switches.class})"
+            end
+            # PREVENCAO: $game_temp e $game_system tambem sao necessarios e podem
+            # ficar nil pelo mesmo motivo (load_new_game_values falhou). Sem
+            # $game_temp com to_title=false, Scene_Map#update pode disparar
+            # pbCallTitle em loop. Sem $game_system, o map_interpreter/contadores
+            # de eventos partem. Criamos reais se faltarem (idempotente).
+            if ($game_temp.nil? || !$game_temp.respond_to?(:to_title)) && Object.const_defined?(:Game_Temp)
+              begin
+                $game_temp = Game_Temp.new
+                dbg "[Scene_Map] FIX: $game_temp criado (#{$game_temp.class})"
+              rescue => _gte
+                dbg "[Scene_Map] FIX $game_temp falhou: #{_gte.message}"
+              end
+            end
+            if ($game_system.nil? || !$game_system.respond_to?(:map_interpreter)) && Object.const_defined?(:Game_System)
+              begin
+                $game_system = Game_System.new
+                dbg "[Scene_Map] FIX: $game_system criado (#{$game_system.class})"
+              rescue => _gsy
+                dbg "[Scene_Map] FIX $game_system falhou: #{_gsy.message}"
+              end
+            end
+          rescue => _ge
+            dbg "[Scene_Map] FIX globais falhou: #{_ge.class}: #{_ge.message}"
+          end
+          # ──────────────────────────────────────────────────────────────────────
+
           _player_real = $game_player && $game_player.is_a?(Game_Player) rescue false
           dbg "[Scene_Map] $game_player real=#{_player_real}, class=#{$game_player.class rescue 'nil'}"
 
@@ -3029,7 +4125,9 @@ begin
         _obj.define_singleton_method(:weather_type)   { 0 }
         _obj.define_singleton_method(:weather_max)    { 0 }
         _obj.define_singleton_method(:shake)          { 0 }
-        _obj.define_singleton_method(:pictures)       { {} }
+        _obj.define_singleton_method(:pictures)       {
+          @__picstore ||= (MKXPPictureStore.new rescue {})
+        }
         $game_screen = _obj
       end
     rescue => e
@@ -3585,7 +4683,72 @@ end
     bitmapBindingReinit(mrb);
     DBGLOG("[FIX2] bitmapBindingReinit chamado antes do loop principal OK\n");
 
+    /* Boot terminado: configurar o GC para um HEAP GRANDE (Pokemon Essentials).
+     * --------------------------------------------------------------------------
+     * DESCOBERTA (analise dos logs): o gargalo dos 220s do CommonEvents e dos
+     * 4 FPS NAO e' o malloc nem o parser do marshal -- e' o GARBAGE COLLECTOR a
+     * correr vezes sem conta durante a criacao de objetos.
+     *
+     * Cada mrb_obj_alloc do mruby corre o GC quando 'live > threshold'. A forma
+     * como o 'threshold' e' recalculado depende do MODO do GC:
+     *   - GERACIONAL  -> threshold = live + 1024 (FIXO!). Ignora interval_ratio.
+     *                    Resultado: GC corre a cada 1024 alocacoes, SEMPRE. Com
+     *                    o heap grande do Pokemon, isto e' GC-thrashing puro.
+     *                    (Foi o erro da tentativa anterior: ligar geracional
+     *                    PIOROU porque forcou este threshold fixo baixo.)
+     *   - NAO-geracional -> threshold = (live_after_mark/100) * interval_ratio.
+     *                    Com interval_ratio MUITO alto, o threshold fica enorme
+     *                    -> o GC quase nao corre durante cargas em massa (marshal
+     *                    de CommonEvents, mapas, etc.) -> sem thrashing.
+     *
+     * CORRECAO: modo NAO-geracional + interval_ratio muito alto (mantido durante
+     * todo o jogo, nao so' no boot). Trocamos memoria (que sobra nos ~128MB do
+     * 3DS) por velocidade. NAO desligamos o GC por completo (mrb_gc_disable)
+     * porque isso fazia o arena de objetos novos transbordar no 3DS; com o GC
+     * apenas "preguicoso" (threshold alto) o arena continua a ser gerido
+     * normalmente pelo read_value (arena_save/restore). */
+    {
+        int before = (int)mrb->gc.live;
+        mrb_full_gc(mrb);                       /* 1 limpeza enquanto o heap e' pequeno */
+        /* GC GERACIONAL reativado (era desligado como remendo para a lentidao do
+         * boot -- mas essa lentidao eram os SIMBOLOS O(N^2), ja' corrigidos no
+         * mruby). O modo geracional e' o normal do mruby e e' o ideal para o
+         * jogo: faz GC menor (barato) frequente que limpa o lixo temporario
+         * (~750 objs/frame no mapa) SEM varrer o heap todo, evitando o OOM que
+         * antes enchia a memoria no mapa ([POOL|GROW] FALHOU). */
+        mrb->gc.generational  = TRUE;
+        mrb->gc.interval_ratio = 200;           /* default mruby (so' usado no modo nao-geracional) */
+        DBGLOG("[GC] boot concluido: GERACIONAL reativado (default) "
+               "(full_gc %d -> %d objs vivos) -- evita OOM no mapa\n",
+               before, (int)mrb->gc.live);
+    }
+
     DBGLOG("[binding] calling %s loop\n", entry_name);
+
+    /* DESLIGAR o diagnostico do method_missing antes do gameplay. A contagem
+     * ($__mm_counts) fazia um hash-write por cada metodo-em-falta por frame;
+     * no mapa ha' centenas/frame (ex: Integer#origin chamado milhares de vezes)
+     * -> fatia real do FPS. Aqui despejamos o TOP final (mantem a visibilidade
+     * do que falta) e DESLIGAMOS so' a contagem. O cache de retorno rapido
+     * ($__mm_retcache) e o log 1x/metodo ($__mm_seen, ja' feito no boot) ficam
+     * intactos -> os metodos-em-falta passam a devolver o valor seguro DIRETO,
+     * sem strings nem hash-writes. NAO remove logging: o [MISSING-TOP] sai aqui
+     * uma ultima vez. */
+    {
+        static const char *mm_off =
+            "begin\n"
+            "  __dump_missing_methods__ rescue nil\n"
+            "  if $__mm_counts\n"
+            "    MKXPDebug.log(\"[MISSING] diagnostico desligado p/ gameplay (cache mantido)\") rescue nil\n"
+            "    $__mm_counts = nil\n"   /* desliga so' a contagem; retcache continua */
+            "    $__mm_total  = nil\n"
+            "  end\n"
+            "rescue => e\n"
+            "  (MKXPDebug.log(\"[MISSING] falha ao desligar diagnostico: #{e.message}\") rescue nil)\n"
+            "end\n";
+        mrb_load_string(mrb, mm_off);
+        if (mrb->exc) mrb->exc = 0;
+    }
 
     /* Diagnóstico Ruby: verificar arity do initialize de BitmapWrapper
      * antes de entrar no loop. Deve ser -1 (C binding) ou 2 (req=1, opt=1).
@@ -4044,6 +5207,61 @@ static bool mkxp_plugin_dump_bytecode(mrb_state* mrb, const char* cache_path,
     mrb_gc_arena_restore(mrb, arena);
     return ok;
 }
+
+/* Compila o codigo UMA SO' VEZ, grava o bytecode (.mrb) E executa o mesmo proc.
+ * Substitui o fluxo antigo que compilava DUAS vezes (uma p/ gravar, outra p/
+ * executar) -- a compilacao (parse) e' a parte cara (~50% do tempo), por isso
+ * fazer 2x desperdicava metade do tempo de cada plugin cache-MISS.
+ *
+ * GENERICO: serve qualquer script de qualquer jogo. Os que dao SyntaxError
+ * falham no unico parse (sem desperdicar o 2o). Devolve true se executou (com ou
+ * sem erro de runtime); *out_dumped fica true se o .mrb foi gravado com sucesso
+ * (para a proxima corrida ser HIT, mesmo que a execucao agora tenha dado erro). */
+static bool mkxp_plugin_compile_dump_run(mrb_state* mrb, const char* cache_path,
+                                         const unsigned char* code, size_t code_len,
+                                         const char* script_name, bool* out_dumped) {
+    if (out_dumped) *out_dumped = false;
+    int arena = mrb_gc_arena_save(mrb);
+    mrbc_context* c = mrbc_context_new(mrb);
+    if (!c) { mrb_gc_arena_restore(mrb, arena); return false; }
+    mrbc_filename(mrb, c, script_name ? script_name : "plugin");
+    c->no_exec = TRUE;   /* compilar SEM executar -> obtemos o proc/irep p/ gravar E correr */
+
+    mrb_value vp = mrb_load_nstring_cxt(mrb, (const char*)code, code_len, c);
+    if (mrb->exc || !mrb_proc_p(vp)) {
+        /* erro de COMPILACAO (ex: SyntaxError): nao da' para gravar nem executar
+         * o bytecode. Limpar e devolver false -> o chamador cai para texto. */
+        if (mrb->exc) { show_error(mrb, script_name); mrb->exc = 0; }
+        mrbc_context_free(mrb, c);
+        mrb_gc_arena_restore(mrb, arena);
+        return false;
+    }
+    struct RProc* proc = mrb_proc_ptr(vp);
+    const mrb_irep* irep = proc->body.irep;
+
+    /* 1) Gravar o bytecode (best-effort). Acontece ANTES de executar, por isso
+     *    e' independente de a execucao falhar -> a proxima corrida sera' HIT. */
+    if (irep) {
+        unsigned char* bin = NULL; size_t bin_sz = 0;
+        int rc = mrb_dump_irep(mrb, irep, DUMP_ENDIAN_NAT, &bin, &bin_sz);
+        if (rc == MRB_DUMP_OK && bin && bin_sz > 0) {
+            FILE* wf = fopen(cache_path, "wb");
+            if (wf) {
+                if (fwrite(bin, 1, bin_sz, wf) == bin_sz && out_dumped) *out_dumped = true;
+                fclose(wf);
+            }
+        }
+        if (bin) mrb_free(mrb, bin);
+    }
+
+    /* 2) Executar o MESMO proc ja' compilado (equivale a ter corrido o texto). */
+    mrb_vm_run(mrb, proc, mrb_top_self(mrb), 0);
+    if (mrb->exc) { show_error(mrb, script_name); mrb->exc = 0; }
+
+    mrbc_context_free(mrb, c);
+    mrb_gc_arena_restore(mrb, arena);
+    return true;
+}
 #endif /* MKXP_CAN_DUMP_IREP */
 #endif /* MKXP_PLUGIN_CACHE */
 
@@ -4182,6 +5400,9 @@ static void run_plugin_scripts(mrb_state* mrb, const char* game_path) {
                 snprintf(sname, sizeof(sname), "%s", base);
             }
 
+            /* PROFILING por fase (igual aos scripts-base). */
+            uint64_t pl_t0 = prof_tick();
+
             /* descomprimir zlib (igual ao loop dos 376 scripts) */
             uLongf dest_len = (compressed_len > 0 ? compressed_len : 1) * 4;
             std::vector<Bytef> decomp(dest_len);
@@ -4199,10 +5420,19 @@ static void run_plugin_scripts(mrb_state* mrb, const char* game_path) {
                 continue;
             }
             decomp.resize(dest_len);
+            double pl_decomp_ms = prof_ticks_to_ms(prof_tick() - pl_t0);
 
             /* patch especifico de plugins: NAO mexe em defined? (o MODTS
              * precisa dele). Ver patch_plugin_script. */
+            uint64_t pl_t1 = prof_tick();
             patch_plugin_script(decomp, (uLong)decomp.size(), sname);
+            double pl_patch_ms = prof_ticks_to_ms(prof_tick() - pl_t1);
+
+            uint64_t pl_bytes = (uint64_t)decomp.size();
+            int    pl_hit = 0;
+            double pl_exec_ms = 0.0, pl_compile_ms = 0.0;
+            uint64_t pl_t2 = prof_tick();   /* inicio da fase exec/compile (fora do #if p/ robustez) */
+            bool executed = false;          /* fora do #if: o fallback abaixo precisa dela sempre */
 
 #if MKXP_PLUGIN_CACHE
             /* Chave de ficheiro: NNNN_nome (indice sequencial preserva ordem). */
@@ -4229,37 +5459,59 @@ static void run_plugin_scripts(mrb_state* mrb, const char* game_path) {
             if (mkxp_plugin_cache_run(mrb, cache_path, sname)) {
                 cache_hits++;
                 ok_scripts++;
+                pl_hit = 1;
+                pl_exec_ms = prof_ticks_to_ms(prof_tick() - pl_t2);
+                prof_script_record(sname, pl_bytes, pl_hit,
+                                   pl_decomp_ms, pl_patch_ms, pl_exec_ms, pl_compile_ms);
                 continue;
             }
 
-            /* 2) Sem cache: gravar o fonte para o PC compilar com mrbc... */
+            /* 2) Sem cache (MISS): gravar o fonte para o PC compilar com mrbc... */
             cache_miss++;
             mkxp_plugin_dump_src(src_path, decomp.data(), decomp.size());
-#if MKXP_CAN_DUMP_IREP
-            /* ...e, se a lib suportar dump, gerar o .mrb AUTOMATICAMENTE no 3DS
-             * (sem BAT). Na proxima corrida este script ja sai da cache. */
-            if (mkxp_plugin_dump_bytecode(mrb, cache_path,
-                                          decomp.data(), decomp.size())) {
-                cache_dumped++;
-            }
-#endif
-            /* ...e correr por texto desta vez (caminho normal abaixo). */
-#endif
 
-            /* executar */
-            mrb_value result = mrb_load_nstring(mrb, (const char*)decomp.data(),
-                                                decomp.size());
-            (void)result;
-            if (mrb->exc) {
-                /* regista o erro detalhado mas continua (boot resiliente) */
-                char ctx[200];
-                snprintf(ctx, sizeof(ctx), "plugin '%s' / %s", pname, sname);
-                show_error(mrb, ctx);
-                mrb->exc = 0;
-                fail_scripts++;
-            } else {
-                ok_scripts++;
+#if MKXP_CAN_DUMP_IREP
+            /* ...e, se a lib suportar dump, COMPILAR UMA SO' VEZ: gera o .mrb
+             * (best-effort) E executa o mesmo proc. Antes compilava-se 2x (uma
+             * p/ gravar, outra p/ executar) -- a compilacao e' a parte cara, por
+             * isso isto poupa ~50% do tempo de cada plugin MISS. Na proxima
+             * corrida o .mrb existe -> HIT (mesmo que a execucao agora dê erro
+             * de runtime, pois o .mrb e' gravado ANTES de executar). */
+            {
+                bool dumped = false;
+                if (mkxp_plugin_compile_dump_run(mrb, cache_path,
+                                                 decomp.data(), decomp.size(),
+                                                 sname, &dumped)) {
+                    executed = true;
+                    if (dumped) cache_dumped++;
+                    /* a contagem ok/fail e' feita por show_error dentro da funcao;
+                     * aqui consideramos "processado". Se houve excecao de runtime
+                     * ela ja' foi logada e limpa la' dentro. */
+                    ok_scripts++;
+                }
             }
+#endif
+#endif /* MKXP_PLUGIN_CACHE */
+
+            /* Fallback: se nao havia dump-irep (ou a compilacao falhou), correr
+             * por texto (compila+executa em runtime, sem cache). */
+            if (!executed) {
+                mrb_value result = mrb_load_nstring(mrb, (const char*)decomp.data(),
+                                                    decomp.size());
+                (void)result;
+                if (mrb->exc) {
+                    char ctx[200];
+                    snprintf(ctx, sizeof(ctx), "plugin '%s' / %s", pname, sname);
+                    show_error(mrb, ctx);
+                    mrb->exc = 0;
+                    fail_scripts++;
+                } else {
+                    ok_scripts++;
+                }
+            }
+            pl_compile_ms = prof_ticks_to_ms(prof_tick() - pl_t2);
+            prof_script_record(sname, pl_bytes, pl_hit,
+                               pl_decomp_ms, pl_patch_ms, pl_exec_ms, pl_compile_ms);
         }
     }
 
@@ -4278,6 +5530,11 @@ static void run_plugin_scripts(mrb_state* mrb, const char* game_path) {
     }
 #endif
 #endif
+    /* Relatorio de profiling dos plugins (igual aos scripts-base): hits/miss,
+     * tempo por fase, top 10 mais lentos. */
+    prof_report_scripts("plugins");
+    prof_scripts_reset();
+
     DBGLOG("[PLUGINS] concluido: %d scripts OK, %d falharam\n",
            ok_scripts, fail_scripts);
 }
@@ -4386,6 +5643,13 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
 	 * O fix MRB_TT_DATA tem de ser aplicado DEPOIS de run_rmxp_scripts(). */
     for (int i = 0; i < num_scripts; i++) {
         mrb_value entry = mrb_ary_entry(scripts_array, i);
+        /* PROGRESSO VISIVEL: a cada 25 scripts (e no 1o), uma linha com a
+         * contagem. Com o log line-buffered, isto prova que o carregamento
+         * esta' a AVANCAR (vs travado). Se o log parar em "script 150/376",
+         * sabes que travou no script ~150. */
+        if (i == 0 || (i % 25) == 0) {
+            DBGLOG("[SCRIPTS] progresso: %d/%d...\n", i, num_scripts);
+        }
         if (!mrb_array_p(entry) || RARRAY_LEN(entry) < 3) {
             DBGLOG("[ERROR] Script %d is not a valid array\n", i);
             continue;
@@ -4405,6 +5669,10 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
         const char* compressed  = RSTRING_PTR(code_val);
         int compressed_len      = RSTRING_LEN(code_val);
 
+        /* PROFILING por fase (descomprimir / patch / compilar / executar) — o
+         * equivalente ao BREAKDOWN dos rxdata, para scripts. */
+        uint64_t ph_t0 = prof_tick();
+
         // Descomprimir com zlib
         uLongf dest_len = compressed_len * 4;
         std::vector<Bytef> decomp(dest_len);
@@ -4419,9 +5687,16 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
             continue;
         }
         decomp.resize(dest_len);
+        double prof_decomp_ms = prof_ticks_to_ms(prof_tick() - ph_t0);
 
         // Aplicar patches (Main, etc.)
+        uint64_t ph_t1 = prof_tick();
         patch_script(decomp, (uLong)decomp.size(), script_name);
+        double prof_patch_ms = prof_ticks_to_ms(prof_tick() - ph_t1);
+
+        uint64_t script_bytes = (uint64_t)decomp.size();
+        int    prof_hit = 0;
+        double prof_exec_ms = 0.0, prof_compile_ms = 0.0;
 
 #if MKXP_BYTECODE_CACHE
         // --- CACHE DE BYTECODE -------------------------------------------
@@ -4431,32 +5706,52 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
         mkxp_cache_key(script_name, decomp.data(), decomp.size(),
                        cache_path, sizeof(cache_path));
 
+        uint64_t ph_t2 = prof_tick();
         bool done = mkxp_cache_try_load(mrb, cache_path, script_name);
-        if (!done) {
-            // nao havia cache valida -> compilar, gravar e executar
+        if (done) {
+            /* HIT: o tempo foi so' executar o bytecode. */
+            prof_hit = 1;
+            prof_exec_ms = prof_ticks_to_ms(prof_tick() - ph_t2);
+        } else {
+            /* MISS: compilar + gravar + executar. Aqui o tempo agrega compilacao
+             * e execucao; o relatorio mostra-o como compile (otimizavel se a cache
+             * gravasse). */
             done = mkxp_cache_compile_run(mrb, (const char*)decomp.data(),
                                           decomp.size(), cache_path, script_name);
+            prof_compile_ms = prof_ticks_to_ms(prof_tick() - ph_t2);
         }
         if (!done) {
             // ultimo recurso: caminho antigo (compila+executa, sem cache)
+            uint64_t ph_t3 = prof_tick();
             mrb_value result = mrb_load_nstring(mrb, (const char*)decomp.data(), decomp.size());
             (void)result;
             if (mrb->exc) {
                 show_error(mrb, script_name);
                 mrb->exc = 0;   // continuar mesmo com erro
             }
+            prof_compile_ms += prof_ticks_to_ms(prof_tick() - ph_t3);
         }
         // --- /CACHE DE BYTECODE ------------------------------------------
 #else
         // Caminho antigo (cache desligada): compila+executa em runtime.
+        uint64_t ph_t2 = prof_tick();
         mrb_value result = mrb_load_nstring(mrb, (const char*)decomp.data(), decomp.size());
         (void)result;
         if (mrb->exc) {
             show_error(mrb, script_name);
             mrb->exc = 0;
         }
+        prof_compile_ms = prof_ticks_to_ms(prof_tick() - ph_t2);
 #endif
+        /* Registar este script no profiling. */
+        prof_script_record(script_name, script_bytes, prof_hit,
+                           prof_decomp_ms, prof_patch_ms, prof_exec_ms, prof_compile_ms);
     }
+
+    /* Relatorio agregado dos 376 scripts: hits/miss, tempo por fase, top 10
+     * mais lentos. Responde se a cache funciona e onde vao os ~95s. */
+    prof_report_scripts("scripts-base");
+    prof_scripts_reset();   /* limpar para a fase de plugins reusar a estrutura */
 
     mrb_gc_unregister(mrb, scripts_array);
     DBGLOG("[SCRIPTS] Loaded %d scripts\n", num_scripts);
@@ -4514,6 +5809,28 @@ static char g_game_base[300] = {0};
  * leitura do load_data quando ha MISS; usado no fim para gravar o resultado). */
 char g_rxcache_pending[600] = {0};
 
+/* Cache de mapas inexistentes (anti-I/O-storm). Plugins sondam Map000 e outros
+ * ids invalidos todos os frames; sem isto cada sonda fazia um fopen() falhado.
+ * Guardamos os nomes (curtos, ex "Data/Map000.rxdata") numa lista fixa. */
+static char s_bad_maps[64][96];
+static int  s_bad_maps_n = 0;
+static bool mkxp_is_known_bad_map(const char *fname) {
+    if (!fname) return false;
+    if (!strstr(fname, "Map") || !strstr(fname, ".rxdata")) return false;
+    for (int i = 0; i < s_bad_maps_n; i++)
+        if (strcmp(s_bad_maps[i], fname) == 0) return true;
+    return false;
+}
+static void mkxp_register_bad_map(const char *fname) {
+    if (!fname) return;
+    if (!strstr(fname, "Map") || !strstr(fname, ".rxdata")) return;
+    if (mkxp_is_known_bad_map(fname)) return;
+    if (s_bad_maps_n < 64) {
+        snprintf(s_bad_maps[s_bad_maps_n], 96, "%s", fname);
+        s_bad_maps_n++;
+    }
+}
+
 int binding_3ds_run(const char *game_path) {
     dbglog_open();
     DBGLOG("binding_3ds_run: %s\n", game_path);
@@ -4527,8 +5844,116 @@ int binding_3ds_run(const char *game_path) {
     display_3ds_init();
     DBGLOG("[DISPLAY] display_3ds_init OK\n");
 
+    /* Inicializar o pool allocator ANTES de abrir o mruby. Todas as alocacoes
+     * do mruby passam a vir dos pools (alloc/free O(1)) em vez do malloc do
+     * sistema -- e' isto que elimina o O(n^2) do boot no 3DS (ver explicacao
+     * na definicao de mkxp_pool, no topo do ficheiro).
+     * MARCADORES DETALHADOS: cada passo loga ANTES de comecar, para que se o
+     * 3DS travar saibas EXATAMENTE em qual passo parou (o log e' line-buffered,
+     * por isso a ultima linha do ficheiro = onde parou). */
+    DBGLOG("[BOOT] passo 1/4: mkxp_pool::init()...\n");
+    mkxp_pool::init();
+#if USE_POOL_ALLOCATOR
+    DBGLOG("[BOOT] passo 1/4 OK. passo 2/4: mrb_open_allocf (criar mruby COM pool)...\n");
+    mrb_state *mrb = mrb_open_allocf(mkxp_pool::allocf, NULL);
+    if (!mrb) {
+        /* FALLBACK: se o pool allocator falhar no 3DS, tentar o mrb_open()
+         * normal. O boot fica mais lento mas pelo menos arranca. */
+        DBGLOG("[BOOT] passo 2/4 FALHOU com pool -- a tentar mrb_open() normal (fallback)...\n");
+        mrb = mrb_open();
+        if (!mrb) { DBGLOG("[ERROR] mrb_open (fallback) tambem falhou\n"); dbglog_close(); return -1; }
+        DBGLOG("[BOOT] passo 2/4 OK via FALLBACK (mrb_open normal -- boot mais lento)\n");
+    } else {
+        DBGLOG("[BOOT] passo 2/4 OK (mruby criado com pool, allocf chamado %ld vezes)\n",
+               mkxp_pool::s_allocf_calls);
+    }
+
+    /* O marshal tem um cache de resolucao de classe (nome -> RClass*) que acelera
+     * o load de TODOS os ficheiros .rxdata/.dat em ~150x. Esses ponteiros so' sao
+     * validos para ESTA sessao mruby; limpar o cache agora garante que uma nova
+     * sessao (reiniciar/trocar de jogo) nunca reutiliza ponteiros antigos. */
+    marshal_class_cache_reset();   /* limpa o cache de classes (ver declaracao no topo) */
+
+    /* Expor o caminho base do jogo ao Ruby como $__mkxp_game_base. O pbResolveBitmap
+     * do Essentials usa FileTest.exist? com caminhos RELATIVOS, que falham no 3DS
+     * (o CWD nao e' a pasta do jogo) -> nenhum windowskin/imagem resolve -> caixa
+     * de texto invisivel. Com esta global, __mkxp_try_bitmap pode testar o caminho
+     * COMPLETO (g_game_base + "/" + rel), tal como o loader C++ ja' faz. */
+    {
+        mrb_value gb = mrb_str_new_cstr(mrb, g_game_base);
+        mrb_gv_set(mrb, mrb_intern_lit(mrb, "$__mkxp_game_base"), gb);
+        DBGLOG("[WSKIN] $__mkxp_game_base = '%s' (p/ resolver imagens por caminho completo)\n", g_game_base);
+    }
+    DBGLOG("[POOL] allocator de pools ativo (alloc O(1), evita malloc O(n) do 3DS)\n");
+#else
+    /* TESTE DE ISOLAMENTO: mrb_open() normal, SEM o pool. Se o jogo arrancar
+     * assim (e travava com o pool), confirma que o problema esta' no pool.
+     * O boot sera' mais lento (malloc O(n) do 3DS no CommonEvents etc), mas
+     * permite chegar ao jogo e validar tudo o resto (audio, ecra, etc). */
+    DBGLOG("[BOOT] passo 1/4 OK. passo 2/4: mrb_open() NORMAL (pool DESLIGADO p/ teste)...\n");
     mrb_state *mrb = mrb_open();
     if (!mrb) { DBGLOG("[ERROR] mrb_open failed\n"); dbglog_close(); return -1; }
+    DBGLOG("[BOOT] passo 2/4 OK (mruby criado SEM pool -- boot mais lento mas estavel)\n");
+    DBGLOG("[POOL] DESLIGADO (USE_POOL_ALLOCATOR=0) -- a usar malloc do sistema\n");
+#endif
+
+
+    /* ── CHECK DE RECURSOS CRITICOS (diagnostico/prevencao) ────────────────────
+     * Da analise do Graphics.zip (18.661 ficheiros): alguns recursos que os
+     * scripts pedem NAO existem. Verificamos cedo e documentamos no log, para
+     * saberes imediatamente o que vai aparecer magenta/sem imagem e porque.
+     * Isto NAO bloqueia nada -- apenas regista. Caminhos relativos a' raiz do
+     * jogo (sdmc:/mkxp/game/). */
+    {
+        struct ResCheck { const char *path; const char *nota; };
+        static const ResCheck checks[] = {
+            { "sdmc:/mkxp/game/Graphics/System/Window.png",      "windowskin base (REDIRECIONADO p/ Windowskins/001-Blue01)" },
+            { "sdmc:/mkxp/game/Graphics/Windowskins/001-Blue01.png", "windowskin fallback (deve existir)" },
+            { "sdmc:/mkxp/game/Graphics/System/Iconset.png",     "icones de itens <img=...> (sem alternativa -> magenta)" },
+            { "sdmc:/mkxp/game/Graphics/Pictures/loadbg.png",    "fundo do menu load (deve existir)" },
+            { "sdmc:/mkxp/game/Graphics/Pictures/loadbg_4.png",  "fundo do menu New Game (deve existir)" },
+            { "sdmc:/mkxp/game/Data/CommonEvents.rxdata",        "eventos comuns (critico p/ intro)" },
+        };
+        DBGLOG("[RESCHECK] a verificar recursos criticos conhecidos...\n");
+        for (size_t i = 0; i < sizeof(checks)/sizeof(checks[0]); i++) {
+            FILE *rf = fopen(checks[i].path, "rb");
+            if (rf) {
+                fclose(rf);
+                DBGLOG("[RESCHECK]   OK    %s\n", checks[i].path);
+            } else {
+                DBGLOG("[RESCHECK]   FALTA %s  -- %s\n", checks[i].path, checks[i].nota);
+            }
+        }
+        DBGLOG("[RESCHECK] concluido (FALTA = sera' logado [BMP|MISS]/[BMP|REDIR] quando pedido)\n");
+    }
+
+    /* ── AJUSTE DO GC (anti-O(n^2)) ────────────────────────────────────────
+     * CAUSA RAIZ da lentidao do boot (CommonEvents 220s, Animations 18s p/
+     * 43KB, etc): o mruby ja' usa GC geracional, mas com interval_ratio=200
+     * dispara major-GCs frequentes que varrem a heap viva INTEIRA. A heap
+     * cresce durante o boot (376 scripts + 54 plugins + data = centenas de
+     * milhares de objetos), por isso cada varrimento fica mais caro -> O(n^2).
+     *
+     * PROBLEMA CRITICO descoberto pelo profiling: durante o boot o GC estava
+     * GERACIONAL, e o modo geracional IGNORA o interval_ratio (dispara um minor
+     * GC a cada ~1024 allocs, threshold FIXO). Por isso pôr interval_ratio=8000
+     * no inicio NAO bastava -- o GC continuava a correr a cada 1024 objetos e a
+     * varrer a heap viva. So' no FIM do boot e' que se punha NAO-geracional.
+     *
+     * CORRECAO: pôr NAO-geracional + interval_ratio gigante JA' AQUI, no inicio
+     * do boot (nao so' no fim). Assim os 376 scripts, os plugins e o 1o load de
+     * GameData (species 7.7s, Animations 14s, moves, items...) correm todos com
+     * o GC raro. Medido no mruby 3.2.0: criar objetos com a heap cheia e
+     * interval_ratio=40000 e' ~2x mais rapido que com o default, e MUITO mais
+     * rapido que geracional. SEGURO: nao desliga o GC (gc.disabled corrompia o
+     * array de topo no 3DS) nem mexe no arena; so' torna o GC menos frequente.
+     * O full_gc final (apos o boot, antes do 1o frame) compacta tudo. */
+    int  gc_saved_interval = mrb->gc.interval_ratio;
+    mrb_bool gc_saved_gen  = mrb->gc.generational;
+    mrb->gc.generational   = FALSE;   /* CRITICO: geracional ignora interval_ratio e corre a cada 1024 allocs */
+    mrb->gc.interval_ratio = 40000;   /* threshold gigante -> GC raro durante as cargas em massa do boot */
+    DBGLOG("[GC] boot inicio: NAO-geracional, interval_ratio %d -> %d, generational %d -> 0 (anti-O(n^2))\n",
+           gc_saved_interval, mrb->gc.interval_ratio, (int)gc_saved_gen);
 
     inputBindingInit(mrb);
     graphicsBindingInit(mrb);
@@ -4551,6 +5976,124 @@ int binding_3ds_run(const char *game_path) {
         } else {
             DBGLOG("[ALIAS] transition_3ds_internal e freeze_3ds_internal OK\n");
         }
+
+        /* ── PICFIX-LATE: pictures store robusto ───────────────────────────────
+         * CAUSA-RAIZ do menu lento: o jogo faz $game_screen.pictures[n].origin/
+         * .zoom_x/.angle/... Quando pictures[] devolvia nil/Integer, cada acesso
+         * caía no method_missing universal MILHARES de vezes por frame (no log:
+         * Integer#origin 1821x e a subir) -> menu a 1-8 FPS.
+         * A 1a tentativa (PICFIX cedo) FALHOU: corria antes de 'dbg' existir e o
+         * alias_method :pictures rebentava (rescue engolia tudo). Aqui corre TARDE
+         * -- 'dbg' e as classes do jogo ja' existem -- e NAO depende do pictures
+         * original (define de fresco). Resultado: pictures[n] devolve sempre um
+         * Game_Picture valido, custo O(1), zero method_missing. */
+        static const char *picfix_ruby = R"PICRUBY(
+# __pf_log: log seguro que NUNCA rebenta (nao depende de 'dbg', que no 3DS
+# pode cair no method_missing universal e levantar excecao -> o erro escapava
+# o rescue e o C++ via mrb->exc setado -> "[PICFIX-LATE] ERRO" mesmo com o
+# patch aplicado. Aqui usamos um log proprio protegido.
+__pf_log = lambda do |msg|
+  begin
+    MKXPDebug.log(msg.to_s)
+  rescue
+    nil
+  end
+end
+
+begin
+  # 1) MKXPPicture: a NOSSA classe, com TODOS os atributos RGSS garantidos.
+  unless Object.const_defined?(:MKXPPicture)
+    klass = Class.new do
+      attr_accessor :number, :name, :origin, :x, :y, :zoom_x, :zoom_y,
+                    :opacity, :blend_type, :tone, :angle
+      def initialize(n = 0)
+        @number = n; @name = ""; @origin = 0; @x = 0.0; @y = 0.0
+        @zoom_x = 100.0; @zoom_y = 100.0; @opacity = 255.0
+        @blend_type = 1; @angle = 0.0
+        @tone = (Tone.new(0,0,0,0) rescue nil)
+      end
+      def show(name, origin, x, y, zx, zy, op, bt)
+        @name=name; @origin=origin; @x=x; @y=y
+        @zoom_x=zx; @zoom_y=zy; @opacity=op; @blend_type=bt; @angle=0.0
+      end
+      def move(dur, origin, x, y, zx, zy, op, bt)
+        @origin=origin; @x=x; @y=y; @zoom_x=zx; @zoom_y=zy; @opacity=op; @blend_type=bt
+      end
+      def rotate(s); @rotate_speed=s; end
+      def start_tone_change(t, d); @tone=t; end
+      def erase; @name=""; end
+      def update; end
+    end
+    Object.const_set(:MKXPPicture, klass)
+    __pf_log.call("[PICFIX-LATE] MKXPPicture criada (atributos RGSS garantidos)")
+  end
+
+  # 2) Store que NUNCA devolve nil: cria MKXPPicture a pedido.
+  unless Object.const_defined?(:MKXPPictureStore)
+    store = Class.new do
+      def initialize; @h = {}; end
+      def [](i); @h[i] ||= MKXPPicture.new(i); end
+      def []=(i, v); @h[i] = v; end
+      def each(&b); @h.values.each(&b); end
+      def size; @h.size; end
+      def length; @h.size; end
+    end
+    Object.const_set(:MKXPPictureStore, store)
+  end
+
+  # 3) Game_Screen#pictures -> store. Define de FRESCO (sem alias, sem defined?).
+  if Object.const_defined?(:Game_Screen)
+    Game_Screen.class_eval do
+      def pictures
+        @__mkxp_picstore ||= MKXPPictureStore.new
+      end
+    end
+    __pf_log.call("[PICFIX-LATE] Game_Screen#pictures -> store robusto OK")
+  end
+
+  # 4) Se $game_screen ja' existe mas nao e' Game_Screen (stub), garante pictures.
+  gs_is_real = begin
+    $game_screen.is_a?(Game_Screen)
+  rescue
+    false
+  end
+  if $game_screen && !gs_is_real
+    begin
+      class << $game_screen
+        def pictures
+          @__mkxp_picstore ||= MKXPPictureStore.new
+        end
+      end
+    rescue
+      nil
+    end
+  end
+rescue => e
+  __pf_log.call("[PICFIX-LATE] falhou (rescue)")
+end
+)PICRUBY";
+        /* limpa qualquer exc residual de blocos anteriores antes de avaliar,
+         * para o teste a seguir refletir SO' o resultado do picfix. */
+        mrb->exc = 0;
+        mrb_load_string(mrb, picfix_ruby);
+        if (mrb->exc) {
+            /* Houve exc: limpa e verifica se mesmo assim o patch ficou aplicado
+             * (um rescue interno pode ter deixado exc setado sem impedir o
+             * patch). So' reportamos ERRO real se Game_Screen NAO ganhou
+             * o metodo pictures do nosso store. */
+            mrb->exc = 0;
+            int ok = 0;
+            if (mrb_class_defined(mrb, "MKXPPictureStore")) ok = 1;
+            if (ok) {
+                DBGLOG("[PICFIX-LATE] aplicado OK (exc residual ignorado)\n");
+            } else {
+                DBGLOG("[PICFIX-LATE] ERRO ao aplicar (exc) -- pictures pode ficar lento\n");
+            }
+            mrb->exc = 0;
+        } else {
+            DBGLOG("[PICFIX-LATE] aplicado OK\n");
+        }
+
     }
     etcBindingInit(mrb);
     bitmapBindingInit(mrb);
@@ -4590,6 +6133,18 @@ int binding_3ds_run(const char *game_path) {
             else
                 snprintf(path, sizeof(path), "%s/%s", g_game_base, fname ? fname : "");
 
+            /* --- cache de mapas INEXISTENTES (anti-I/O-storm + anti-log-spam)
+             * Plugins ("Water bubles" / "Following Pokemon EX") sondam Map000
+             * (e outros ids invalidos) TODOS os frames. Cada sonda fazia um
+             * fopen() falhado E um DBGLOG (escrita no SD, lentissima no 3DS)
+             * -> centenas de escritas/frame -> 2700 ms/frame. Verificamos ANTES
+             * de qualquer log: a 1a sonda loga e regista; as seguintes saem
+             * AQUI, sem log e sem tocar no disco. (helpers a nivel de ficheiro) */
+            if (mkxp_is_known_bad_map(fname)) {
+                g_rxcache_pending[0] = 0;
+                return mrb_nil_value();
+            }
+
             DBGLOG("[load_data] req='%s' -> '%s'\n", fname ? fname : "(nil)", path);
 
 #if MKXP_RXDATA_CACHE
@@ -4605,7 +6160,7 @@ int binding_3ds_run(const char *game_path) {
                         safe[si++] = (*p=='/'||*p=='\\'||*p==':') ? '_' : *p;
                     safe[si] = 0;
                     snprintf(g_rxcache_pending, sizeof(g_rxcache_pending),
-                             "sdmc:/mkxp/cache/rxdata/%s.%lu.%lu.mrx",
+                             "sdmc:/mkxp/cache/rxdata/%s.%lu.%lu.v2.mrx",
                              safe, (unsigned long)st_src.st_size,
                              (unsigned long)st_src.st_mtime);
 
@@ -4614,16 +6169,30 @@ int binding_3ds_run(const char *game_path) {
                         DBGLOG("[RXCACHE] HIT '%s'\n", fname);
                         mrb_value cv = mrb_nil_value();
                         bool ok = true;
+                        /* IMPORTANTE: marshalLoadInt NAO lanca excecao C++ quando o
+                         * marshal falha -- faz raise mruby (seta mrb2->exc) e devolve
+                         * nil. Por isso o catch(...) sozinho NAO deteta cache corrompida.
+                         * Temos de inspecionar mrb2->exc explicitamente E limpa-lo, senao
+                         * o erro pendente contamina o estado e rebenta frames depois
+                         * (era a causa do "New Game sai do jogo": Map001.mrx truncado). */
+                        mrb2->exc = NULL;                 /* limpa estado antes de tentar */
                         try { cv = marshalLoadInt(mrb2, cf); }
-                        catch (...) { ok = false; }
+                        catch (...) { ok = false; }       /* defensivo: throw improvavel */
                         fclose(cf);
+                        if (mrb2->exc) {                  /* houve raise mruby -> cache ma' */
+                            ok = false;
+                            mrb2->exc = NULL;             /* descarta o erro pendente */
+                        }
                         if (ok && !mrb_nil_p(cv)) {
                             DBGLOG("[RXCACHE]   load OK (sem re-parse da fonte)\n");
                             g_rxcache_pending[0] = 0;   /* ja' resolvido */
                             return cv;
                         }
-                        DBGLOG("[RXCACHE]   cache corrompida -> recarrega da fonte\n");
+                        DBGLOG("[RXCACHE]   CORROMPIDA '%s' -> apaga e recarrega da fonte\n",
+                               g_rxcache_pending);
                         remove(g_rxcache_pending);
+                        /* g_rxcache_pending fica setado de proposito: ao recarregar da
+                         * fonte abaixo, o bloco de gravacao regenera o .mrx correto. */
                     } else {
                         DBGLOG("[RXCACHE] MISS '%s' -> grava apos load\n", fname);
                     }
@@ -4641,6 +6210,23 @@ int binding_3ds_run(const char *game_path) {
                 src = "romfs";
             }
             if (!fp) {
+                /* Mapas inexistentes (MapNNN.rxdata) NAO devem rebentar: plugins
+                 * como "Following Pokemon EX" (getTerrainTag) e "Water bubles" sondam
+                 * ids de mapa invalidos de proposito (ex: Map000). Rebentar aqui
+                 * matava o Spriteset_Global inteiro -> ecra preto apos New Game.
+                 * Para mapas em falta devolvemos nil (o codigo Ruby ja' tolera nil);
+                 * para qualquer outro ficheiro essencial mantemos o raise, para nao
+                 * mascarar bugs reais de dados em falta. */
+                bool is_map = fname &&
+                    (strstr(fname, "Map") != NULL) &&
+                    (strstr(fname, ".rxdata") != NULL);
+                if (is_map) {
+                    DBGLOG("[load_data] mapa inexistente '%s' -> nil (sonda de plugin, ignorado)\n",
+                           path);
+                    mkxp_register_bad_map(fname);   /* proxima sonda: nil sem I/O */
+                    g_rxcache_pending[0] = 0;   /* nao gravar cache de um nil */
+                    return mrb_nil_value();
+                }
                 DBGLOG("[load_data] ERRO: ficheiro nao encontrado '%s'\n", path);
                 mrb_raise(mrb2, mrb_class_get(mrb2, "RuntimeError"),
                           "load_data: cannot open file");
@@ -4682,20 +6268,41 @@ int binding_3ds_run(const char *game_path) {
              * Escreve para um ficheiro temporario e so' o renomeia no fim,
              * para que uma escrita interrompida nao deixe cache corrompida. */
             if (g_rxcache_pending[0] && !mrb_nil_p(v)) {
-                char tmp[620];
+                char tmp[640];
                 snprintf(tmp, sizeof(tmp), "%s.tmp", g_rxcache_pending);
                 FILE *wf = fopen(tmp, "wb");
+                if (!wf) {
+                    /* RECUPERACAO: a pasta sdmc:/mkxp/cache/rxdata/ pode nao existir
+                     * (apagada manualmente, ou mkdir do boot falhou). Sem isto, TODOS
+                     * os load_data ficam MISS para sempre -> cada arranque/mapa re-
+                     * processa do zero (cache morto = lentidao permanente). Garante a
+                     * arvore de pastas e tenta abrir o tmp uma segunda vez. */
+                    mkdir("sdmc:/mkxp",              0777);
+                    mkdir("sdmc:/mkxp/cache",        0777);
+                    mkdir("sdmc:/mkxp/cache/rxdata", 0777);
+                    wf = fopen(tmp, "wb");
+                    if (wf) DBGLOG("[RXCACHE] pasta recriada -> tmp abre agora OK\n");
+                    else    DBGLOG("[RXCACHE] tmp falha mesmo apos mkdir: '%s'\n", tmp);
+                }
                 if (wf) {
                     bool ok = true;
-                    try { marshalDumpInt(mrb2, wf, v); }
+                    bool complete = false;
+                    try { complete = marshalDumpInt(mrb2, wf, v); }
                     catch (...) { ok = false; }
                     fclose(wf);
-                    if (ok) {
+                    if (ok && complete) {
                         remove(g_rxcache_pending);          /* Windows/3DS: rename falha se destino existe */
                         if (rename(tmp, g_rxcache_pending) == 0)
                             DBGLOG("[RXCACHE] gravado '%s' (proxima corrida le da cache)\n",
                                    g_rxcache_pending);
                         else { DBGLOG("[RXCACHE] rename falhou -> apaga tmp\n"); remove(tmp); }
+                    } else if (ok && !complete) {
+                        /* dump tinha tipos nao-serializaveis (Tables/Data). Gravar
+                         * isto daria cache corrompido -> EOF ao reler -> jogo fecha.
+                         * Descartamos o tmp; este ficheiro le-se sempre da fonte. */
+                        DBGLOG("[RXCACHE] '%s' tem tipos nao-serializaveis -> cache IGNORADO (le da fonte)\n",
+                               g_rxcache_pending);
+                        remove(tmp);
                     } else {
                         DBGLOG("[RXCACHE] dump falhou -> apaga tmp\n");
                         remove(tmp);
@@ -4799,7 +6406,9 @@ int binding_3ds_run(const char *game_path) {
     DBGLOG("[FIX4] __rebind_bitmapwrapper_init__ registado em Kernel OK\n");
 
     // Carregar scripts (ainda vazia, mas vamos preencher)
+    DBGLOG("[BOOT] passo 3/4: run_rmxp_scripts (carregar+correr 376 scripts -- FASE MAIS LONGA)...\n");
     run_rmxp_scripts(mrb, game_path);
+    DBGLOG("[BOOT] passo 3/4 OK (scripts carregados e executados).\n");
 
     /* ---------------------------------------------------------------
      * REINIT CRÍTICO: Bitmap + BitmapWrapper + Sprite

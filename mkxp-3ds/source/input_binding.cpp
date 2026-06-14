@@ -21,6 +21,15 @@ static bool s_released[RMXP_KEY_COUNT];
 static bool s_trigger_latch[RMXP_KEY_COUNT];
 static bool s_release_latch[RMXP_KEY_COUNT];
 
+/* Contador de frames que cada tecla esta' em baixo, para o Input.repeat? real
+ * do RGSS. Sem isto, repeat? = press? (true em TODOS os frames) -> 1 toque
+ * fisico (que dura ~4 frames) movia o cursor 4 vezes. */
+static int  s_press_frames[RMXP_KEY_COUNT];
+/* Lógica RGSS: repeat? e' true no 1o frame, depois espera REPEAT_DELAY, depois
+ * repete a cada REPEAT_INTERVAL frames. (Valores classicos do RGSS @60fps.) */
+#define RMXP_REPEAT_DELAY    15
+#define RMXP_REPEAT_INTERVAL  4
+
 /* Chamado UMA vez por frame, exclusivamente por grph_update (C++).
  * Input.update (Ruby) e um no-op para evitar double-poll. */
 void inputBindingUpdate() {
@@ -37,6 +46,10 @@ void inputBindingUpdate() {
         if (new_released[i])  s_release_latch[i]  = true;
         if (new_triggered[i]) s_pressed[i] = true;
         if (new_released[i])  s_pressed[i] = false;
+        /* contar frames em baixo (para o repeat? real): incrementa enquanto
+         * pressionado, zera quando solto. */
+        if (s_pressed[i]) s_press_frames[i]++;
+        else              s_press_frames[i] = 0;
         /* Super Debug: registar QUALQUER tecla fisica detectada. Mostra no log
          * se o input do 3DS/Azahar esta a chegar ao binding. Se carregas em A
          * e NAO aparece "tecla detectada k=13", o problema e' a montante
@@ -63,17 +76,34 @@ static mrb_value inp_trigger(mrb_state *mrb, mrb_value self) {
         DBG(DBG_INPUT, "trigger? k=%d -> TRUE (latch consumido)", (int)k);
         return mrb_true_value();
     }
-    /* DIAGNOSTICO: registar TODAS as leituras de trigger? para ver a sequencia
-     * exata (quem le o que, e se o latch de 13 e' consumido por outra leitura).
-     * So loga teclas relevantes (k<=18) ou fora de limites, p/ nao inundar. */
-    if (DBGV(DBG_INPUT) && (k < 0 || k > RMXP_KEY_COUNT || k == 13 || k == 12 || k == 11)) {
+    /* DIAGNOSTICO: o log por-frame de "trigger? -> false" disparava 2x por frame
+     * SEMPRE (mesmo sem input), gerando dezenas de milhares de escritas ao SD e
+     * matando a performance (1 FPS). O input ja' esta' confirmado a funcionar,
+     * por isso o caso "false" e' silenciado. Os eventos UTEIS continuam logados:
+     * "tecla detectada" (latch ON, em inputBindingUpdate) e o ramo TRUE acima
+     * ("latch consumido"). Para re-ativar o trace completo em depuracao futura,
+     * liga DBG_POS junto de DBG_INPUT (gate abaixo). */
+    if (DBGV(DBG_INPUT) && DBGV(DBG_POS) &&
+        (k < 0 || k > RMXP_KEY_COUNT || k == 13 || k == 12 || k == 11)) {
         DBG(DBG_INPUT, "trigger? k=%d -> false (latch off ou fora de limites)", (int)k);
     }
     return mrb_false_value();
 }
 static mrb_value inp_repeat(mrb_state *mrb, mrb_value self) {
     (void)self; mrb_int k; mrb_get_args(mrb, "i", &k);
-    return (k>=0&&k<RMXP_KEY_COUNT&&s_pressed[k]) ? mrb_true_value() : mrb_false_value();
+    if (k<0 || k>=RMXP_KEY_COUNT || !s_pressed[k]) return mrb_false_value();
+    /* Logica de repeticao do RGSS (em vez de devolver true em TODOS os frames):
+     *  - true no 1o frame em que a tecla foi pressionada (toque simples = 1 vez)
+     *  - depois fica em silencio durante RMXP_REPEAT_DELAY frames
+     *  - so' entao comeca a repetir, a cada RMXP_REPEAT_INTERVAL frames
+     * Assim 1 toque fisico (~4 frames) move o cursor SO' 1 vez, e segurar a
+     * tecla faz scroll continuo (como num menu normal). */
+    int f = s_press_frames[k];
+    if (f <= 1) return mrb_true_value();                  /* primeiro frame */
+    if (f > RMXP_REPEAT_DELAY &&
+        ((f - RMXP_REPEAT_DELAY) % RMXP_REPEAT_INTERVAL) == 0)
+        return mrb_true_value();                            /* repeticoes apos o atraso */
+    return mrb_false_value();
 }
 static mrb_value inp_release(mrb_state *mrb, mrb_value self) {
     (void)self; mrb_int k; mrb_get_args(mrb, "i", &k);

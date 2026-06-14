@@ -3,6 +3,7 @@
 #include <citro3d.h>
 #include <stdio.h>
 #include "platform_3ds.h"
+#include "audio_3ds.h"
 
 extern int  mkxp_3ds_run(const char* game_path);
 extern void mkxp_3ds_cleanup();
@@ -15,10 +16,12 @@ static void init_services() {
     consoleInit(GFX_BOTTOM, NULL);
     romfsInit();
     ndspInit();
+    audio_3ds_init();   /* subsistema de audio (SE/cries) -- depois de ndspInit */
 }
 
 static void exit_services() {
     mkxp_3ds_cleanup();
+    audio_3ds_exit();   /* libertar buffers de audio antes de ndspExit */
     ndspExit();
     romfsExit();
     C2D_Fini();

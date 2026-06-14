@@ -1,5 +1,7 @@
 #include "display_3ds.h"
 #include "debug_3ds.h"
+#include "audio_3ds.h"
+#include "profile_3ds.h"
 #include <cstring>
 #include <stdio.h>
 extern FILE *g_dbglog;
@@ -7,7 +9,7 @@ extern FILE *g_dbglog;
  * para evitar I/O sincrono ao cartao SD por frame. Contador global partilhado. */
 extern int g_dbglog_flushc;
 #define printf(fmt, ...) do { if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); \
-    if (++g_dbglog_flushc >= 64) { g_dbglog_flushc = 0; fflush(g_dbglog); } } } while(0)
+    if (++g_dbglog_flushc >= 512) { g_dbglog_flushc = 0; fflush(g_dbglog); } } } while(0)
 
 #define TOP_W 400
 #define TOP_H 240
@@ -102,6 +104,12 @@ void display_3ds_begin_frame() {
 
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     s_in_frame = true;
+    /* PROFILING: o tempo desde o end_frame anterior ate' aqui foi a LOGICA do
+     * jogo (update Ruby: Scene#update, eventos, input). A partir daqui ate' ao
+     * end_frame e' o RENDER (C++: blits). Medir os dois separadamente diz-nos
+     * se os 5 FPS sao por causa da logica Ruby ou do render. */
+    PROF_END(PROF_FRAME_UPDATE);     /* fecha o intervalo de update (aberto no end_frame anterior) */
+    PROF_BEGIN(PROF_FRAME_RENDER);   /* abre o intervalo de render */
     C2D_TargetClear(s_top,    C2D_Color32(0, 0, 0, 255));
     C2D_TargetClear(s_bottom, C2D_Color32(0, 0, 0, 255));
     C2D_SceneBegin(s_top);
@@ -115,6 +123,45 @@ void display_3ds_begin_frame() {
  * ═══════════════════════════════════════════════════════════════════════════ */
 void display_3ds_end_frame() {
     s_frame_count++;
+
+    /* HEARTBEAT: a cada 60 frames (~1x/seg) uma linha "vivo" com o nº de frame.
+     * Prova que o LOOP PRINCIPAL esta' a correr. Se o log parar de mostrar
+     * heartbeats, o jogo travou (e a ultima linha diz em que frame). Custo ~0
+     * (1 linha por segundo). Com o log line-buffered, ve-se em tempo real. */
+    if ((s_frame_count % 60) == 0) {
+        extern FILE *g_dbglog;
+        if (g_dbglog) {
+            fprintf(g_dbglog, "[HEARTBEAT] vivo -- frame %d\n", s_frame_count);
+            fflush(g_dbglog);
+        }
+        printf("[HEARTBEAT] vivo -- frame %d\n", s_frame_count);
+    }
+
+    /* AUDIO (Fase 1): reciclar buffers de SE que ja' terminaram. Barato; corre
+     * 1x por frame garantido. (A funcao verifica o estado interno e so' liberta
+     * o que terminou; loga apenas quando ha' algo a reciclar.) */
+    audio_3ds_update();
+
+    /* ── MEDIDOR DE FPS REAL (intuitivo p/ debug de performance) ──────────────
+     * Mede o tempo de parede entre cada 60 frames via svcGetSystemTick (relogio
+     * do CPU ARM11 = 268.111856 MHz). Imprime UMA linha [FPS] legivel:
+     *   [FPS] 58.7 fps | 60 frames em 1022 ms | media 17.0 ms/frame
+     * Se vires "1.x fps" e ms/frame enorme, ha' trabalho a mais por frame (I/O,
+     * recriacao de texturas, marshal). Linha unica a cada 60 frames -> custo ~0. */
+    {
+        static u64 s_fps_tick0 = 0;
+        static int s_fps_frames = 0;
+        if (s_fps_tick0 == 0) s_fps_tick0 = svcGetSystemTick();
+        if (++s_fps_frames >= 60) {
+            u64 now   = svcGetSystemTick();
+            double ms = (double)(now - s_fps_tick0) / 268111.856; /* ticks -> ms */
+            double fps = (ms > 0.0) ? (s_fps_frames * 1000.0 / ms) : 0.0;
+            printf("[FPS] %.1f fps | %d frames em %.0f ms | media %.1f ms/frame\n",
+                   fps, s_fps_frames, ms, ms / s_fps_frames);
+            s_fps_tick0  = now;
+            s_fps_frames = 0;
+        }
+    }
 
     /* [DBG] Frame 1,2,3 + cada 300: relatório de blits */
     bool do_log = (s_frame_count <= 3 || s_frame_count % 300 == 0);
@@ -155,6 +202,41 @@ void display_3ds_end_frame() {
 
     C2D_SceneBegin(s_bottom);
     C3D_FrameEnd(0);
+
+    /* PROFILING: fim do render deste frame. Acumula blits e, a cada 60 frames,
+     * imprime um relatorio [PROFILE|frame] com a divisao update vs render. Isto
+     * responde DIRETAMENTE a' pergunta "onde vai o tempo do frame?": se
+     * frame.update >> frame.render, o gargalo e' a logica Ruby (ex: GC, eventos);
+     * se frame.render >> frame.update, e' o desenho (blits, texturas). */
+    PROF_END(PROF_FRAME_RENDER);     /* fecha o render */
+    g_prof_blits += (uint64_t)s_blit_count;
+
+    if ((s_frame_count % 60) == 0 && s_frame_count > 0) {
+        double upd_ms = prof_ticks_to_ms(g_prof_zones[PROF_FRAME_UPDATE].total_ticks);
+        double rnd_ms = prof_ticks_to_ms(g_prof_zones[PROF_FRAME_RENDER].total_ticks);
+        uint64_t upd_n = g_prof_zones[PROF_FRAME_UPDATE].count;
+        uint64_t rnd_n = g_prof_zones[PROF_FRAME_RENDER].count;
+        double upd_avg = upd_n ? upd_ms / (double)upd_n : 0.0;
+        double rnd_avg = rnd_n ? rnd_ms / (double)rnd_n : 0.0;
+        extern FILE *g_dbglog;
+        char line[256];
+        snprintf(line, sizeof(line),
+            "[PROFILE|frame] media: update=%.1fms render=%.1fms (=> %s domina) "
+            "| objs_criados_total=%llu frees_total=%llu\n",
+            upd_avg, rnd_avg,
+            upd_avg > rnd_avg ? "LOGICA Ruby" : "RENDER C++",
+            (unsigned long long)g_prof_objs_created,
+            (unsigned long long)g_prof_frees);
+        printf("%s", line);
+        if (g_dbglog) { fprintf(g_dbglog, "%s", line); fflush(g_dbglog); }
+        /* reset das zonas de frame para a media ser dos ULTIMOS 60 frames, nao
+         * acumulada desde o boot (senao a media fica "achatada" e nao reflete o
+         * estado atual, ex: menu vs mapa). */
+        prof_zone_reset(PROF_FRAME_UPDATE);
+        prof_zone_reset(PROF_FRAME_RENDER);
+    }
+
+    PROF_BEGIN(PROF_FRAME_UPDATE);   /* abre o intervalo de update ate' ao proximo begin_frame */
 }
 
 int display_3ds_screen_width()  { return TOP_W; }
@@ -222,6 +304,16 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba) 
         return nullptr;
     }
 
+    /* FIX TEXTO DESFOCADO/ILEGIVEL no menu (New Game, etc.):
+     * O citro3d, por omissao, usa filtragem GPU_LINEAR (bilinear). O jogo
+     * renderiza a 512x384 (logico RMXP) e faz DOWNSCALE para o ecra 400x240
+     * (escala ~0.625x). Com filtragem linear, o texto encolhido fica BORRADO.
+     * GPU_NEAREST mantem os pixels nitidos no downscale -> texto legivel.
+     * Trade-off: sprites grandes ficam ligeiramente mais "duros", mas a
+     * legibilidade do texto e' prioritaria (e o RMXP foi desenhado p/ pixels
+     * nitidos, nao interpolados). */
+    C3D_TexSetFilter(&tex->tex, GPU_NEAREST, GPU_NEAREST);
+
     memset(dst, 0, (size_t)(tw * th * 4));
 
     for (int y = 0; y < h && y < th; y++) {
@@ -270,8 +362,13 @@ void display_3ds_free_texture(DS3Texture* t) {
         printf("[TEX|FREE] chamado com t=NULL (double-free?)\n");
         return;
     }
-    printf("[TEX|FREE] valid=%d ptr=%p w=%d h=%d\n",
-           t->valid, (void*)t, t->width, t->height);
+    /* Este log disparava por-frame no menu de load (texturas 408x222 recriadas
+     * a cada frame) -> escrita ao SD constante -> 1 FPS. Movido para a categoria
+     * DBG_TEXTURE, DESLIGADA por defeito. Para diagnosticar texturas outra vez:
+     * dbg_set_mask(dbg_get_mask() | DBG_TEXTURE);  ou liga DBG_TEXTURE na mascara
+     * em debug_3ds.cpp. Os casos de ERRO abaixo continuam sempre visiveis. */
+    DBG(DBG_TEXTURE, "free valid=%d ptr=%p w=%d h=%d",
+        t->valid, (void*)t, t->width, t->height);
     if (!t->valid) {
         printf("[TEX|FREE]   AVISO: a libertar textura que nunca foi válida\n");
         printf("[TEX|FREE]   → create_texture falhou e caller não verificou nullptr?\n");

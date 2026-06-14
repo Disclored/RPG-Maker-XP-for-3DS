@@ -348,14 +348,39 @@ static mrb_value spr_height(mrb_state *mrb, mrb_value s) {
     return mrb_fixnum_value(p && p->bitmap ? (p->src_h > 0 ? p->src_h : p->bitmap->height) : 0);
 }
 
-/* color/tone — guardados como ivars */
+/* color/tone — guardados como ivars.
+ * CRITICO p/ performance do menu: o codigo RGSS faz sprite.color.set(...),
+ * sprite.color.alpha=, sprite.color.red, etc. a CADA frame. Se @color for nil,
+ * cada um desses cai no method_missing universal (NilClass#alpha/red/green/blue/
+ * set/x=...) CENTENAS de vezes por frame -> menu a 4 FPS. Por isso, em vez de
+ * devolver nil, criamos uma Color/Tone real a pedido (lazy) e guardamo-la. */
 static mrb_value spr_get_color(mrb_state *mrb, mrb_value s) {
-    return mrb_iv_get(mrb, s, mrb_intern_lit(mrb, "@color")); }
+    mrb_value v = mrb_iv_get(mrb, s, mrb_intern_lit(mrb, "@color"));
+    if (mrb_nil_p(v) && mrb_class_defined(mrb, "Color")) {
+        struct RClass *cc = mrb_class_get(mrb, "Color");
+        if (cc) {
+            mrb_value args[4] = { mrb_fixnum_value(0), mrb_fixnum_value(0),
+                                  mrb_fixnum_value(0), mrb_fixnum_value(0) };
+            v = mrb_obj_new(mrb, cc, 4, args);
+            mrb_iv_set(mrb, s, mrb_intern_lit(mrb, "@color"), v);
+        }
+    }
+    return v; }
 static mrb_value spr_set_color(mrb_state *mrb, mrb_value s) {
     mrb_value v; mrb_get_args(mrb, "o", &v);
     mrb_iv_set(mrb, s, mrb_intern_lit(mrb, "@color"), v); return v; }
 static mrb_value spr_get_tone(mrb_state *mrb, mrb_value s) {
-    return mrb_iv_get(mrb, s, mrb_intern_lit(mrb, "@tone")); }
+    mrb_value v = mrb_iv_get(mrb, s, mrb_intern_lit(mrb, "@tone"));
+    if (mrb_nil_p(v) && mrb_class_defined(mrb, "Tone")) {
+        struct RClass *tc = mrb_class_get(mrb, "Tone");
+        if (tc) {
+            mrb_value args[4] = { mrb_fixnum_value(0), mrb_fixnum_value(0),
+                                  mrb_fixnum_value(0), mrb_fixnum_value(0) };
+            v = mrb_obj_new(mrb, tc, 4, args);
+            mrb_iv_set(mrb, s, mrb_intern_lit(mrb, "@tone"), v);
+        }
+    }
+    return v; }
 static mrb_value spr_set_tone(mrb_state *mrb, mrb_value s) {
     mrb_value v; mrb_get_args(mrb, "o", &v);
     mrb_iv_set(mrb, s, mrb_intern_lit(mrb, "@tone"), v); return v; }

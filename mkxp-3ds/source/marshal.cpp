@@ -16,19 +16,89 @@
 #include <stdint.h>
 #include <vector>
 #include <unordered_map>
+#include <string>
+#include "profile_3ds.h"
 
 /* ---- logging partilhado com binding_3ds.cpp ---------------------- */
 /* g_dbglog e o FILE* aberto em binding_3ds.cpp (sdmc:/mkxp/debug_binding.log).
-   printf sozinho NAO chega ao ficheiro de log; escrevemos tambem nele. */
+   printf sozinho NAO chega ao ficheiro de log; escrevemos tambem nele.
+   dbglog_stamp() (definido em binding_3ds.cpp) devolve o tempo total/delta para
+   o prefixo [t=...s d=...ms], igual ao DBGLOG -> linhas [marshal] tambem
+   ficam com timestamp e da' para medir quanto cada load demorou. */
 extern FILE *g_dbglog;
+extern void  dbglog_stamp(double *out_total_s, double *out_delta_ms);
 #define MZLOG(fmt, ...) do { \
-        printf(fmt, ##__VA_ARGS__); \
-        if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); fflush(g_dbglog); } \
+        double __ts_t, __ts_d; dbglog_stamp(&__ts_t, &__ts_d); \
+        printf("[t=%8.3fs d=%7.1fms] " fmt, __ts_t, __ts_d, ##__VA_ARGS__); \
+        if (g_dbglog) { fprintf(g_dbglog, "[t=%8.3fs d=%7.1fms] " fmt, __ts_t, __ts_d, ##__VA_ARGS__); fflush(g_dbglog); } \
     } while(0)
 
 /* contadores de diagnostico, reiniciados a cada load completo */
 static int s_tbl_built = 0;
 static int s_udef_seen = 0;
+
+/* ============================================================================
+ * CACHE DE RESOLUCAO DE CLASSE — a correcao do gargalo dos 219s.
+ * ----------------------------------------------------------------------------
+ * O profiling provou que class_from_path() consumia 219 dos 220 segundos do
+ * CommonEvents (e ~97% do tempo de cada mapa). Causa: cada um dos 113 mil
+ * objetos obrigava a resolver a sua classe via mrb_const_get + mrb_intern, e
+ * no 3DS isso e' patologicamente lento (~1.9ms cada, provavelmente por cair no
+ * const_missing custom do Essentials). Como quase todos os objetos sao da MESMA
+ * classe (ex: RPG::EventCommand), resolver repetidamente e' desperdicio puro.
+ *
+ * SOLUCAO: cache nome-da-classe -> RClass*. Resolve cada classe UMA vez; as
+ * 113 mil chamadas seguintes sao lookups O(1) num std::unordered_map.
+ *
+ * IMPORTANTE — isto e' GENERICO, nao especifico do Pokemon: a chave e' o nome
+ * lido do PROPRIO ficheiro marshal (RPG::Map, RPG::Actor, RPG::Skill, RPG::Enemy,
+ * RPG::Troop, GameData::X, etc). Acelera QUALQUER jogo RPG Maker XP, porque TODOS
+ * serializam as mesmas classes RPG::* repetidas milhares de vezes.
+ *
+ * SEGURANCA (emulador): o cache guarda ponteiros RClass* que so' sao validos
+ * dentro de UMA sessao mruby. Se o mruby for recriado (reiniciar/trocar de jogo),
+ * os ponteiros antigos ficam invalidos. Defesa dupla:
+ *   1. Owner-check: o cache esta' ligado a um mrb_state*; se mudar, limpa-se.
+ *   2. Validacao de tipo: antes de devolver um hit, confirma que o ponteiro
+ *      ainda aponta para uma classe/modulo valido (MRB_TT_CLASS/MODULE/SCLASS).
+ *      Se a memoria foi reutilizada por outra coisa (ex: close+open no mesmo
+ *      endereco), o tipo nao bate -> re-resolve em vez de devolver lixo.
+ * As duas juntas tornam o cache seguro mesmo que um dia o emulador reinicie o
+ * mruby sem fechar a aplicacao. */
+static std::unordered_map<std::string, struct RClass*> s_class_cache;
+static mrb_state *s_class_cache_owner = 0;
+
+/* Simbolos das ivars de Table, pre-computados uma vez por sessao (ver
+ * build_table_from_dump). Em escopo de ficheiro para o reset os limpar quando o
+ * mruby e' recriado -- senao um mrb_sym de uma sessao antiga poderia nao bater
+ * na nova (a symbol table e' reconstruida). */
+static mrb_sym s_tbl_sym_x=0, s_tbl_sym_y=0, s_tbl_sym_z=0, s_tbl_sym_data=0;
+
+/* Chamavel do exterior (binding) para limpar o cache ao (re)criar o mruby. */
+extern "C" void marshal_class_cache_reset(void){
+    s_class_cache.clear();
+    s_class_cache_owner = 0;
+    s_tbl_sym_x = s_tbl_sym_y = s_tbl_sym_z = s_tbl_sym_data = 0;  /* re-internar na nova sessao */
+}
+
+static inline void class_cache_check_owner(mrb_state *mrb){
+    if (s_class_cache_owner != mrb){
+        s_class_cache.clear();          /* mruby diferente -> ponteiros antigos invalidos */
+        s_class_cache_owner = mrb;
+    }
+}
+
+/* Confirma que um RClass* em cache ainda e' uma classe/modulo valido. Defesa
+ * contra reutilizacao de memoria entre sessoes. */
+static inline bool class_ptr_still_valid(struct RClass *c){
+    if (!c) return false;
+    enum mrb_vtype tt = (enum mrb_vtype)((struct RBasic*)c)->tt;
+    return tt == MRB_TT_CLASS || tt == MRB_TT_MODULE || tt == MRB_TT_SCLASS;
+}
+/* Posto a 1 por write_value quando encontra um tipo que nao sabe serializar
+ * (MRB_TT_DATA, etc). marshalDumpInt devolve-o para o cache decidir NAO gravar
+ * um ficheiro que nao faz round-trip (senao gravava lixo -> EOF ao reler). */
+static int s_dump_incomplete = 0;
 
 /* ---- Exception --------------------------------------------------- */
 struct MarshalException {
@@ -171,8 +241,10 @@ static char *read_str_raw(ReadCtx *c){
 }
 static mrb_value read_str_val(ReadCtx *c){
     mrb_state *mrb=c->mrb; int len=read_fixnum(c);
+    PROF_BEGIN(PROF_MARSHAL_STRING);
     mrb_value s=mrb_str_new(mrb,0,len);
     c->readData(RSTR_PTR(RSTRING(s)),len); RSTR_PTR(RSTRING(s))[len]='\0';
+    PROF_END(PROF_MARSHAL_STRING);
     return s;
 }
 /* Lê string sem registar no object pool — usado por read_ivar que regista o slot */
@@ -198,7 +270,11 @@ static mrb_value read_hash(ReadCtx *c){
     return h;
 }
 static mrb_sym read_symbol(ReadCtx *c){
-    mrb_sym s=mrb_intern_cstr(c->mrb,read_str_raw(c)); c->symbols.add(s); return s;
+    char *raw=read_str_raw(c);
+    PROF_BEGIN(PROF_MARSHAL_SYMBOL);
+    mrb_sym s=mrb_intern_cstr(c->mrb,raw);
+    PROF_END(PROF_MARSHAL_SYMBOL);
+    c->symbols.add(s); return s;
 }
 static mrb_sym read_symlink(ReadCtx *c){
     int i=read_fixnum(c);
@@ -261,18 +337,35 @@ static struct RClass *class_from_path(mrb_state *mrb, mrb_value path){
     else if(mrb_string_p(path)) s=(char*)RSTRING_PTR(path);
     else throw MarshalException(MarshalException::ArgumentError,"bad class path");
     if(s[0]=='"') s++;
+
+    /* CACHE: o nome da classe (ex: "RPG::EventCommand") repete-se em milhares de
+     * objetos. Resolver uma vez e reutilizar evita os ~1.9ms/obj do const_get no
+     * 3DS. Construir a chave ate' ao terminador ('"' ou fim). */
+    class_cache_check_owner(mrb);
+    const char *name_end = s;
+    while(*name_end && *name_end!='"') name_end++;
+    std::string key(s, (size_t)(name_end - s));
+    auto it = s_class_cache.find(key);
+    if(it != s_class_cache.end() && class_ptr_still_valid(it->second))
+        return it->second;   /* HIT valido: O(1), sem const_get */
+
+    /* MISS: resolver via const_get (caro no 3DS, mas so' 1x por classe). */
     char *p=s,*b=s; mrb_value klass=mrb_obj_value(mrb->object_class);
     while(*p&&*p!='"'){
         while(*p&&*p!=':'&&*p!='"') p++;
         klass=mrb_const_get(mrb,klass,mrb_intern(mrb,b,p-b));
         if(p[0]==':'){ if(p[1]!=':') return 0; p+=2; b=p; }
     }
-    return (struct RClass*)mrb_obj_ptr(klass);
+    struct RClass *result=(struct RClass*)mrb_obj_ptr(klass);
+    s_class_cache[key]=result;   /* guardar para as proximas milhares de vezes */
+    return result;
 }
 static mrb_value read_object(ReadCtx *c){
     mrb_state *mrb=c->mrb;
     mrb_value class_path=read_value(c);
+    PROF_BEGIN(PROF_MARSHAL_CLASS);
     struct RClass *klass=class_from_path(mrb,class_path);
+    PROF_END(PROF_MARSHAL_CLASS);
     if(!klass){
         /* Classe nao definida — usa Object como fallback e loga aviso */
         const char *cname="<unknown>";
@@ -281,12 +374,17 @@ static mrb_value read_object(ReadCtx *c){
         printf("[Marshal] WARN: classe '%s' nao definida -- a usar Object como fallback\n", cname);
         klass=mrb->object_class;
     }
+    PROF_BEGIN(PROF_MARSHAL_ALLOC);
     mrb_value obj=mrb_obj_value(mrb_obj_alloc(mrb,MRB_TT_OBJECT,klass));
+    PROF_END(PROF_MARSHAL_ALLOC);
     c->objects.add(obj); int n=read_fixnum(c);
     for(int i=0;i<n;i++){
         mrb_value nm=read_value(c), vl=read_value(c);
-        if(mrb_symbol_p(nm))
+        if(mrb_symbol_p(nm)){
+            PROF_BEGIN(PROF_MARSHAL_IVSET);
             mrb_obj_iv_set(mrb,mrb_obj_ptr(obj),mrb_symbol(nm),vl);
+            PROF_END(PROF_MARSHAL_IVSET);
+        }
     }
     return obj;
 }
@@ -350,10 +448,21 @@ static mrb_value build_table_from_dump(mrb_state *mrb, struct RClass *klass, mrb
         int16_t v=le_i16(cell); cell+=2;
         mrb_ary_set(mrb,arr,i,mrb_int_value(mrb,(mrb_int)v));
     }
-    mrb_obj_iv_set(mrb,mrb_obj_ptr(obj),mrb_intern_lit(mrb,"@x"),   mrb_int_value(mrb,xsize));
-    mrb_obj_iv_set(mrb,mrb_obj_ptr(obj),mrb_intern_lit(mrb,"@y"),   mrb_int_value(mrb,ysize));
-    mrb_obj_iv_set(mrb,mrb_obj_ptr(obj),mrb_intern_lit(mrb,"@z"),   mrb_int_value(mrb,zsize));
-    mrb_obj_iv_set(mrb,mrb_obj_ptr(obj),mrb_intern_lit(mrb,"@data"),arr);
+    /* Simbolos das ivars pre-computados UMA vez por sessao (ver declaracao em
+     * escopo de ficheiro + reset em marshal_class_cache_reset). build_table_from_dump
+     * e' chamado centenas de vezes (Animations.rxdata: 667 tables); evitar
+     * re-internar "@x"/"@y"/"@z"/"@data" a cada chamada poupa milhares de
+     * mrb_intern no 3DS. */
+    if(!s_tbl_sym_x){
+        s_tbl_sym_x   =mrb_intern_lit(mrb,"@x");
+        s_tbl_sym_y   =mrb_intern_lit(mrb,"@y");
+        s_tbl_sym_z   =mrb_intern_lit(mrb,"@z");
+        s_tbl_sym_data=mrb_intern_lit(mrb,"@data");
+    }
+    mrb_obj_iv_set(mrb,mrb_obj_ptr(obj),s_tbl_sym_x,   mrb_int_value(mrb,xsize));
+    mrb_obj_iv_set(mrb,mrb_obj_ptr(obj),s_tbl_sym_y,   mrb_int_value(mrb,ysize));
+    mrb_obj_iv_set(mrb,mrb_obj_ptr(obj),s_tbl_sym_z,   mrb_int_value(mrb,zsize));
+    mrb_obj_iv_set(mrb,mrb_obj_ptr(obj),s_tbl_sym_data,arr);
     mrb_gc_arena_restore(mrb,arena);
     s_tbl_built++;
     if(s_tbl_built<=3)
@@ -506,6 +615,88 @@ static void write_userdef(WriteCtx *c, mrb_value obj){
     write_value(c,mrb_str_intern(mrb,mrb_class_path(mrb,o->c)));
     write_str_val(c,mrb_funcall(mrb,obj,"_dump",0));
 }
+
+/* ── Serializacao de Table/Color/Tone para o cache ──────────────────────────
+ * Estes objectos foram reconstruidos nativamente (build_table_from_dump /
+ * build_colortone_from_dump) como MRB_TT_OBJECT com ivars, SEM _dump. Para o
+ * cache fazer round-trip (e os 16 mapas + CommonEvents lerem do cache rapido
+ * em vez da fonte -> 0.4 fps ao entrar no mapa), gravamos de volta o formato
+ * userdef binario IGUAL ao que o leitor espera. */
+static void le_put_i32(WriteCtx *c, int32_t v){
+    unsigned char b[4]={(unsigned char)(v&0xFF),(unsigned char)((v>>8)&0xFF),
+                        (unsigned char)((v>>16)&0xFF),(unsigned char)((v>>24)&0xFF)};
+    c->writeData((const char*)b,4);
+}
+static void le_put_i16(WriteCtx *c, int16_t v){
+    unsigned char b[2]={(unsigned char)(v&0xFF),(unsigned char)((v>>8)&0xFF)};
+    c->writeData((const char*)b,2);
+}
+static int32_t iv_i32(mrb_state *mrb, mrb_value obj, const char *name, int32_t dflt){
+    mrb_value v=mrb_iv_get(mrb,obj,mrb_intern_cstr(mrb,name));
+    if(mrb_integer_p(v)) return (int32_t)mrb_integer(v);
+    if(mrb_float_p(v))   return (int32_t)mrb_float(v);
+    return dflt;
+}
+/* Table#_dump: [dim,xsize,ysize,zsize,total] (5x int32 LE) + total x int16 LE.
+ * Escrevemos como TYPE_USERDEF: classpath + string binaria. */
+static void write_table_userdef(WriteCtx *c, mrb_value obj){
+    mrb_state *mrb=c->mrb; struct RObject *o=mrb_obj_ptr(obj);
+    c->writeByte(TYPE_USERDEF);
+    write_value(c,mrb_str_intern(mrb,mrb_class_path(mrb,o->c)));
+    int32_t xs=iv_i32(mrb,obj,"@x",1), ys=iv_i32(mrb,obj,"@y",1), zs=iv_i32(mrb,obj,"@z",1);
+    if(xs<1)xs=1; if(ys<1)ys=1; if(zs<1)zs=1;
+    mrb_value data=mrb_iv_get(mrb,obj,mrb_intern_lit(mrb,"@data"));
+    int32_t total=0;
+    if(mrb_array_p(data)) total=(int32_t)RARRAY_LEN(data);
+    int32_t expect=xs*ys*zs;
+    int dim = (zs>1)?3:((ys>1)?2:1);
+    /* string de dados: 20 bytes header + total*2 */
+    int32_t bodylen=20+total*2;
+    write_fixnum(c,bodylen);                 /* tamanho da string userdef */
+    le_put_i32(c,dim); le_put_i32(c,xs); le_put_i32(c,ys); le_put_i32(c,zs);
+    le_put_i32(c, (total>0)?total:expect);
+    for(int32_t i=0;i<total;i++){
+        mrb_value cell=mrb_ary_entry(data,i);
+        int16_t cv = mrb_integer_p(cell)?(int16_t)mrb_integer(cell):0;
+        le_put_i16(c,cv);
+    }
+}
+/* Color/Tone#_dump: 4 doubles LE (32 bytes): red,green,blue,alpha/gray.
+ * Os valores podem estar em ivars (MRB_TT_OBJECT) OU no struct nativo
+ * (MRB_TT_DATA) -- neste caso lemos via metodos red/green/blue/alpha. */
+static double ct_component(mrb_state *mrb, mrb_value obj, const char *iv, const char *meth){
+    mrb_value v=mrb_iv_get(mrb,obj,mrb_intern_cstr(mrb,iv));
+    if(mrb_float_p(v)) return mrb_float(v);
+    if(mrb_integer_p(v)) return (double)mrb_integer(v);
+    /* sem ivar: tentar metodo nativo */
+    if(mrb_respond_to(mrb,obj,mrb_intern_cstr(mrb,meth))){
+        mrb_value r=mrb_funcall(mrb,obj,meth,0);
+        if(mrb_float_p(r)) return mrb_float(r);
+        if(mrb_integer_p(r)) return (double)mrb_integer(r);
+    }
+    return 0.0;
+}
+static void write_colortone_userdef(WriteCtx *c, mrb_value obj){
+    mrb_state *mrb=c->mrb; struct RObject *o=mrb_obj_ptr(obj);
+    c->writeByte(TYPE_USERDEF);
+    write_value(c,mrb_str_intern(mrb,mrb_class_path(mrb,o->c)));
+    double vals[4];
+    vals[0]=ct_component(mrb,obj,"@red","red");
+    vals[1]=ct_component(mrb,obj,"@green","green");
+    vals[2]=ct_component(mrb,obj,"@blue","blue");
+    vals[3]=ct_component(mrb,obj,"@alpha","alpha");
+    /* Tone usa 'gray' no 4o campo em vez de alpha; tentar se alpha=0 */
+    if(vals[3]==0.0 && mrb_respond_to(mrb,obj,mrb_intern_cstr(mrb,"gray"))){
+        mrb_value g=mrb_funcall(mrb,obj,"gray",0);
+        if(mrb_float_p(g)) vals[3]=mrb_float(g);
+        else if(mrb_integer_p(g)) vals[3]=(double)mrb_integer(g);
+    }
+    write_fixnum(c,32);                      /* 4 doubles */
+    for(int i=0;i<4;i++){
+        unsigned char b[8]; memcpy(b,&vals[i],8);
+        c->writeData((const char*)b,8);
+    }
+}
 static void write_value(WriteCtx *c, mrb_value v){
     mrb_state *mrb=c->mrb; int arena=mrb_gc_arena_save(mrb);
     if(c->objects.contains(v)){
@@ -531,15 +722,45 @@ static void write_value(WriteCtx *c, mrb_value v){
             }
             break;
         case MRB_TT_CLASS:
-        case MRB_TT_OBJECT:
+        case MRB_TT_OBJECT: {
             c->objects.add(v);
-            if(mrb_obj_respond_to(mrb,mrb_obj_ptr(v)->c,mrb_intern_lit(mrb,"_dump"))){
+            const char *cn = mrb_obj_classname(mrb, v);
+            if (cn && strcmp(cn,"Table")==0) {
+                write_table_userdef(c, v);
+            } else if (cn && (strcmp(cn,"Color")==0 || strcmp(cn,"Tone")==0)) {
+                write_colortone_userdef(c, v);
+            } else if (mrb_obj_respond_to(mrb,mrb_obj_ptr(v)->c,mrb_intern_lit(mrb,"_dump"))) {
                 c->writeByte(TYPE_USERDEF); write_userdef(c,v);
             } else {
                 c->writeByte(TYPE_OBJECT); write_object(c,v);
             }
             break;
-        default: printf("Marshal: unwritable type %d\n",(int)mrb_type(v)); break;
+        }
+        default: {
+            /* Color/Tone (e por vezes Table) sao reconstruidos como classes
+             * nativas MRB_TT_DATA (struct C), NAO MRB_TT_OBJECT. Por isso nao
+             * caem no case acima -- caem aqui. Detetamos pela classe e gravamos
+             * o userdef na mesma. Sem isto, qualquer mapa com Tone (todos menos
+             * os mais simples) tinha o cache IGNORADO. */
+            const char *cn = mrb_obj_classname(mrb, v);
+            if (cn && strcmp(cn,"Table")==0) {
+                c->objects.add(v);
+                write_table_userdef(c, v);
+                break;
+            } else if (cn && (strcmp(cn,"Color")==0 || strcmp(cn,"Tone")==0)) {
+                c->objects.add(v);
+                write_colortone_userdef(c, v);
+                break;
+            }
+            /* Tipo nao-serializavel (outro MRB_TT_DATA). O write nao sabe
+             * grava-lo, por isso o ficheiro de cache ficaria INCOMPLETO -> EOF
+             * ao reler. Marcamos o dump como sujo para o chamador NAO gravar
+             * cache deste objeto; lê-se sempre da fonte (correto). */
+            s_dump_incomplete = 1;
+            printf("Marshal: unwritable type %d (cache deste ficheiro sera' ignorado)\n",
+                   (int)mrb_type(v));
+            break;
+        }
     }
     mrb_gc_arena_restore(mrb,arena);
 }
@@ -551,10 +772,12 @@ static void verify_header(ReadCtx *c){
 }
 
 /* ====== PUBLIC FILE* API ========================================== */
-void marshalDumpInt(mrb_state *mrb, FILE *fp, mrb_value val){
+bool marshalDumpInt(mrb_state *mrb, FILE *fp, mrb_value val){
     WriteBuf wb; WriteCtx c; c.wb=&wb; c.mrb=mrb; c.limit=100;
+    s_dump_incomplete = 0;
     write_header(&c); write_value(&c,val);
     fwrite(wb.data.data(),1,wb.data.size(),fp);
+    return s_dump_incomplete == 0;   /* true = dump integro, seguro para cache */
 }
 
 mrb_value marshalLoadInt(mrb_state *mrb, FILE *fp){
@@ -568,12 +791,43 @@ mrb_value marshalLoadInt(mrb_state *mrb, FILE *fp){
      * Sem isto, a MarshalException propagava-se como excecao C++ pura e o erro
      * detalhado nunca chegava ao log -- so se via "marshal falhou" sem causa.
      * Agora convertemos em erro mruby (como mrb_marshal_load faz) e logamos o
-     * ponto de falha, para poder corrigir a causa raiz. */
+     * ponto de falha, para poder corrigir a causa raiz.
+     * NOTA: a aceleracao do GC (anti-O(n^2)) e' feita ATIVANDO O GC GERACIONAL
+     * uma vez no arranque (mrb_full_gc + generational), NAO desligando o GC nem
+     * mexendo no arena aqui -- desligar o GC durante o read corrompia o array
+     * de topo no 3DS (arena overflow com GC off). */
     try {
         verify_header(&c);
+        /* PROFILING: capturar contadores ANTES do parse para medir o que ESTE
+         * ficheiro custou (objetos criados e frees=GC durante o parse). */
+        uint64_t prof_objs0  = g_prof_objs_created;
+        uint64_t prof_frees0 = g_prof_frees;
+        /* Reset das zonas internas (alloc/ivset/class) para medir SO' este
+         * ficheiro -- assim o breakdown diz onde foi o tempo deste parse. */
+        prof_zone_reset(PROF_MARSHAL_ALLOC);
+        prof_zone_reset(PROF_MARSHAL_IVSET);
+        prof_zone_reset(PROF_MARSHAL_CLASS);
+        prof_zone_reset(PROF_MARSHAL_SYMBOL);
+        prof_zone_reset(PROF_MARSHAL_STRING);
+        uint64_t prof_t0     = prof_tick();
+
         mrb_value v=read_value(&c);
+
+        double   parse_ms    = prof_ticks_to_ms(prof_tick() - prof_t0);
+        uint64_t objs_made   = g_prof_objs_created - prof_objs0;
+        uint64_t frees_made  = g_prof_frees        - prof_frees0;
+        g_prof_bytes_parsed += (uint64_t)sz;
+
         MZLOG("[marshal] load OK (%ld bytes): userdefs=%d tables=%d top_type=%d\n",
               sz,s_udef_seen,s_tbl_built,(int)mrb_type(v));
+        /* Relatorio de profiling SO' para ficheiros grandes (>50KB) -- os
+         * pequenos nao interessam e poluiriam o log. Mostra ms/byte, ms/obj e
+         * o BREAKDOWN (alloc vs ivset vs class) que localiza os ~2ms/objeto. */
+        if (sz > 30000) {   /* baixado de 50KB p/ 30KB: apanha o Animations.rxdata (43KB),
+                             * a maior anomalia do log (14s p/ 43KB). Assim o BREAKDOWN
+                             * diz no 3DS real onde vao esses 14s (alloc/ivset/class/leitura). */
+            prof_report_marshal("(ficheiro)", (uint64_t)sz, objs_made, frees_made, parse_ms);
+        }
         return v;
     } catch(const MarshalException &e){
         MZLOG("[marshal] FALHA @pos=%d/%ld apos %d tables, %d userdefs: %s\n",
