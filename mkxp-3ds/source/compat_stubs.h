@@ -408,6 +408,10 @@ begin
       @tone=Tone.new; @viewport=viewport; @disposed=false; @bitmap=nil
       begin
         @__psprite = Sprite.new(@viewport)
+        # P3: passar o viewport pelo SETTER (spr_init ignora o arg do new), para
+        # o vp_z da struct ser preenchido e o sort por (viewport.z, z) funcionar.
+        # Sem isto, o background (Plane) ficava com vp_z=0 e caia atras do mapa.
+        (@__psprite.viewport = @viewport) rescue nil
         @__psprite.z = @z
       rescue
         @__psprite = nil
@@ -430,6 +434,10 @@ begin
         @__psprite.x = -(@ox || 0)
         @__psprite.y = -(@oy || 0)
         @__psprite.z = @z
+        # P3: re-propagar o viewport re-le o seu z para o vp_z (o ecra de escolha
+        # de personagem faz viewport.z=99999 e depois cria o Plane; mas se o z
+        # mudasse depois, isto mantem o vp_z em dia). Custo: 1 leitura de #z.
+        (@__psprite.viewport = @viewport) rescue nil
         @__psprite.visible = @visible
         @__psprite.opacity = @opacity
         (@__psprite.zoom_x = @zoom_x) rescue nil

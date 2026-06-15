@@ -142,6 +142,21 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
         int pre_blit = display_3ds_blit_count();   /* ← adicionar accessor em display_3ds */
         tilemaps_draw_all();
         sprites_draw_all();
+        /* DUMP-DE-FRAME (botao Y): despeja todos os sprites DESTE frame, ja'
+         * ordenados por z. So' corre quando o utilizador pediu (flag do input).
+         * Limita a alguns despejos por sessao para nao encher o SD se ficar
+         * carregado. */
+        {
+            extern volatile bool g_dump_frame_requested;
+            if (g_dump_frame_requested) {
+                g_dump_frame_requested = false;
+                static int s_dump_n = 0;
+                if (s_dump_n < 12) {
+                    s_dump_n++;
+                    sprites_dump_frame(mrb, "botao-Y");
+                }
+            }
+        }
         int post_blit = display_3ds_blit_count();
 
         if (s_frame_count < 3 || s_frame_count % 300 == 0) {

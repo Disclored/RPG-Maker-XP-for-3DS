@@ -19,6 +19,11 @@ extern void display_3ds_blit_ex(DS3Texture* t,
 /* global sprite list for rendering */
 static std::vector<Sprite3DS*> g_sprites;
 
+/* DUMP-DE-FRAME (botao Y): pedido pendente de despejo. O input poll poe true
+ * quando o Y e' premido; o grph_update le, despeja e poe false. volatile
+ * porque e' escrita/lida em pontos diferentes do loop. */
+volatile bool g_dump_frame_requested = false;
+
 static void sprite_free(mrb_state*, void *p) {
     Sprite3DS *s = (Sprite3DS*)p;
     if (!s) return;
@@ -29,6 +34,11 @@ static void sprite_free(mrb_state*, void *p) {
 const mrb_data_type Sprite3DSType = { "Sprite", sprite_free };
 
 #define GET_SPR(s) ((Sprite3DS*)DATA_PTR(s))
+
+/* P3: declarado adiante (definicao perto do spriteBindingInit). Le o z de um
+ * Viewport Ruby de forma segura; 0 se nil/sem #z. Usado por spr_init e o
+ * setter viewport= para preencher vp_z (chave primaria do sort de sprites). */
+static int read_viewport_z(mrb_state *mrb, mrb_value vp);
 
 #include "tilemap_binding_3ds.h"
 
@@ -73,9 +83,27 @@ void sprites_draw_all() {
         }
     }
 
-    /* Ordenar por z -- stable_sort preserva ordem de inserção para z iguais */
+    /* Ordenar como o RGSS: a chave primaria de cada sprite e' a sua posicao no
+     * espaco Z GLOBAL do ecra -- que e' o viewport.z se tiver viewport, ou o
+     * proprio z se NAO tiver. O desempate e' o z local.
+     *   chave_primaria = has_vp ? vp_z : z
+     *   chave_secundaria = z
+     * Isto corrige DOIS casos:
+     *  (1) background da escolha de personagem (Plane, viewport.z=99999) fica a'
+     *      frente do mapa (viewport.z baixo) -- o que o P3 ja' resolvia;
+     *  (2) janela de MENSAGEM nas intros: criada SEM viewport e com z=99999
+     *      (pbCreateMessageWindow), tem de ficar a' frente das intro Pictures
+     *      (que teem viewport.z>0). Antes, ao usar vp_z=0 para sem-viewport, a
+     *      mensagem caia ATRAS das imagens -- as falas pareciam nao aparecer.
+     * Sprites sem viewport mantem a ordem por z entre si (comportamento original).
+     * Custo: leitura de 2 ints da struct, sem chamadas a Ruby. */
     std::stable_sort(g_sprites.begin(), g_sprites.end(),
-        [](const Sprite3DS *a, const Sprite3DS *b) { return a->z < b->z; });
+        [](const Sprite3DS *a, const Sprite3DS *b) {
+            int ka = a->has_vp ? a->vp_z : a->z;
+            int kb = b->has_vp ? b->vp_z : b->z;
+            if (ka != kb) return ka < kb;
+            return a->z < b->z;
+        });
 
     for (size_t i = 0; i < g_sprites.size(); i++) {
         Sprite3DS *s = g_sprites[i];
@@ -158,16 +186,85 @@ void sprites_draw_all() {
     }
 }
 
+/* DUMP-DE-FRAME (botao Y): despeja TODOS os sprites registados no frame actual,
+ * na MESMA ordem em que sao desenhados (ja' ordenados por z acima). Para cada um:
+ * classe Ruby, x/y/z/ox/oy, zoom, opacity, visible, has_vp/vp_z, dims do bitmap,
+ * e a COR CENTRAL do bitmap (lida directamente dos pixels em RAM). Isto da' um
+ * retrato completo do que esta' empilhado em cada pixel -- p/ identificar a
+ * origem de artefactos (ex. axadrezado dourado do teclado) sem adivinhar.
+ * Custo: so' corre quando o utilizador carrega no Y (nunca por-frame). */
+void sprites_dump_frame(mrb_state *mrb, const char *motivo) {
+    extern FILE *g_dbglog;
+    if (!g_dbglog) return;
+    fprintf(g_dbglog, "[FRAMEDUMP] ===== inicio (motivo=%s) total_sprites=%d =====\n",
+            motivo ? motivo : "?", (int)g_sprites.size());
+    int idx = 0;
+    for (size_t i = 0; i < g_sprites.size(); i++) {
+        Sprite3DS *s = g_sprites[i];
+        if (!s) continue;
+        /* classe Ruby */
+        const char *cls = "?";
+        if (!mrb_nil_p(s->rb_self)) {
+            cls = mrb_obj_classname(mrb, s->rb_self);
+            if (!cls) cls = "?";
+        }
+        /* dims do bitmap */
+        int bw = 0, bh = 0;
+        bool has_bmp = (s->bitmap && !s->bitmap->disposed && s->bitmap->pixels);
+        if (has_bmp) { bw = s->bitmap->width; bh = s->bitmap->height; }
+        /* cor central do bitmap (RAM) */
+        int cr = -1, cg = -1, cb = -1, ca = -1;
+        if (has_bmp && bw > 0 && bh > 0) {
+            int cx = bw / 2, cy = bh / 2;
+            long pi = ((long)cy * bw + cx) * 4;
+            cr = s->bitmap->pixels[pi];
+            cg = s->bitmap->pixels[pi+1];
+            cb = s->bitmap->pixels[pi+2];
+            ca = s->bitmap->pixels[pi+3];
+        }
+        /* destino real no ecra (mesma formula do blit) */
+        int src_w = s->src_w > 0 ? s->src_w : bw;
+        int src_h = s->src_h > 0 ? s->src_h : bh;
+        float dx = (float)s->x - s->ox * s->zoom_x;
+        float dy = (float)s->y - s->oy * s->zoom_y;
+        fprintf(g_dbglog,
+            "[FRAMEDUMP] #%03d %s bmp=%dx%d src=[%d,%d,%d,%d] xy=(%d,%d) o=(%d,%d) "
+            "z=%d vpz=%d hvp=%d zoom=(%.3f,%.3f) op=%d vis=%d disp=%d "
+            "dst=(%.0f,%.0f %0.fx%.0f) cxc=(%d,%d,%d,a%d)\n",
+            idx++, cls, bw, bh,
+            s->src_x, s->src_y, s->src_w, s->src_h,
+            s->x, s->y, s->ox, s->oy,
+            s->z, s->vp_z, s->has_vp ? 1 : 0,
+            (double)s->zoom_x, (double)s->zoom_y,
+            s->opacity, s->visible ? 1 : 0, s->disposed ? 1 : 0,
+            (double)dx, (double)dy, (double)(src_w * s->zoom_x), (double)(src_h * s->zoom_y),
+            cr, cg, cb, ca);
+    }
+    fprintf(g_dbglog, "[FRAMEDUMP] ===== fim =====\n");
+    fflush(g_dbglog);
+}
+
 static mrb_value spr_init(mrb_state *mrb, mrb_value self) {
-    /* aceita viewport opcional — ignorado por agora */
+    /* P3: aceita viewport opcional. Antes era ignorado; agora guardamo-lo como
+     * ivar @viewport E lemos o seu z para vp_z (chave primaria de ordenacao),
+     * para que QUALQUER Sprite.new(viewport) -- nao so' via o setter -- fique
+     * com a ordem correta (viewport.z, z), como no RGSS. */
+    mrb_value vp = mrb_nil_value();
+    mrb_get_args(mrb, "|o", &vp);
     Sprite3DS *s = (Sprite3DS*)calloc(1, sizeof(Sprite3DS));
     s->opacity = 255;
     s->zoom_x  = 1.0f;
     s->zoom_y  = 1.0f;
     s->visible = true;
+    s->rb_self = self; /* DUMP: guardar o objecto Ruby p/ ler classe/ivars no dump-Y */
     DATA_PTR(self)  = s;
     DATA_TYPE(self) = &Sprite3DSType;
     g_sprites.push_back(s);
+    if (!mrb_nil_p(vp)) {
+        mrb_iv_set(mrb, self, mrb_intern_lit(mrb, "@viewport"), vp);
+        s->vp_z = read_viewport_z(mrb, vp);
+        s->has_vp = true;
+    }
 
     /* DIAGNÓSTICO: log nas primeiras 10 chamadas para confirmar que spr_init C++ está activo */
     {
@@ -423,6 +520,56 @@ static mrb_value spr_set_tone(mrb_state *mrb, mrb_value s) {
     mrb_value v; mrb_get_args(mrb, "o", &v);
     mrb_iv_set(mrb, s, mrb_intern_lit(mrb, "@tone"), v); return v; }
 
+/* P3: ler o z de um objecto Viewport Ruby de forma segura (sem rebentar se for
+ * nil ou nao responder a #z). Devolve 0 quando nao ha viewport. */
+static int read_viewport_z(mrb_state *mrb, mrb_value vp) {
+    if (mrb_nil_p(vp)) return 0;
+    if (!mrb_respond_to(mrb, vp, mrb_intern_lit(mrb, "z"))) return 0;
+    mrb_value zv = mrb_funcall(mrb, vp, "z", 0);
+    if (mrb_fixnum_p(zv)) return (int)mrb_fixnum(zv);
+    if (mrb_float_p(zv))  return (int)mrb_float(zv);
+    return 0;
+}
+
+static mrb_value spr_get_viewport(mrb_state *mrb, mrb_value self) {
+    return mrb_iv_get(mrb, self, mrb_intern_lit(mrb, "@viewport"));
+}
+/* Guarda o viewport como ivar Ruby (como antes) E copia o seu z para vp_z na
+ * struct, para o sort de sprites_draw_all ordenar por (viewport.z, z) -- igual
+ * ao RGSS. Resolve o background (Plane) que caia atras do mapa por o motor so'
+ * ordenar por z local. Sprites sem viewport ficam com vp_z=0 (ordem inalterada). */
+static mrb_value spr_set_viewport(mrb_state *mrb, mrb_value self) {
+    mrb_value v; mrb_get_args(mrb, "o", &v);
+    mrb_iv_set(mrb, self, mrb_intern_lit(mrb, "@viewport"), v);
+    Sprite3DS *s = GET_SPR(self);
+    if (s) {
+        if (mrb_nil_p(v)) {
+            s->has_vp = false;
+            s->vp_z = 0;
+        } else {
+            s->has_vp = true;
+            s->vp_z = read_viewport_z(mrb, v);
+        }
+        /* DIAGNOSTICO P3: logar as primeiras vezes que um viewport de z alto e'
+         * aplicado (cenas tipo escolha de personagem, vp.z>=99999). Confirma no
+         * log que o vp_z chega a' struct e o sort por (viewport.z, z) actua. */
+        if (s->has_vp && s->vp_z >= 1000) {
+            static int s_vpz_log = 0;
+            if (s_vpz_log < 8) {
+                s_vpz_log++;
+                extern FILE *g_dbglog;
+                if (g_dbglog) {
+                    fprintf(g_dbglog,
+                        "[SPR|VPZ] viewport.z=%d aplicado a sprite z=%d (ordena por vp_z,z)\n",
+                        s->vp_z, s->z);
+                    fflush(g_dbglog);
+                }
+            }
+        }
+    }
+    return v;
+}
+
 void spriteBindingInit(mrb_state *mrb) {
     RClass *k = mrb_define_class(mrb, "Sprite", mrb->object_class);
     MRB_SET_INSTANCE_TT(k, MRB_TT_DATA);
@@ -458,7 +605,10 @@ void spriteBindingInit(mrb_state *mrb) {
             mrb_value v; mrb_get_args(mrb, "o", &v); \
             mrb_iv_set(mrb, self, mrb_intern_cstr(mrb, "@" nm), v); return v; }, \
         MRB_ARGS_REQ(1));
-    IVAR_PROP("viewport")
+    // viewport: setter dedicado (P3) que propaga viewport.z -> vp_z na struct
+    // para o sort por (viewport.z, z). bush_depth/wave_* continuam ivars puros.
+    mrb_define_method(mrb, k, "viewport",  spr_get_viewport, MRB_ARGS_NONE());
+    mrb_define_method(mrb, k, "viewport=", spr_set_viewport, MRB_ARGS_REQ(1));
     IVAR_PROP("bush_depth")
     IVAR_PROP("bush_opacity")
     IVAR_PROP("wave_amp")

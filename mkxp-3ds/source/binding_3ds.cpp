@@ -2073,8 +2073,15 @@ begin
     unless method_defined?(:green=); def green=(v); v; end; end
     unless method_defined?(:blue);   def blue;   self; end; end
     unless method_defined?(:blue=);  def blue=(v); v; end; end
+    # even?/odd? NAO existem no mruby 3.2.0. Sem eles, codigo como
+    # "x = 16 + (i.even? ? 0 : 358)" (plugin Gender selection) lanca
+    # NoMethodError -> apanhado pelo method_missing -> o ternario cai sempre no
+    # ramo errado e TODOS os bonecos vao para a mesma coluna (sobrepostos).
+    # Registar aqui resolve isso de forma generica p/ qualquer plugin RMXP.
+    unless method_defined?(:even?);  def even?; (self % 2) == 0; end; end
+    unless method_defined?(:odd?);   def odd?;  (self % 2) != 0; end; end
   end
-  dbg "[INT-FIX] Integer#alpha/red/green/blue adicionados OK"
+  dbg "[INT-FIX] Integer#alpha/red/green/blue/even?/odd? adicionados OK"
 rescue => e
   dbg "[INT-FIX] falhou: #{e.class}: #{e.message}"
 end
@@ -2506,6 +2513,36 @@ begin
       s = (base.to_s rescue "")
       return nil if s.empty?
 
+      # ── FIX REGRESSAO (dialogo com skin errado) ───────────────────────────────
+      # O setSkin() do Essentials chama pbResolveBitmap() ANTES de criar o
+      # AnimatedBitmap e faz "return if nil_or_empty?". No 3DS, FileTest.exist?/
+      # File.exist? falham para alguns windowskins (ex. "speech se 1") mesmo
+      # existindo -- entao o setSkin aborta e a janela fica com o skin do
+      # initialize (pbGetSystemFrame = "choice se 1", 48x48). Resultado: o
+      # DIALOGO (que faz setSkin("speech se 1")) ficava com o skin de ESCOLHA.
+      # Os windowskins sao carregados pelo loader C++ (o @sysframe ja' o prova:
+      # AnimatedBitmap.new("choice se 1") funciona). Por isso, para caminhos
+      # "Graphics/Windowskins/*", confiamos no loader e devolvemos o caminho SEM
+      # verificar a existencia (se faltar, o loader mostra fallback visivel).
+      # Resolve o setSkin do dialogo e mantem o Yes/No correto. Generico p/ Essentials.
+      begin
+        sw = s.gsub("\\", "/")
+        if sw.start_with?("Graphics/Windowskins/") || sw.start_with?("graphics/Windowskins/")
+          noext_ws = sw
+          begin
+            dot   = sw.rindex(".")
+            slash = sw.rindex("/")
+            noext_ws = sw[0...dot] if dot && slash && dot > slash && (sw.length - dot) <= 5
+          rescue
+            noext_ws = sw
+          end
+          dbg "[BMP|WSKIN-TRUST] '#{s}' -> '#{noext_ws}' (confia no loader)" if ($__mkxp_wskin_trust_logged ||= 0) < 4 && ($__mkxp_wskin_trust_logged += 1)
+          return noext_ws
+        end
+      rescue
+      end
+      # ──────────────────────────────────────────────────────────────────────────
+
       # ── PREVENCAO: redireccionar recursos CONHECIDOS em falta ─────────────────
       # Da analise do Graphics.zip: a pasta Graphics/System/ NAO existe, mas os
       # scripts pedem "Graphics/System/Window" (windowskin). O equivalente
@@ -2849,29 +2886,47 @@ end
 # qualquer forma. So' actua se o valor atual estiver vazio.
 begin
   if Object.const_defined?(:MessageConfig)
-    # Caminho a forcar: 1o windowskin do jogo (se configurado) + fallback universal.
-    skin_path = nil
+    # P4 (PROVADO via Scripts.rxdata 000_Settings.rb + 080_MessageConfig.rb):
+    # ha DOIS frames distintos no Essentials:
+    #   - SPEECH frame: dialogo (Window_AdvancedTextPokemon). pbGetSpeechFrame ->
+    #     SPEECH_WINDOWSKINS[textskin]. Indice 0 = "speech se 1" (96x48).
+    #   - SYSTEM frame: menus e Yes/No (Window_CommandPokemonEx, via
+    #     SpriteWindow_Base#initialize -> pbGetSystemFrame -> MENU_WINDOWSKINS[frame]).
+    #     Indice 0 = "choice se 1" (48x48).
+    # O bug: estavamos a forcar AMBOS para SPEECH_WINDOWSKINS[0], pondo o Yes/No
+    # com o skin de dialogo (96x48) em vez do de escolha (48x48). Resultado: caixa
+    # Yes/No com geometria errada. Fix: cada frame usa o seu proprio array.
+    speech_path = nil
+    system_path = nil
     begin
       if defined?(Settings) && Settings.const_defined?(:SPEECH_WINDOWSKINS) &&
          Settings::SPEECH_WINDOWSKINS.is_a?(Array) && !Settings::SPEECH_WINDOWSKINS.empty?
-        skin_path = "Graphics/Windowskins/" + Settings::SPEECH_WINDOWSKINS[0].to_s
+        speech_path = "Graphics/Windowskins/" + Settings::SPEECH_WINDOWSKINS[0].to_s
       end
     rescue; end
-    skin_path ||= "Graphics/Windowskins/001-Blue01"   # default universal (RESCHECK confirma que existe)
+    begin
+      if defined?(Settings) && Settings.const_defined?(:MENU_WINDOWSKINS) &&
+         Settings::MENU_WINDOWSKINS.is_a?(Array) && !Settings::MENU_WINDOWSKINS.empty?
+        system_path = "Graphics/Windowskins/" + Settings::MENU_WINDOWSKINS[0].to_s
+      end
+    rescue; end
+    speech_path ||= "Graphics/Windowskins/001-Blue01"   # default universal (RESCHECK confirma que existe)
+    system_path ||= speech_path                          # se nao houver MENU_WINDOWSKINS, cai no speech
 
     # Setar DIRETO nas class-vars do MessageConfig, contornando pbResolveBitmap.
     # (pbSetSpeechFrame faria @@x = pbResolveBitmap(v) || "" -> voltaria a "".)
     need_speech = (MessageConfig.pbGetSpeechFrame.to_s.empty? rescue true)
     need_system = (MessageConfig.pbGetSystemFrame.to_s.empty? rescue true)
     begin
-      MessageConfig.class_variable_set(:@@defaultTextSkin, skin_path) if need_speech
+      MessageConfig.class_variable_set(:@@defaultTextSkin, speech_path) if need_speech
     rescue; end
     begin
-      MessageConfig.class_variable_set(:@@systemFrame, skin_path) if need_system
+      MessageConfig.class_variable_set(:@@systemFrame, system_path) if need_system
     rescue; end
-    dbg "[WSKIN] forcado DIRETO windowskin='#{skin_path}' (speech=#{need_speech} system=#{need_system})"
+    dbg "[WSKIN] forcado DIRETO speech='#{speech_path}' system='#{system_path}' (speech=#{need_speech} system=#{need_system})"
     sf = (MessageConfig.pbGetSpeechFrame rescue "?")
-    dbg "[WSKIN] pbGetSpeechFrame agora = '#{sf}'"
+    syf = (MessageConfig.pbGetSystemFrame rescue "?")
+    dbg "[WSKIN] pbGetSpeechFrame='#{sf}' pbGetSystemFrame='#{syf}'"
   end
 rescue => e
   dbg "[WSKIN] forcar windowskin falhou: #{e.class}: #{e.message}"
@@ -2944,70 +2999,173 @@ begin
         skw = (sk.width rescue 0); skh = (sk.height rescue 0)
         return unless skw.is_a?(Integer) && skh.is_a?(Integer) && skw > 0 && skh > 0
         wx = (self.x rescue 0); wy = (self.y rescue 0)
+        # DIAGNOSTICO (teclado): despejar as pecas das janelas de entrada de
+        # texto para localizar os "quadrados brancos" da img3. So' as classes do
+        # teclado, e so' as primeiras vezes (limite por classe), p/ nao poluir.
+        begin
+          cn = self.class.to_s
+          if cn == 'Window_CharacterEntry' || cn == 'Window_TextEntry'
+            $__mkxp_kbdump ||= {}
+            if ($__mkxp_kbdump[cn] ||= 0) < 1
+              $__mkxp_kbdump[cn] += 1
+              dbg "[KBDUMP] === #{cn} skin=#{skw}x#{skh} win=(#{wx},#{wy}) #{(self.width rescue '?')}x#{(self.height rescue '?')} bopac=#{(self.back_opacity rescue '?')} opac=#{(self.opacity rescue '?')} ==="
+              sp.each do |kk, ss|
+                next if ss.nil?
+                bb2 = (ss.bitmap rescue nil)
+                bs2 = (bb2 && !(bb2.disposed? rescue true)) ? "#{(bb2.width rescue '?')}x#{(bb2.height rescue '?')}" : "nil"
+                sr2 = (ss.src_rect rescue nil)
+                srs = sr2 ? "[#{(sr2.x rescue '?')},#{(sr2.y rescue '?')},#{(sr2.width rescue '?')},#{(sr2.height rescue '?')}]" : "[-]"
+                # cor central do bitmap da peca: revela se alguma peca tem pixels
+                # dourados (origem do axadrezado amarelo do teclado, ainda nao provada)
+                pxc = "-"
+                if bb2 && !(bb2.disposed? rescue true)
+                  pw = (bb2.width rescue 0); ph = (bb2.height rescue 0)
+                  if pw > 0 && ph > 0
+                    cc = (bb2.get_pixel(pw/2, ph/2) rescue nil)
+                    pxc = cc ? "#{(cc.red rescue '?')},#{(cc.green rescue '?')},#{(cc.blue rescue '?')},a#{(cc.alpha rescue '?')}" : "?"
+                  end
+                end
+                dbg "[KBDUMP]  #{kk}: bmp=#{bs2} src=#{srs} xy=(#{(ss.x rescue '?')},#{(ss.y rescue '?')}) o=(#{(ss.ox rescue '?')},#{(ss.oy rescue '?')}) z=#{(ss.z rescue '?')} op=#{(ss.opacity rescue '?')} vis=#{(ss.visible rescue '?')} cxc=#{pxc}"
+              end
+            end
+          end
+        rescue
+        end
         ccx = wx + (self.width rescue 0) / 2; ccy = wy + (self.height rescue 0) / 2
-        lW = 16; rW = 16; tH = 16; bH = 16
-        lW = sp['side1'].bitmap.width  if sp['side1'] && (sp['side1'].bitmap rescue nil)
-        rW = sp['side2'].bitmap.width  if sp['side2'] && (sp['side2'].bitmap rescue nil)
-        tH = sp['side0'].bitmap.height if sp['side0'] && (sp['side0'].bitmap rescue nil)
-        bH = sp['side3'].bitmap.height if sp['side3'] && (sp['side3'].bitmap rescue nil)
+        # ============================================================
+        # FORMATO DA SKIN (PROVADO via codigo Essentials 082_SpriteWindow
+        # + medicao dos pixels das skins reais):
+        # As skins "speech se 1" (96x48) e "choice se 1" (48x48) NAO sao
+        # windowskins de 9 fatias de 16px. O Essentials trata-as com
+        # skinformat=1 (em __setWindowskin: tudo o que nao e' 192x128 nem
+        # 128x128 vira skinformat=1). Com skinformat=1, o privRefresh usa:
+        #   skinrect = ((skw-16)/2, (skh-16)/2, 16, 16)
+        #   sx,sy = skinrect.x, skinrect.y ; cx,cy = sx+16, sy+16
+        #   endX,endY = skw-cx, skh-cy
+        # e recorta as 9 pecas com cantos ASSIMETRICOS. Para 96x48 os cantos
+        # sao 40x16 (nao 16x16!); para 48x48 sao 16x16. Replicamos isso
+        # EXATAMENTE -- e' o que o jogo desenha no PC. Aplicar a tira/back
+        # esticada por cima garante o miolo cheio mesmo se a skin for so' fundo.
+        # ============================================================
+        # GUARDA skinformat: este recorte assimetrico SO' se aplica a skins
+        # skinformat=1. O Essentials (__setWindowskin) define skinformat=0 para
+        # 192x128 (RPGXP) e 128x128 (RPGVX) -- essas usam cantos FIXOS 16x16 e o
+        # proprio jogo ja' as recorta bem. Aplicar a logica (skw-16)/2 a elas
+        # daria cantos 56x56/88x56 (errado). So' actuamos no formato pequeno.
+        __is_fmt0 = ((skw == 192 && skh == 128) || (skw == 128 && skh == 128))
+        if __is_fmt0
+          # skinformat=0: nao mexer nos cantos (o jogo recorta a 16x16 sozinho).
+          sx = 16; sy = 16; cxr = skw - 16; cyr = skh - 16
+          endX = 16; endY = 16
+          lW = 16; rW = 16; tH = 16; bH = 16
+          nfx = 0
+        else
+        sx = (skw - 16) / 2; sy = (skh - 16) / 2
+        sx = 0 if sx < 0; sy = 0 if sy < 0
+        cxr = sx + 16; cyr = sy + 16
+        endX = skw - cxr; endY = skh - cyr
+        endX = 0 if endX < 0; endY = 0 if endY < 0
+        # lW/rW/tH/bH = espessura das bordas (p/ posicionar o miolo). No
+        # skinformat=1 a borda esq/dir tem largura sx/endX e topo/base sy/endY.
+        lW = sx; rW = endX; tH = sy; bH = endY
+        lW = 16 if lW <= 0; rW = 16 if rW <= 0; tH = 16 if tH <= 0; bH = 16 if bH <= 0
+        # Mapa dos 4 cantos: [chave] => [src_x, src_y, src_w, src_h]
+        __corner_src = {
+          'corner0' => [0,    0,    sx,   sy  ],
+          'corner1' => [cxr,  0,    endX, sy  ],
+          'corner2' => [0,    cyr,  sx,   endY],
+          'corner3' => [cxr,  cyr,  endX, endY],
+        }
+        __side_src = {
+          'side0' => [sx,   0,    16,   sy  ],  # topo
+          'side1' => [0,    sy,   sx,   16  ],  # esquerda
+          'side2' => [cxr,  sy,   endX, 16  ],  # direita
+          'side3' => [sx,   cyr,  16,   endY],  # base
+        }
         nfx = 0
         sp.each do |k, s|
           next if s.nil?
-          next unless k.to_s.start_with?('corner')
+          ks = k.to_s
           cb = (s.bitmap rescue nil); next if cb.nil?
           next unless ((cb.width rescue 0) == skw && (cb.height rescue 0) == skh)
-          sr = (s.src_rect rescue nil)
-          next if sr && (sr.width rescue skw) < skw   # ja' recortado -> idempotente
-          ex = (s.x rescue 0) - (s.ox rescue 0); ey = (s.y rescue 0) - (s.oy rescue 0)
-          isL = (ex < ccx); isT = (ey < ccy)
-          cw = isL ? lW : rW; ch = isT ? tH : bH
-          sx = isL ? 0 : (skw - cw); sy = isT ? 0 : (skh - ch)
-          s.src_rect = Rect.new(sx, sy, cw, ch); nfx += 1
+          rr = __corner_src[ks] || __side_src[ks]
+          next if rr.nil?
+          # Aplicar SEMPRE (idempotente): o jogo as vezes deixa src vazio
+          # (teclado Window_TextEntry mostra src=[-]), outras recorta mal.
+          # Recortar a regiao EXATA do skinformat=1 corrige ambos os casos.
+          next if rr[2] <= 0 || rr[3] <= 0
+          s.src_rect = Rect.new(rr[0], rr[1], rr[2], rr[3]); nfx += 1
+        end
         end
         # NOTA: nao fazemos 'return if nfx == 0' aqui. Mesmo que os cantos ja'
         # estejam recortados (idempotencia), o MIOLO pode ainda nao estar
         # esticado (a janela cresce de tamanho DEPOIS do initialize). Por isso
         # o stretch da 'back' abaixo corre sempre que houver tamanho valido.
+        # NOTA P1 + Regressao teclado (PROVADO via SPRDUMP + pixels das skins):
+        # NAO pintamos as 'side' (isso destruia as bordas -> FAIXAS PRETAS).
+        # MAS a peca 'back' (bitmap 4x64) e' uma fatia da COLUNA ESQUERDA da skin,
+        # que NEM SEMPRE e' o fundo: em "speech se 1" (96x48) a coluna esq e'
+        # opaca (fundo), mas em "choice se 1" (48x48) e' transparente+borda branca
+        # -> estica-la dava o miolo AXADREZADO do teclado. O CENTRO da skin e'
+        # que e' SEMPRE o fundo (medido: (7,7,7,224) em ambas). Por isso pintamos
+        # SO' a 'back' (uma peca, nao as side -> sem faixas) com a cor central da
+        # skin e esticamo-la para cobrir o miolo. Robusto p/ qualquer skin.
         fillc = (sk.get_pixel(skw / 2, skh / 2) rescue nil)
         fillc = Color.new(8, 8, 8, 255) if fillc.nil?
-        fillc = Color.new(8, 8, 8, 224) if (fillc.alpha rescue 0) < 200
-        # As 'side' continuam a ser pintadas (sao tiras finas das bordas).
-        ['side0', 'side1', 'side2', 'side3'].each do |fk|
-          fs = sp[fk]; next if fs.nil?
-          fb = (fs.bitmap rescue nil); next if fb.nil? || (fb.disposed? rescue true)
-          (fb.fill_rect(0, 0, fb.width, fb.height, fillc) rescue nil)
-        end
-        # MIOLO (peca 'back'): o fundo da janela. O bitmap original e' minusculo
-        # (ex 4x64, ja' com a COR/textura de fundo da skin) e o engine devia
-        # estica-lo via zoom, mas no 3DS ficava por cobrir -> centro vazio (so'
-        # apareciam os cantos). FIX (event-driven, ZERO alocacao): esticar a
-        # propria peca 'back' via zoom_x/zoom_y ate cobrir o interior, fixando-a
-        # no canto sup-esq do interior. ZERAMOS ox/oy porque o blit faz
-        # dx = x - ox*zoom_x: com zoom grande, um ox!=0 atirava a peca para fora
-        # do ecra (era a causa das "caixas pretas" no teclado/Yes-No). Como nao
-        # criamos bitmaps, nao ha churn de memoria (bom p/ FPS no ARM11) e o
-        # fundo mantem a aparencia ORIGINAL da skin (igual ao PC), em vez de um
-        # preto chapado. Compensamos o offset do viewport se existir.
+        fillc = Color.new(8, 8, 8, 224) if (fillc.alpha rescue 0) < 8
         bk = sp['back']
         if bk
           bb = (bk.bitmap rescue nil)
           if bb && !(bb.disposed? rescue true)
             bw = (bb.width rescue 0); bh = (bb.height rescue 0)
-            iw = (self.width rescue 0) - (lW + rW)
-            ih = (self.height rescue 0) - (tH + bH)
+            # ROBUSTEZ MAXIMA (PROVADO via FRAMEDUMP): as 'side' tem bitmap proprio
+            # transparente -> as faixas entre cantos e miolo ficavam vazias. Em vez
+            # de depender das side, esticamos o 'back' para cobrir a JANELA INTEIRA
+            # (full width/height, na posicao wx,wy). Assim NAO ha transparencia em
+            # lado nenhum. Os cantos (opacos, da skin) desenham POR CIMA nas 4
+            # esquinas (z igual, mas back e' criado/desenhado primeiro -> fica atras),
+            # dando o detalhe de canto. O texto (contents) desenha por cima de tudo.
+            iw = (self.width rescue 0)
+            ih = (self.height rescue 0)
             if bw > 0 && bh > 0 && iw > 0 && ih > 0
               vx = 0; vy = 0
               vp = (bk.viewport rescue nil)
               if vp && (vp.rect rescue nil); vx = (vp.rect.x rescue 0); vy = (vp.rect.y rescue 0); end
+              (bb.fill_rect(0, 0, bw, bh, fillc) rescue nil)
               (bk.src_rect = Rect.new(0, 0, bw, bh) rescue nil)
               (bk.zoom_x = iw.to_f / bw rescue nil)
               (bk.zoom_y = ih.to_f / bh rescue nil)
               (bk.ox = 0 rescue nil); (bk.oy = 0 rescue nil)
-              (bk.x = (wx - vx) + lW rescue nil)
-              (bk.y = (wy - vy) + tH rescue nil)
-              dbg "[CFIX] #{self.class} miolo esticado #{iw}x#{ih} (back #{bw}x#{bh} zoom)"
+              (bk.x = (wx - vx) rescue nil)
+              (bk.y = (wy - vy) rescue nil)
+              dbg "[CFIX] #{self.class} back FULL #{iw}x#{ih} (bmp #{bw}x#{bh} fill=#{fillc.red rescue '?'},#{fillc.green rescue '?'},#{fillc.blue rescue '?'},a#{fillc.alpha rescue '?'})"
             end
           end
+        end
+        # PREENCHER AS 4 SIDE (faixas entre cantos e miolo) -- PROVADO via FRAMEDUMP:
+        # no formato skinformat=1 destas skins, as 'side' top/left/right/bottom tem
+        # BITMAP PROPRIO (480x16, 40x64, etc) que fica TRANSPARENTE (alpha 0) -> as
+        # faixas entre os cantos e o miolo ficavam vazias e via-se o fundo/personagem.
+        # Cada side e' um bitmap independente; basta pinta-lo opaco com a cor central
+        # da skin (a mesma do miolo). Os cantos (opacos) desenham por cima nas
+        # esquinas, por isso nao ha sobreposicao errada. So' actua no formato pequeno
+        # (skinformat=1); para 128/192 (skinformat=0) as side vem da skin e nao se tocam.
+        if !__is_fmt0
+          ['side0','side1','side2','side3'].each do |sk_name|
+            ss = sp[sk_name]
+            next if ss.nil?
+            sbb = (ss.bitmap rescue nil)
+            next if sbb.nil? || (sbb.disposed? rescue true)
+            # SO' pintar se a side tem bitmap PROPRIO (nao a windowskin recortada):
+            # se o bitmap for a skin (96x48), ja' foi recortado acima e nao se pinta.
+            sbw = (sbb.width rescue 0); sbh = (sbb.height rescue 0)
+            next if sbw <= 0 || sbh <= 0
+            next if (sbw == skw && sbh == skh)   # e' a skin recortada -> nao mexer
+            (sbb.fill_rect(0, 0, sbw, sbh, fillc) rescue nil)
+            # garantir que desenha o bitmap todo (sem src_rect a cortar)
+            (ss.src_rect = Rect.new(0, 0, sbw, sbh) rescue nil)
+          end
+          dbg "[CFIX] #{self.class} sides preenchidas (fill=#{fillc.red rescue '?'},#{fillc.green rescue '?'},#{fillc.blue rescue '?'},a#{fillc.alpha rescue '?'})"
         end
         dbg "[CFIX] #{self.class} #{nfx} cantos recortados (skin #{skw}x#{skh})" if nfx > 0
       end
@@ -3042,6 +3200,34 @@ begin
             __ov = (@height rescue nil)
             r = __mkxp_cfix_hset(v)
             (__mkxp_cfix! rescue nil) if __ov != v
+            r
+          end
+        end
+        # Re-correr no UPDATE apenas para as janelas de ENTRADA DE TEXTO (teclado).
+        # PROVADO (KBDUMP + img4): no teclado (Window_TextEntry/CharacterEntry) as
+        # pecas teem back GRANDE (ex 448x160) e o proprio Window faz refresh INTERNO
+        # que re-blitta a skin DEPOIS do CFIX do initialize, desfazendo o recorte
+        # dos cantos e o preenchimento do miolo -> cantos 48x48 brancos + miolo
+        # axadrezado. O dialogo nao tem este problema porque o BACKFILL re-aplica a
+        # cada text=. Aqui damos o mesmo tratamento: re-aplicar o CFIX no update,
+        # LIMITADO as primeiras chamadas (a janela estabiliza depressa) para nao
+        # pesar por-frame no ARM11. So' afeta classes de teclado (zero custo nas
+        # outras janelas, que nem entram neste ramo).
+        if method_defined?(:update)
+          alias_method :__mkxp_cfix_update, :update
+          def update(*a, &b)
+            r = __mkxp_cfix_update(*a, &b)
+            begin
+              cn = self.class.to_s
+              if cn == 'Window_CharacterEntry' || cn == 'Window_TextEntry' ||
+                 cn == 'Window_TextEntry_Keyboard'
+                n = (@__mkxp_cfix_upd ||= 0)
+                if n < 4
+                  @__mkxp_cfix_upd = n + 1
+                  (__mkxp_cfix! rescue nil)
+                end
+              end
+            rescue; end
             r
           end
         end
@@ -4963,61 +5149,92 @@ end
             "            __skw = __csk.width; __skh = __csk.height\n"
             "            __wx=(self.x rescue 0); __wy=(self.y rescue 0)\n"
             "            __ccx = __wx + (self.width rescue 0)/2; __ccy = __wy + (self.height rescue 0)/2\n"
-            "            __lW=16; __rW=16; __tH=16; __bH=16\n"
-            "            if __csp['side1'] && (__csp['side1'].bitmap rescue nil); __lW = __csp['side1'].bitmap.width; end\n"
-            "            if __csp['side2'] && (__csp['side2'].bitmap rescue nil); __rW = __csp['side2'].bitmap.width; end\n"
-            "            if __csp['side0'] && (__csp['side0'].bitmap rescue nil); __tH = __csp['side0'].bitmap.height; end\n"
-            "            if __csp['side3'] && (__csp['side3'].bitmap rescue nil); __bH = __csp['side3'].bitmap.height; end\n"
+            "            # GUARDA skinformat: recorte assimetrico SO' p/ skinformat=1.\n"
+            "            # 192x128 e 128x128 sao skinformat=0 (cantos fixos 16x16, o jogo\n"
+            "            # recorta-os sozinho) -- nao mexer.\n"
+            "            __isfmt0 = ((__skw == 192 && __skh == 128) || (__skw == 128 && __skh == 128))\n"
+            "            if __isfmt0\n"
+            "              __lW = 16; __rW = 16; __tH = 16; __bH = 16; __nfx = 0\n"
+            "            else\n"
+            "            __sx = (__skw - 16)/2; __sy = (__skh - 16)/2\n"
+            "            __sx = 0 if __sx < 0; __sy = 0 if __sy < 0\n"
+            "            __cxr = __sx + 16; __cyr = __sy + 16\n"
+            "            __endX = __skw - __cxr; __endY = __skh - __cyr\n"
+            "            __endX = 0 if __endX < 0; __endY = 0 if __endY < 0\n"
+            "            __lW = __sx; __rW = __endX; __tH = __sy; __bH = __endY\n"
+            "            __lW = 16 if __lW <= 0; __rW = 16 if __rW <= 0; __tH = 16 if __tH <= 0; __bH = 16 if __bH <= 0\n"
+            "            __csrc = {\n"
+            "              'corner0' => [0,      0,      __sx,   __sy  ],\n"
+            "              'corner1' => [__cxr,  0,      __endX, __sy  ],\n"
+            "              'corner2' => [0,      __cyr,  __sx,   __endY],\n"
+            "              'corner3' => [__cxr,  __cyr,  __endX, __endY],\n"
+            "              'side0'   => [__sx,   0,      16,     __sy  ],\n"
+            "              'side1'   => [0,      __sy,   __sx,   16    ],\n"
+            "              'side2'   => [__cxr,  __sy,   __endX, 16    ],\n"
+            "              'side3'   => [__sx,   __cyr,  16,     __endY],\n"
+            "            }\n"
             "            __nfx = 0\n"
             "            __csp.each do |__k, __s|\n"
             "              next if __s.nil?\n"
-            "              next unless __k.to_s.start_with?('corner')\n"
+            "              __ks = __k.to_s\n"
             "              __cb = (__s.bitmap rescue nil); next if __cb.nil?\n"
             "              __cbw = (__cb.width rescue 0); __cbh = (__cb.height rescue 0)\n"
             "              next unless (__cbw == __skw && __cbh == __skh)\n"
-            "              __ex = (__s.x rescue 0) - (__s.ox rescue 0)\n"
-            "              __ey = (__s.y rescue 0) - (__s.oy rescue 0)\n"
-            "              __isL = (__ex < __ccx); __isT = (__ey < __ccy)\n"
-            "              __cw = __isL ? __lW : __rW\n"
-            "              __ch = __isT ? __tH : __bH\n"
-            "              __sx = __isL ? 0 : (__skw - __cw)\n"
-            "              __sy = __isT ? 0 : (__skh - __ch)\n"
-            "              __s.src_rect = Rect.new(__sx, __sy, __cw, __ch)\n"
+            "              __rr = __csrc[__ks]\n"
+            "              next if __rr.nil?\n"
+            "              next if __rr[2] <= 0 || __rr[3] <= 0\n"
+            "              __s.src_rect = Rect.new(__rr[0], __rr[1], __rr[2], __rr[3])\n"
             "              __nfx += 1\n"
             "            end\n"
-            "            MKXPDebug.log(\"[CORNERFIX] #{__nfx} cantos recortados (L=#{__lW} R=#{__rW} T=#{__tH} B=#{__bH} skin=#{__skw}x#{__skh})\") if __nfx > 0\n"
+            "            end\n"
+            "            MKXPDebug.log(\"[CORNERFIX] #{__nfx} pecas recortadas skinfmt1 (L=#{__lW} R=#{__rW} T=#{__tH} B=#{__bH} skin=#{__skw}x#{__skh})\") if __nfx > 0\n"
             "            __fillc = (__csk.get_pixel(__skw/2, __skh/2) rescue nil)\n"
             "            __fillc = Color.new(8,8,8,255) if __fillc.nil?\n"
-            "            __fillc = Color.new(8,8,8,224) if (__fillc.alpha rescue 0) < 200\n"
+            "            __fillc = Color.new(8,8,8,224) if (__fillc.alpha rescue 0) < 8\n"
             "            __filled = 0\n"
-            "            ['side0','side1','side2','side3'].each do |__fk|\n"
-            "              __fs = __csp[__fk]; next if __fs.nil?\n"
-            "              __fb = (__fs.bitmap rescue nil); next if __fb.nil? || (__fb.disposed? rescue true)\n"
-            "              (__fb.fill_rect(0, 0, __fb.width, __fb.height, __fillc) rescue nil)\n"
-            "              __filled += 1\n"
-            "            end\n"
+            "            # P1+teclado: NAO pintar as 'side' (faixas pretas). Pintar SO' a\n"
+            "            # 'back' com a cor CENTRAL da skin (sempre fundo) e estica-la: o\n"
+            "            # miolo fica cheio mesmo quando a coluna esq da skin e' transparente.\n"
             "            __bk = __csp['back']\n"
             "            if __bk\n"
             "              __bb = (__bk.bitmap rescue nil)\n"
             "              if __bb && !(__bb.disposed? rescue true)\n"
             "                __bw = (__bb.width rescue 0); __bh = (__bb.height rescue 0)\n"
-            "                __iw = (self.width rescue 0) - (__lW + __rW)\n"
-            "                __ih = (self.height rescue 0) - (__tH + __bH)\n"
+            "                __iw = (self.width rescue 0)\n"
+            "                __ih = (self.height rescue 0)\n"
             "                if __bw > 0 && __bh > 0 && __iw > 0 && __ih > 0\n"
             "                  __vx = 0; __vy = 0\n"
             "                  __vp = (__bk.viewport rescue nil)\n"
             "                  if __vp && (__vp.rect rescue nil); __vx = (__vp.rect.x rescue 0); __vy = (__vp.rect.y rescue 0); end\n"
+            "                  (__bb.fill_rect(0, 0, __bw, __bh, __fillc) rescue nil)\n"
             "                  (__bk.src_rect = Rect.new(0, 0, __bw, __bh) rescue nil)\n"
             "                  (__bk.zoom_x = __iw.to_f / __bw rescue nil)\n"
             "                  (__bk.zoom_y = __ih.to_f / __bh rescue nil)\n"
             "                  (__bk.ox = 0 rescue nil); (__bk.oy = 0 rescue nil)\n"
-            "                  (__bk.x = (__wx - __vx) + __lW rescue nil)\n"
-            "                  (__bk.y = (__wy - __vy) + __tH rescue nil)\n"
+            "                  (__bk.x = (__wx - __vx) rescue nil)\n"
+            "                  (__bk.y = (__wy - __vy) rescue nil)\n"
             "                  __filled += 1\n"
             "                end\n"
             "              end\n"
             "            end\n"
-            "            MKXPDebug.log(\"[BACKFILL] #{__filled} pecas + miolo esticado (#{__fillc.red rescue '?'},#{__fillc.green rescue '?'},#{__fillc.blue rescue '?'},a#{__fillc.alpha rescue '?'})\") if __filled > 0\n"
+            "            MKXPDebug.log(\"[BACKFILL] back pint+esticado (#{__fillc.red rescue '?'},#{__fillc.green rescue '?'},#{__fillc.blue rescue '?'},a#{__fillc.alpha rescue '?'})\") if __filled > 0\n"
+            "            # PREENCHER AS 4 SIDE (faixas entre cantos e miolo). No formato\n"
+            "            # skinformat=1 as side tem bitmap PROPRIO transparente -> faixas\n"
+            "            # vazias. Pintar cada uma opaca com a cor central. So' skinfmt1.\n"
+            "            if !__isfmt0\n"
+            "              ['side0','side1','side2','side3'].each do |__sn|\n"
+            "                __ss = __csp[__sn]\n"
+            "                next if __ss.nil?\n"
+            "                __sbb = (__ss.bitmap rescue nil)\n"
+            "                next if __sbb.nil? || (__sbb.disposed? rescue true)\n"
+            "                __sbw = (__sbb.width rescue 0); __sbh = (__sbb.height rescue 0)\n"
+            "                next if __sbw <= 0 || __sbh <= 0\n"
+            "                next if (__sbw == __skw && __sbh == __skh)\n"
+            "                (__sbb.fill_rect(0, 0, __sbw, __sbh, __fillc) rescue nil)\n"
+            "                (__ss.src_rect = Rect.new(0, 0, __sbw, __sbh) rescue nil)\n"
+            "              end\n"
+            "              MKXPDebug.log(\"[CORNERFIX] sides preenchidas\")\n"
+            "            end\n"
             "          end\n"
             "        rescue => __ce\n"
             "          MKXPDebug.log(\"[CORNERFIX] err #{__ce.class}: #{__ce.message}\")\n"
@@ -5297,10 +5514,13 @@ begin
           __gk2.send(:define_method, :update_player) do
             r = __diag_update_player
             begin
-              unless (instance_variable_get(:@__appear_dumped) rescue true)
-                instance_variable_set(:@__appear_dumped, true)
+              __cnt = (instance_variable_get(:@__appear_dumps) rescue 0) || 0
+              if __cnt < 6
+                instance_variable_set(:@__appear_dumps, __cnt + 1)
                 sp = (instance_variable_get(:@sprites) rescue nil)
                 rq = (instance_variable_get(:@realquant) rescue 0)
+                bg = (instance_variable_get(:@bg) rescue '?')
+                MKXPDebug.log("[APPEAR2] dump##{__cnt+1} @bg=#{bg} @realquant=#{rq.inspect}")
                 if sp.is_a?(Hash) && rq.is_a?(Integer)
                   rq.times { |i|
                     s = sp["player #{i}"]
