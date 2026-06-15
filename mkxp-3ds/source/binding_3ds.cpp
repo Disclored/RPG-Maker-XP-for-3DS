@@ -2924,6 +2924,136 @@ rescue => e
 end
 # === /PROBE DA CAIXA DE TEXTO ===============================================
 
+# === CFIX: recorte de windowskin GENERICO (corrige molduras pretas) =========
+# O CORNERFIX/BACKFILL original (mais abaixo) so' actua em
+# Window_AdvancedTextPokemon#text= -> so' o DIALOGO fica bem. As outras janelas
+# (Window_CommandPokemon=Yes/No, Window_TextEntry e Window_UnformattedTextPokemon
+# do teclado de nome) herdam de SpriteWindow_Base mas NUNCA passam por esse hook,
+# por isso a moldura sai PRETA no 3DS (os cantos ficam com a skin 96x48 inteira em
+# vez de recortada). Aqui aplicamos o MESMO recorte ao nivel da BASE, mas de forma
+# OTIMIZADA para o ARM11: event-driven (corre 1x no fim do initialize de cada
+# janela + 1x se a skin mudar via windowskin=), NUNCA por-frame. Idempotente: sai
+# de imediato se os cantos ja' estiverem recortados (src_rect < skin). Custo por
+# frame = ZERO. Generico p/ qualquer jogo RMXP/Essentials.
+begin
+  if Object.const_defined?(:SpriteWindow_Base)
+    class SpriteWindow_Base
+      def __mkxp_cfix!
+        sp = (@sprites rescue nil); sk = (self.windowskin rescue nil)
+        return unless sp.is_a?(Hash) && sk && !(sk.disposed? rescue true)
+        skw = (sk.width rescue 0); skh = (sk.height rescue 0)
+        return unless skw.is_a?(Integer) && skh.is_a?(Integer) && skw > 0 && skh > 0
+        wx = (self.x rescue 0); wy = (self.y rescue 0)
+        ccx = wx + (self.width rescue 0) / 2; ccy = wy + (self.height rescue 0) / 2
+        lW = 16; rW = 16; tH = 16; bH = 16
+        lW = sp['side1'].bitmap.width  if sp['side1'] && (sp['side1'].bitmap rescue nil)
+        rW = sp['side2'].bitmap.width  if sp['side2'] && (sp['side2'].bitmap rescue nil)
+        tH = sp['side0'].bitmap.height if sp['side0'] && (sp['side0'].bitmap rescue nil)
+        bH = sp['side3'].bitmap.height if sp['side3'] && (sp['side3'].bitmap rescue nil)
+        nfx = 0
+        sp.each do |k, s|
+          next if s.nil?
+          next unless k.to_s.start_with?('corner')
+          cb = (s.bitmap rescue nil); next if cb.nil?
+          next unless ((cb.width rescue 0) == skw && (cb.height rescue 0) == skh)
+          sr = (s.src_rect rescue nil)
+          next if sr && (sr.width rescue skw) < skw   # ja' recortado -> idempotente
+          ex = (s.x rescue 0) - (s.ox rescue 0); ey = (s.y rescue 0) - (s.oy rescue 0)
+          isL = (ex < ccx); isT = (ey < ccy)
+          cw = isL ? lW : rW; ch = isT ? tH : bH
+          sx = isL ? 0 : (skw - cw); sy = isT ? 0 : (skh - ch)
+          s.src_rect = Rect.new(sx, sy, cw, ch); nfx += 1
+        end
+        # NOTA: nao fazemos 'return if nfx == 0' aqui. Mesmo que os cantos ja'
+        # estejam recortados (idempotencia), o MIOLO pode ainda nao estar
+        # esticado (a janela cresce de tamanho DEPOIS do initialize). Por isso
+        # o stretch da 'back' abaixo corre sempre que houver tamanho valido.
+        fillc = (sk.get_pixel(skw / 2, skh / 2) rescue nil)
+        fillc = Color.new(8, 8, 8, 255) if fillc.nil?
+        fillc = Color.new(8, 8, 8, 224) if (fillc.alpha rescue 0) < 200
+        # As 'side' continuam a ser pintadas (sao tiras finas das bordas).
+        ['side0', 'side1', 'side2', 'side3'].each do |fk|
+          fs = sp[fk]; next if fs.nil?
+          fb = (fs.bitmap rescue nil); next if fb.nil? || (fb.disposed? rescue true)
+          (fb.fill_rect(0, 0, fb.width, fb.height, fillc) rescue nil)
+        end
+        # MIOLO (peca 'back'): o fundo da janela. O bitmap original e' minusculo
+        # (ex 4x64, ja' com a COR/textura de fundo da skin) e o engine devia
+        # estica-lo via zoom, mas no 3DS ficava por cobrir -> centro vazio (so'
+        # apareciam os cantos). FIX (event-driven, ZERO alocacao): esticar a
+        # propria peca 'back' via zoom_x/zoom_y ate cobrir o interior, fixando-a
+        # no canto sup-esq do interior. ZERAMOS ox/oy porque o blit faz
+        # dx = x - ox*zoom_x: com zoom grande, um ox!=0 atirava a peca para fora
+        # do ecra (era a causa das "caixas pretas" no teclado/Yes-No). Como nao
+        # criamos bitmaps, nao ha churn de memoria (bom p/ FPS no ARM11) e o
+        # fundo mantem a aparencia ORIGINAL da skin (igual ao PC), em vez de um
+        # preto chapado. Compensamos o offset do viewport se existir.
+        bk = sp['back']
+        if bk
+          bb = (bk.bitmap rescue nil)
+          if bb && !(bb.disposed? rescue true)
+            bw = (bb.width rescue 0); bh = (bb.height rescue 0)
+            iw = (self.width rescue 0) - (lW + rW)
+            ih = (self.height rescue 0) - (tH + bH)
+            if bw > 0 && bh > 0 && iw > 0 && ih > 0
+              vx = 0; vy = 0
+              vp = (bk.viewport rescue nil)
+              if vp && (vp.rect rescue nil); vx = (vp.rect.x rescue 0); vy = (vp.rect.y rescue 0); end
+              (bk.src_rect = Rect.new(0, 0, bw, bh) rescue nil)
+              (bk.zoom_x = iw.to_f / bw rescue nil)
+              (bk.zoom_y = ih.to_f / bh rescue nil)
+              (bk.ox = 0 rescue nil); (bk.oy = 0 rescue nil)
+              (bk.x = (wx - vx) + lW rescue nil)
+              (bk.y = (wy - vy) + tH rescue nil)
+              dbg "[CFIX] #{self.class} miolo esticado #{iw}x#{ih} (back #{bw}x#{bh} zoom)"
+            end
+          end
+        end
+        dbg "[CFIX] #{self.class} #{nfx} cantos recortados (skin #{skw}x#{skh})" if nfx > 0
+      end
+      unless method_defined?(:__mkxp_cfix_init)
+        alias_method :__mkxp_cfix_init, :initialize
+        def initialize(*a, &b)
+          __mkxp_cfix_init(*a, &b)
+          (__mkxp_cfix! rescue nil)
+        end
+        alias_method :__mkxp_cfix_wsset, :windowskin=
+        def windowskin=(v)
+          __mkxp_cfix_wsset(v)
+          (__mkxp_cfix! rescue nil)
+        end
+        # Re-correr quando a janela MUDA DE TAMANHO: muitas janelas (Yes/No,
+        # comandos, dialogo) nascem pequenas no initialize e so' recebem o
+        # tamanho final mais tarde via width=/height=. Sem isto, o miolo ficava
+        # do tamanho inicial (pequeno) e o centro aparecia vazio. Event-driven:
+        # so' dispara quando o valor MUDA mesmo (nao por-frame). Custo ~zero.
+        if method_defined?(:width=)
+          alias_method :__mkxp_cfix_wset, :width=
+          def width=(v)
+            __ov = (@width rescue nil)
+            r = __mkxp_cfix_wset(v)
+            (__mkxp_cfix! rescue nil) if __ov != v
+            r
+          end
+        end
+        if method_defined?(:height=)
+          alias_method :__mkxp_cfix_hset, :height=
+          def height=(v)
+            __ov = (@height rescue nil)
+            r = __mkxp_cfix_hset(v)
+            (__mkxp_cfix! rescue nil) if __ov != v
+            r
+          end
+        end
+      end
+    end
+    dbg "[CFIX] recorte de windowskin instalado em SpriteWindow_Base (event-driven, 0 custo/frame)"
+  end
+rescue => e
+  dbg "[CFIX] instalacao falhou: #{e.class}: #{e.message}"
+end
+# === /CFIX ==================================================================
+
 # -- FIX CAIXA DE TEXTO: windowskin a carregar como 32x32 vazio ----------------
 # DIAGNOSTICO (do log [WSKIN-PROBE]): a janela de mensagem cria 16 sprites,
 # 15 com bitmap, 10 visiveis -- a janela ESTA' a ser desenhada. MAS a windowskin
@@ -4858,14 +4988,36 @@ end
             "            MKXPDebug.log(\"[CORNERFIX] #{__nfx} cantos recortados (L=#{__lW} R=#{__rW} T=#{__tH} B=#{__bH} skin=#{__skw}x#{__skh})\") if __nfx > 0\n"
             "            __fillc = (__csk.get_pixel(__skw/2, __skh/2) rescue nil)\n"
             "            __fillc = Color.new(8,8,8,255) if __fillc.nil?\n"
+            "            __fillc = Color.new(8,8,8,224) if (__fillc.alpha rescue 0) < 200\n"
             "            __filled = 0\n"
-            "            ['back','side0','side1','side2','side3'].each do |__fk|\n"
+            "            ['side0','side1','side2','side3'].each do |__fk|\n"
             "              __fs = __csp[__fk]; next if __fs.nil?\n"
             "              __fb = (__fs.bitmap rescue nil); next if __fb.nil? || (__fb.disposed? rescue true)\n"
             "              (__fb.fill_rect(0, 0, __fb.width, __fb.height, __fillc) rescue nil)\n"
             "              __filled += 1\n"
             "            end\n"
-            "            MKXPDebug.log(\"[BACKFILL] #{__filled} pecas preenchidas (#{__fillc.red rescue '?'},#{__fillc.green rescue '?'},#{__fillc.blue rescue '?'},a#{__fillc.alpha rescue '?'})\") if __filled > 0\n"
+            "            __bk = __csp['back']\n"
+            "            if __bk\n"
+            "              __bb = (__bk.bitmap rescue nil)\n"
+            "              if __bb && !(__bb.disposed? rescue true)\n"
+            "                __bw = (__bb.width rescue 0); __bh = (__bb.height rescue 0)\n"
+            "                __iw = (self.width rescue 0) - (__lW + __rW)\n"
+            "                __ih = (self.height rescue 0) - (__tH + __bH)\n"
+            "                if __bw > 0 && __bh > 0 && __iw > 0 && __ih > 0\n"
+            "                  __vx = 0; __vy = 0\n"
+            "                  __vp = (__bk.viewport rescue nil)\n"
+            "                  if __vp && (__vp.rect rescue nil); __vx = (__vp.rect.x rescue 0); __vy = (__vp.rect.y rescue 0); end\n"
+            "                  (__bk.src_rect = Rect.new(0, 0, __bw, __bh) rescue nil)\n"
+            "                  (__bk.zoom_x = __iw.to_f / __bw rescue nil)\n"
+            "                  (__bk.zoom_y = __ih.to_f / __bh rescue nil)\n"
+            "                  (__bk.ox = 0 rescue nil); (__bk.oy = 0 rescue nil)\n"
+            "                  (__bk.x = (__wx - __vx) + __lW rescue nil)\n"
+            "                  (__bk.y = (__wy - __vy) + __tH rescue nil)\n"
+            "                  __filled += 1\n"
+            "                end\n"
+            "              end\n"
+            "            end\n"
+            "            MKXPDebug.log(\"[BACKFILL] #{__filled} pecas + miolo esticado (#{__fillc.red rescue '?'},#{__fillc.green rescue '?'},#{__fillc.blue rescue '?'},a#{__fillc.alpha rescue '?'})\") if __filled > 0\n"
             "          end\n"
             "        rescue => __ce\n"
             "          MKXPDebug.log(\"[CORNERFIX] err #{__ce.class}: #{__ce.message}\")\n"
@@ -4962,6 +5114,327 @@ begin
     end
     MKXPDebug.log('[DLGINIT] hook instalado em Window_AdvancedTextPokemon#initialize')
   end
+
+  # ---- DIAGNOSTICO TEMPORARIO: entrada de nome (teclado BW Text Entry) ----
+  # O teclado de nome no Essentials passa por pbEnterText -> cria uma cena
+  # (PokemonEntryScene / PokemonEntryScene2) e chama pbStartScene. O ecra fica
+  # preso quando essa cena nao desenha ou rebenta em pbStartScene. Este bloco:
+  #  (1) LISTA que metodos/classes de entrada existem mesmo (sabermos o nome real)
+  #  (2) faz hook a pbStartScene das cenas p/ apanhar ENTROU/OK/CRASH+backtrace.
+  begin
+    cand_m = [:pbEnterText, :pbEnterPlayerName, :pbChooseGender, :pbTrainerName, :pbProcessPlayerInput]
+    presentes = cand_m.select { |m| (Object.method_defined?(m) || (Object.allocate.respond_to?(m, true) rescue false)) }
+    MKXPDebug.log("[NAMEIN] metodos-entrada presentes: #{presentes.inspect}")
+    cand_c = ["PokemonEntryScene","PokemonEntryScene2","PokemonEntryScene3","PokemonEntry","PokemonEntry2"]
+    cls = cand_c.select { |c| (Object.const_defined?(c) rescue false) }
+    MKXPDebug.log("[NAMEIN] classes-entrada presentes: #{cls.inspect}")
+  rescue => e
+    MKXPDebug.log("[NAMEIN] inventario falhou: #{e.class}: #{e.message}")
+  end
+
+  # ---- CORRECAO: pbTrainerName robusto -------------------------------------
+  # O log provou: o evento da Trainer Card chama pbTrainerName(nil,0) via um
+  # "Script" event command (command_355). A versao do jogo rebenta logo no corpo
+  # com "ArgumentError: comparison of String with Integer failed" (um "<" que
+  # compara o nome String com um Integer tipo MAX_PLAYER_NAME_SIZE). Como o eval
+  # rebenta e o motor re-tenta o command_355 todos os frames, o jogo fica PRESO e
+  # o teclado nunca chega a ser instanciado. Nao podemos editar o script do jogo,
+  # por isso substituimos pbTrainerName por uma versao a prova de tipos que usa o
+  # teclado (pbEnterPlayerName/pbEnterText, ja carregados) com min/max Integer
+  # garantidos, e aplica o nome a $player/$Trainer. Generico p/ qualquer jogo
+  # RMXP/Essentials. O hook [NAMEIN] global instalado a seguir envolve esta versao
+  # (mantendo o logging CHAMADO/-> intacto).
+  begin
+    if Object.method_defined?(:pbTrainerName) && !Object.method_defined?(:__pretn_orig)
+      Object.send(:alias_method, :__pretn_orig, :pbTrainerName)
+    end
+    def __pretn_int(v, dflt)
+      return v if v.is_a?(Integer)
+      begin
+        iv = Integer(v) rescue nil
+        iv.is_a?(Integer) ? iv : dflt
+      rescue
+        dflt
+      end
+    end
+    def pbTrainerName(*args)
+      MKXPDebug.log("[NAMEIN] pbTrainerName(robusto) args=#{args.inspect}") rescue nil
+      name = args[0]
+      if name.is_a?(String) && name.length > 0
+        newname = name
+      else
+        maxlen = 12
+        begin
+          if defined?(Settings) && Settings.const_defined?(:MAX_PLAYER_NAME_SIZE)
+            maxlen = __pretn_int(Settings::MAX_PLAYER_NAME_SIZE, 12)
+          end
+        rescue
+          maxlen = 12
+        end
+        maxlen = 12 if !maxlen.is_a?(Integer) || maxlen <= 0
+        help = "Your name?"
+        newname = nil
+        if Object.method_defined?(:pbEnterPlayerName) || (respond_to?(:pbEnterPlayerName, true) rescue false)
+          begin
+            newname = pbEnterPlayerName(help, 1, maxlen)
+          rescue => e
+            MKXPDebug.log("[NAMEIN] pbEnterPlayerName falhou: #{e.class}: #{e.message}") rescue nil
+            newname = nil
+          end
+        end
+        if !(newname.is_a?(String) && newname.length > 0)
+          begin
+            newname = pbEnterText(help, 1, maxlen, "")
+          rescue => e
+            MKXPDebug.log("[NAMEIN] pbEnterText falhou: #{e.class}: #{e.message}") rescue nil
+            newname = nil
+          end
+        end
+        newname = "Player" if !(newname.is_a?(String) && newname.length > 0)
+      end
+      begin
+        if defined?($player) && $player && $player.respond_to?(:name=)
+          $player.name = newname
+        elsif defined?($Trainer) && $Trainer && $Trainer.respond_to?(:name=)
+          $Trainer.name = newname
+        end
+      rescue => e
+        MKXPDebug.log("[NAMEIN] aplicar nome falhou: #{e.class}: #{e.message}") rescue nil
+      end
+      MKXPDebug.log("[NAMEIN] pbTrainerName(robusto) -> #{newname.inspect}") rescue nil
+      newname
+    end
+    MKXPDebug.log("[NAMEIN] PATCH pbTrainerName robusto instalado OK")
+  rescue => e
+    MKXPDebug.log("[NAMEIN] PATCH pbTrainerName falhou: #{e.class}: #{e.message}")
+  end
+
+  # ---- CORRECAO: teclado BW -> modo SETAS (input nativo 3DS) ----------------
+  # O plugin "BW Text Entry Scene" (PokemonEntryScene) tem USEKEYBOARD=true, que
+  # escolhe o caminho pbEntry1: le o nome de um TECLADO FISICO de PC via
+  #   Input.text_input = true ; Input.triggerex?(:RETURN) ; Input.triggerex?(:ESCAPE)
+  # Nada disto existe no 3DS (sem teclado fisico) nem no nosso binding nativo, por
+  # isso o loop nunca recebe input: nao escreve e A/Enter nunca confirma -> PRESO.
+  # Forcando USEKEYBOARD=false, o plugin usa pbEntry2 (teclado de SETAS on-screen)
+  # que le SO Input.trigger?(USE) e Input.repeat?(UP/DOWN/LEFT/RIGHT) -- tudo ja
+  # suportado nativamente em C++. E' tambem o unico modo navegavel num 3DS (d-pad
+  # + A). Generico p/ qualquer jogo que use este plugin. remove_const evita o aviso
+  # de redefinicao. Idempotente (so' age se ainda for !=false).
+  begin
+    if Object.const_defined?(:PokemonEntryScene)
+      kls = Object.const_get(:PokemonEntryScene)
+      if kls.is_a?(Class) && kls.const_defined?(:USEKEYBOARD) && kls::USEKEYBOARD != false
+        kls.send(:remove_const, :USEKEYBOARD)
+        kls.const_set(:USEKEYBOARD, false)
+        MKXPDebug.log("[NAMEIN] PATCH USEKEYBOARD=false (teclado de setas, input nativo 3DS) OK")
+      end
+    end
+  rescue => e
+    MKXPDebug.log("[NAMEIN] PATCH USEKEYBOARD falhou: #{e.class}: #{e.message}")
+  end
+  # ---- FIM CORRECAO ---------------------------------------------------------
+
+  # ---- DIAGNOSTICO appearance (Gender selection) ----------------------------
+  # So' LOGGING -- nao altera comportamento. Confirma quantos bonecos a cena
+  # "Select your appearance" mostra. A duvida: no video PC vem-se 10 bonecos,
+  # mas no 3DS so' 4. A matematica (abaixo, no log) prova que os 10 CABEM no
+  # ecra fisico, logo NAO e' o emulador a corta-los: o numero vem de
+  # @realquant = GenderPickSelection.quant_registered_player (metadata do jogo).
+  # Este hook regista o valor real em runtime + a posicao fisica de cada boneco
+  # (VIS/FORA), para decidir com prova em vez de adivinhar. Idempotente,
+  # protegido por begin/rescue, e so' age se o plugin existir. Usa (i % 2 == 0)
+  # em vez de i.even? por compatibilidade. Generico: nao mexe no jogo.
+  begin
+    if Object.const_defined?(:GenderPickSelection)
+      __gps = Object.const_get(:GenderPickSelection)
+      if __gps.const_defined?(:Show)
+        __gkls = __gps.const_get(:Show)
+        if __gkls.is_a?(Class) && __gkls.method_defined?(:create_scene) &&
+           !__gkls.method_defined?(:__diag_create_scene)
+          __gkls.send(:alias_method, :__diag_create_scene, :create_scene)
+          __gkls.send(:define_method, :create_scene) do
+            r = __diag_create_scene
+            begin
+              rq = (instance_variable_get(:@realquant) rescue nil)
+              pl = (instance_variable_get(:@player) rescue nil)
+              MKXPDebug.log("[APPEAR] @realquant=#{rq.inspect} @player.size=#{(pl ? pl.size : nil).inspect}")
+              if rq.is_a?(Integer)
+                rq.times { |i|
+                  x = 16 + ((i % 2 == 0) ? 0 : 358)
+                  y = 52 + 64 * (i / 2)
+                  fx = (x * 0.625 + 40).to_i
+                  fy = (y * 0.625).to_i
+                  vis = (fx < 400 && fy < 240) ? "VIS" : "FORA"
+                  MKXPDebug.log("[APPEAR]   boneco #{i}: log(#{x},#{y}) fis(#{fx},#{fy}) #{vis}")
+                }
+              end
+            rescue => e
+              MKXPDebug.log("[APPEAR] log falhou: #{e.class}: #{e.message}")
+            end
+            r
+          end
+          MKXPDebug.log("[APPEAR] hook GenderPickSelection::Show#create_scene instalado OK")
+        end
+      end
+    end
+  rescue => e
+    MKXPDebug.log("[APPEAR] PATCH falhou: #{e.class}: #{e.message}")
+  end
+  # APPEAR2: inspecionar os SPRITES dos bonecos depois de criados, para saber
+  # PORQUE so' metade aparece. Hookamos update_player (onde o plugin posiciona
+  # e poe o bitmap de cada boneco) e, na 1a passagem, logamos por boneco: se o
+  # bitmap carregou (largura), z, visibilidade e posicao. Se os da esquerda
+  # (pares) tiverem bmp=nil/0x0 -> e' carregamento de asset; se tiverem bitmap
+  # OK mas nao aparecem -> e' z/ordem/tapados. So' loga 1x (@__appear_dumped).
+  begin
+    if Object.const_defined?(:GenderPickSelection)
+      __gps2 = Object.const_get(:GenderPickSelection)
+      if __gps2.const_defined?(:Show)
+        __gk2 = __gps2.const_get(:Show)
+        if __gk2.is_a?(Class) && __gk2.method_defined?(:update_player) &&
+           !__gk2.method_defined?(:__diag_update_player)
+          __gk2.send(:alias_method, :__diag_update_player, :update_player)
+          __gk2.send(:define_method, :update_player) do
+            r = __diag_update_player
+            begin
+              unless (instance_variable_get(:@__appear_dumped) rescue true)
+                instance_variable_set(:@__appear_dumped, true)
+                sp = (instance_variable_get(:@sprites) rescue nil)
+                rq = (instance_variable_get(:@realquant) rescue 0)
+                if sp.is_a?(Hash) && rq.is_a?(Integer)
+                  rq.times { |i|
+                    s = sp["player #{i}"]
+                    if s.nil?
+                      MKXPDebug.log("[APPEAR2] boneco #{i}: SEM SPRITE")
+                    else
+                      b = (s.bitmap rescue nil)
+                      bs = (b && !(b.disposed? rescue true)) ? "#{(b.width rescue '?')}x#{(b.height rescue '?')}" : "nil"
+                      MKXPDebug.log("[APPEAR2] boneco #{i}: bmp=#{bs} z=#{(s.z rescue '?')} vis=#{(s.visible rescue '?')} xy=(#{(s.x rescue '?')},#{(s.y rescue '?')}) o=(#{(s.ox rescue '?')},#{(s.oy rescue '?')})")
+                    end
+                  }
+                end
+              end
+            rescue => __e2
+              MKXPDebug.log("[APPEAR2] dump falhou: #{__e2.class}: #{__e2.message}")
+            end
+            r
+          end
+          MKXPDebug.log("[APPEAR2] hook update_player instalado OK")
+        end
+      end
+    end
+  rescue => __e2
+    MKXPDebug.log("[APPEAR2] PATCH falhou: #{__e2.class}: #{__e2.message}")
+  end
+  # ---- FIM DIAGNOSTICO appearance -------------------------------------------
+
+  def self.__mkxp_hook_scene(klass_name)
+    return false unless (Object.const_defined?(klass_name) rescue false)
+    klass = Object.const_get(klass_name)
+    return false unless klass.is_a?(Class)
+    return true if klass.method_defined?(:__diag_pbStartScene)
+    return false unless klass.method_defined?(:pbStartScene)
+    klass.send(:alias_method, :__diag_pbStartScene, :pbStartScene)
+    klass.send(:define_method, :pbStartScene) do |*a, &b|
+      MKXPDebug.log("[NAMEIN] #{klass_name}#pbStartScene ENTROU") rescue nil
+      begin
+        r = __diag_pbStartScene(*a, &b)
+        MKXPDebug.log("[NAMEIN] #{klass_name}#pbStartScene OK -> #{r.inspect}") rescue nil
+        r
+      rescue => ex
+        MKXPDebug.log("[NAMEIN] #{klass_name}#pbStartScene CRASH: #{ex.class}: #{ex.message}") rescue nil
+        (ex.backtrace || [])[0,8].each_with_index{|l,i| MKXPDebug.log("[NAMEIN]   bt[#{i}]: #{l}") rescue nil}
+        raise
+      end
+    end
+    MKXPDebug.log("[NAMEIN] hook #{klass_name}#pbStartScene OK")
+    true
+  end
+  ["PokemonEntryScene","PokemonEntryScene2","PokemonEntryScene3"].each do |kn|
+    begin
+      __mkxp_hook_scene(kn)
+    rescue => e
+      MKXPDebug.log("[NAMEIN] hook #{kn} falhou: #{e.class}: #{e.message}")
+    end
+  end
+  # Hook GLOBAL ao proprio pbEnterText/pbEnterPlayerName: dizer se o teclado
+  # chega a ser CHAMADO. Se nao houver "[NAMEIN] pbEnterText CHAMADO" quando o
+  # jogo pede o nome, o script parte ANTES do teclado (ex: falha do sprite do
+  # Trainer Card a montante). Se aparecer CHAMADO sem "->", fica preso dentro.
+  def self.__mkxp_hook_global(meth)
+    ok = Object.method_defined?(meth)
+    ok ||= (Object.allocate.respond_to?(meth, true) rescue false) unless ok
+    return false unless ok
+    diag = "__diag_g_#{meth}".to_sym
+    return true if Object.method_defined?(diag)
+    Object.send(:alias_method, diag, meth)
+    Object.send(:define_method, meth) do |*a, &b|
+      MKXPDebug.log("[NAMEIN] #{meth} CHAMADO args=#{a.inspect}") rescue nil
+      begin
+        r = send(diag, *a, &b)
+        MKXPDebug.log("[NAMEIN] #{meth} -> #{r.inspect}") rescue nil
+        r
+      rescue => ex
+        MKXPDebug.log("[NAMEIN] #{meth} CRASH: #{ex.class}: #{ex.message}") rescue nil
+        (ex.backtrace || [])[0,8].each_with_index{|l,i| MKXPDebug.log("[NAMEIN]   bt[#{i}]: #{l}") rescue nil}
+        raise
+      end
+    end
+    MKXPDebug.log("[NAMEIN] hook GLOBAL #{meth} OK")
+    true
+  end
+  [:pbEnterText, :pbEnterPlayerName, :pbTrainerName, :pbEnterPokemonName, :pbChooseGender, :pbNameEntry].each do |m|
+    begin
+      __mkxp_hook_global(m)
+    rescue => e
+      MKXPDebug.log("[NAMEIN] hook GLOBAL #{m} falhou: #{e.class}: #{e.message}")
+    end
+  end
+  # Hook generico a um metodo de INSTANCIA de uma classe. Apanha caminhos
+  # alternativos de entrada de nome que NAO passam por pbEnterText:
+  #  - Essentials: PokemonEntry#pbStartScreen (camada acima de pbStartScene)
+  #  - RMXP nativo (Name Input Processing / event command 105):
+  #    Interpreter#command_105, Scene_Name#main, Window_NameInput/Edit#initialize
+  # Se NENHUM destes nem os globais dispararem ao despachar a msg "write your
+  # name", a entrada de nome nunca e' sequer tentada (bug a montante no evento).
+  def self.__mkxp_hook_imethod(klass_name, meth)
+    meth = meth.to_sym
+    return false unless (Object.const_defined?(klass_name) rescue false)
+    klass = Object.const_get(klass_name)
+    return false unless klass.is_a?(Class)
+    return false unless klass.method_defined?(meth)
+    diag = "__diag_im_#{klass_name}_#{meth}".to_sym
+    return true if klass.method_defined?(diag)
+    klass.send(:alias_method, diag, meth)
+    klass.send(:define_method, meth) do |*a, &b|
+      MKXPDebug.log("[NAMEIN] #{klass_name}##{meth} ENTROU (args=#{a.size})") rescue nil
+      begin
+        r = send(diag, *a, &b)
+        MKXPDebug.log("[NAMEIN] #{klass_name}##{meth} OK") rescue nil
+        r
+      rescue => ex
+        MKXPDebug.log("[NAMEIN] #{klass_name}##{meth} CRASH: #{ex.class}: #{ex.message}") rescue nil
+        (ex.backtrace || [])[0,10].each_with_index{|l,i| MKXPDebug.log("[NAMEIN]   bt[#{i}]: #{l}") rescue nil}
+        raise
+      end
+    end
+    MKXPDebug.log("[NAMEIN] hook #{klass_name}##{meth} OK")
+    true
+  end
+  [
+    ["PokemonEntry","pbStartScreen"], ["PokemonEntry2","pbStartScreen"],
+    ["PokemonEntry3","pbStartScreen"],
+    ["Interpreter","command_105"],
+    ["Scene_Name","main"],
+    ["Window_NameInput","initialize"], ["Window_NameEdit","initialize"],
+  ].each do |kn, mn|
+    begin
+      __mkxp_hook_imethod(kn, mn)
+    rescue => e
+      MKXPDebug.log("[NAMEIN] hook #{kn}##{mn} falhou: #{e.class}: #{e.message}")
+    end
+  end
+  # ---- FIM DIAGNOSTICO ----
 rescue => e
   MKXPDebug.log("[PBMSG] bloco falhou: #{e.class}: #{e.message}")
 end

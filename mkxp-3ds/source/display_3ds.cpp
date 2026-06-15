@@ -4,6 +4,8 @@
 #include "profile_3ds.h"
 #include <cstring>
 #include <stdio.h>
+#include <vector>
+#include <algorithm>
 extern FILE *g_dbglog;
 /* OTIMIZACAO 3DS: flush periodico (cada 64 escritas) em vez de a cada printf,
  * para evitar I/O sincrono ao cartao SD por frame. Contador global partilhado. */
@@ -64,6 +66,80 @@ static size_t s_tex_bytes_peak = 0;
  * medias (working-set -> precisa VRAM/memoria estendida). */
 static int s_tex_hist[6] = {0,0,0,0,0,0};
 static int s_tex_big_w = 0, s_tex_big_h = 0;   /* maior textura POT ja vista */
+
+/* [fix] Overflow de texturas para VRAM quando o heap linear (FCRAM) enche.
+ * O 3DS tem ~6MB de VRAM, dos quais sobram varios MB depois dos framebuffers.
+ * So' encaminhamos texturas PEQUENAS (UI, texto, cursores) para nao arriscar
+ * esgotar a VRAM com um atlas grande e matar os framebuffers. Generico p/
+ * qualquer jogo RMXP que esgote o heap linear. */
+static const unsigned VRAM_OVERFLOW_MAX = 512u * 1024;  /* <=512KB por textura */
+static const unsigned VRAM_OVERFLOW_KEEP = 256u * 1024; /* deixar 256KB livres */
+static int    s_tex_vram_live  = 0;
+static size_t s_tex_vram_bytes = 0;
+
+/* ── SUPER LOG (DBG_SUPER) ───────────────────────────────────────────────────
+ * Registo global de texturas VIVAS (engine-level, limitado ~ nº vivo, O(1) por
+ * create, O(N) por free com swap-pop). Permite, por intervalo, listar peso
+ * (bytes/%), tamanho/POT, local (linear/VRAM) e NECESSIDADE (desenhada vs
+ * ociosa = candidata a fuga). Por defeito OFF; liga com:
+ *   dbg_set_mask(dbg_get_mask() | DBG_SUPER);
+ * Cadencia em frames: 1 = TODOS os frames (avisado: muita escrita ao SD, derruba
+ * o FPS — so' para sessao de debug). Ajusta s_super_every. */
+static std::vector<DS3Texture*> s_live_texs;
+static int s_super_every = 120;   /* intervalo (frames) entre snapshots */
+static void super_snapshot(void);  /* SUPER LOG: definido mais abaixo */
+
+/* ── [EVICT] Eviccao on-demand de texturas idle ──────────────────────────────
+ * PORQUE: o heap linear (FCRAM, 24MB) fragmenta-se com o tempo. Uma textura
+ * grande contigua (ex: 1024x1024 = 4MB) pode falhar a alocar mesmo havendo
+ * varios MB livres, porque estao espalhados em blocos pequenos. Sintoma real
+ * (log): [TEX|CREATE] ERRO C3D_TexInit FALHOU src=832x704, linear_livre=6958KB
+ * mas a textura de 4MB nao cabe -> a arte da intro/transicao nunca aparece.
+ *
+ * COMO: quando o TexInit falha, libertamos texturas que NAO sao desenhadas ha'
+ * muitos frames (idle) para compactar o heap, e re-tentamos UMA vez. As texturas
+ * idle sao recriadas automaticamente a partir de b->pixels (que vivem no heap
+ * malloc, intacto) quando o jogo voltar a precisar delas.
+ *
+ * SEGURANCA: antes de libertar, pomos *owner_slot=nullptr para o Bitmap dono
+ * saber que perdeu a textura (evita use-after-free no proximo blit). Texturas
+ * sem owner registado (owner_slot==nullptr) NUNCA sao evictadas.
+ *
+ * CUSTO: zero no caminho normal -- so' corre quando o TexInit ja' falhou (caso
+ * raro). GENERICO (engine-level): gestao de heap de texturas, nao especifico
+ * de nenhum jogo. */
+static const int TEX_EVICT_IDLE_FRAMES = 120; /* idle = sem blit ha' >=120 frames (~4s a 30fps) */
+static bool evict_idle_textures(DS3Texture* self, unsigned want_bytes, int frame_now) {
+    int      freed = 0;
+    unsigned freed_bytes = 0;
+    /* iterar sobre COPIA: free_texture modifica s_live_texs (swap-pop). */
+    std::vector<DS3Texture*> snapshot = s_live_texs;
+    for (size_t i = 0; i < snapshot.size(); i++) {
+        DS3Texture* t = snapshot[i];
+        if (t == self) continue;             /* nunca a propria */
+        if (!t->valid) continue;
+        if (!t->owner_slot) continue;        /* sem dono -> nao mexer (seguranca) */
+        /* idle = nunca desenhada (-1) OU sem blit ha' muito tempo */
+        if (t->last_blit_frame >= 0 &&
+            (frame_now - t->last_blit_frame) < TEX_EVICT_IDLE_FRAMES) continue;
+        /* avisar o dono ANTES de libertar (evita use-after-free) */
+        *(t->owner_slot) = nullptr;
+        freed_bytes += t->pot_bytes;
+        display_3ds_free_texture(t);         /* tira de s_live_texs + liberta heap */
+        freed++;
+        if (freed_bytes >= want_bytes) break; /* ja' chega para a textura nova */
+    }
+    if (freed > 0) {
+        printf("[TEX|EVICT] libertou %d texturas idle (%.0fKB) p/ caber %.0fKB\n",
+               freed, freed_bytes/1024.0, want_bytes/1024.0);
+    }
+    return freed > 0;
+}
+
+void display_3ds_set_texture_owner(DS3Texture* t, DS3Texture** slot) {
+    if (t) t->owner_slot = slot;
+}
+
 static inline int tex_bucket(unsigned b) {
     if (b <=   16u*1024) return 0;
     if (b <=   64u*1024) return 1;
@@ -109,16 +185,23 @@ void display_3ds_begin_frame() {
      * categorias poderem carimbar a que frame pertence o evento. */
     dbg_set_frame(s_frame_count);
 
+    /* SUPER LOG (DBG_SUPER, OFF por defeito): censo completo de recursos por
+     * intervalo. So' corre se a categoria estiver ligada -> custo zero quando
+     * desligada. Ligar: dbg_set_mask(dbg_get_mask() | DBG_SUPER); */
+    if (DBGV(DBG_SUPER) && s_super_every > 0 && (s_frame_count % s_super_every) == 0)
+        super_snapshot();
+
     /* [DBG] Frame 0,1,2 + cada 300: confirmar que o render está a arrancar */
     if (s_frame_count < 3 || s_frame_count % 300 == 0) {
         printf("[DISPLAY|FRAME] begin #%d "
                "(tex_ok=%d tex_fail=%d blit_total=%d)\n",
                s_frame_count, s_tex_created, s_tex_failed, s_blit_total);
         printf("[TEX|MEM] VIVAS=%d (pico %d) bytes_tex=%.0fKB (pico %.0fKB) | "
-               "linear_livre=%.0fKB vram_livre=%.0fKB\n",
+               "linear_livre=%.0fKB vram_livre=%.0fKB vram_tex=%d/%.0fKB\n",
                s_tex_alive, s_tex_alive_peak,
                s_tex_bytes/1024.0, s_tex_bytes_peak/1024.0,
-               linearSpaceFree()/1024.0, vramSpaceFree()/1024.0);
+               linearSpaceFree()/1024.0, vramSpaceFree()/1024.0,
+               s_tex_vram_live, s_tex_vram_bytes/1024.0);
         printf("[TEX|HIST] vivas: <=16K=%d <=64K=%d <=256K=%d <=1M=%d <=4M=%d >4M=%d | maior_POT=%dx%d\n",
                s_tex_hist[0], s_tex_hist[1], s_tex_hist[2], s_tex_hist[3],
                s_tex_hist[4], s_tex_hist[5], s_tex_big_w, s_tex_big_h);
@@ -154,17 +237,18 @@ void display_3ds_begin_frame() {
 void display_3ds_end_frame() {
     s_frame_count++;
 
-    /* HEARTBEAT: a cada 60 frames (~1x/seg) uma linha "vivo" com o nº de frame.
-     * Prova que o LOOP PRINCIPAL esta' a correr. Se o log parar de mostrar
-     * heartbeats, o jogo travou (e a ultima linha diz em que frame). Custo ~0
-     * (1 linha por segundo). Com o log line-buffered, ve-se em tempo real. */
-    if ((s_frame_count % 60) == 0) {
+    /* HEARTBEAT: prova de vida do LOOP PRINCIPAL (forense de crash: a ultima
+     * linha diz em que frame travou). Reduzido para 1x cada 300 frames (~5s a
+     * 60fps) e SEM duplicacao -- antes escrevia 2x (fprintf + macro printf, que
+     * tambem vai para o g_dbglog) e dava fflush a cada 60 frames, o que custava
+     * escrita SINCRONA ao SD com frequencia. Mantemos UM fflush aqui para a
+     * forense (a 1x/300f o custo e' irrelevante). */
+    if ((s_frame_count % 300) == 0) {
         extern FILE *g_dbglog;
         if (g_dbglog) {
             fprintf(g_dbglog, "[HEARTBEAT] vivo -- frame %d\n", s_frame_count);
             fflush(g_dbglog);
         }
-        printf("[HEARTBEAT] vivo -- frame %d\n", s_frame_count);
     }
 
     /* AUDIO (Fase 1): reciclar buffers de SE que ja' terminaram. Barato; corre
@@ -319,8 +403,48 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba) 
                s_tex_log_count + 1, w, h, tw, th, (tw*th*4)/1024.0f);
     }
 
-    /* [DBG] C3D_TexInit: falha mais comum = falta de VRAM */
-    if (!C3D_TexInit(&tex->tex, (u16)tw, (u16)th, GPU_RGBA8)) {
+    /* Tenta o heap linear (FCRAM) primeiro — caminho normal. */
+    bool init_ok = C3D_TexInit(&tex->tex, (u16)tw, (u16)th, GPU_RGBA8);
+
+    /* [fix] Heap linear cheio? Encaminha texturas pequenas para a VRAM livre
+     * em vez de falhar (e deixar a UI/texto por desenhar). Aditivo: so' corre
+     * quando o caminho normal ja' falhou, logo nunca piora o estado atual. */
+    if (!init_ok) {
+        unsigned want = (unsigned)(tw * th * 4);
+        if (want <= VRAM_OVERFLOW_MAX &&
+            vramSpaceFree() >= (want + VRAM_OVERFLOW_KEEP)) {
+            if (C3D_TexInitVRAM(&tex->tex, (u16)tw, (u16)th, GPU_RGBA8)) {
+                init_ok = true;
+                tex->in_vram = true;
+            }
+        }
+    }
+
+    /* [EVICT] Ultima tentativa antes de desistir: o heap linear pode ter espaco
+     * suficiente mas FRAGMENTADO (varios MB livres mas nenhum bloco contiguo
+     * grande). Libertar texturas idle compacta o heap. Re-tentamos UMA vez no
+     * heap linear. So' corre quando tudo o resto ja' falhou -> custo zero normal.
+     * Caso tipico: arte grande da intro/transicao (832x704 -> POT 1024x1024,
+     * 4MB) que nao cabe enquanto ha' dezenas de texturas de dialogo/mapa idle. */
+    if (!init_ok) {
+        unsigned want = (unsigned)(tw * th * 4);
+        if (evict_idle_textures(tex, want, s_frame_count)) {
+            init_ok = C3D_TexInit(&tex->tex, (u16)tw, (u16)th, GPU_RGBA8);
+            if (init_ok) {
+                printf("[TEX|EVICT] re-tentativa OK: %dx%d criada apos libertar idle\n", tw, th);
+            }
+            /* se ainda falhou e a textura e' pequena, tentar VRAM tambem */
+            if (!init_ok && want <= VRAM_OVERFLOW_MAX &&
+                vramSpaceFree() >= (want + VRAM_OVERFLOW_KEEP)) {
+                if (C3D_TexInitVRAM(&tex->tex, (u16)tw, (u16)th, GPU_RGBA8)) {
+                    init_ok = true;
+                    tex->in_vram = true;
+                }
+            }
+        }
+    }
+
+    if (!init_ok) {
         if ((s_tex_failed % 100) == 0) {
             printf("[TEX|CREATE] ERRO C3D_TexInit FALHOU: src=%dx%d POT=%dx%d (1 em cada 100)\n",
                    w, h, tw, th);
@@ -328,10 +452,11 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba) 
             printf("[TEX|CREATE]   → tex_ok=%d tex_fail=%d até agora\n",
                    s_tex_created, s_tex_failed + 1);
             printf("[TEX|MEM] VIVAS=%d (pico %d) bytes_tex=%.0fKB (pico %.0fKB) | "
-                   "linear_livre=%.0fKB vram_livre=%.0fKB\n",
+                   "linear_livre=%.0fKB vram_livre=%.0fKB vram_tex=%d/%.0fKB\n",
                    s_tex_alive, s_tex_alive_peak,
                    s_tex_bytes/1024.0, s_tex_bytes_peak/1024.0,
-                   linearSpaceFree()/1024.0, vramSpaceFree()/1024.0);
+                   linearSpaceFree()/1024.0, vramSpaceFree()/1024.0,
+                   s_tex_vram_live, s_tex_vram_bytes/1024.0);
             printf("[TEX|HIST] vivas: <=16K=%d <=64K=%d <=256K=%d <=1M=%d <=4M=%d >4M=%d | maior_POT=%dx%d\n",
                    s_tex_hist[0], s_tex_hist[1], s_tex_hist[2], s_tex_hist[3],
                    s_tex_hist[4], s_tex_hist[5], s_tex_big_w, s_tex_big_h);
@@ -384,13 +509,20 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba) 
         }
     }
 
-    C3D_TexFlush(&tex->tex);
+    /* VRAM e' memoria nao-cacheada: o flush de cache de dados nao e' necessario
+     * (e GSPGPU_FlushDataCache nem deve ser chamado sobre enderecos de VRAM).
+     * So' o caminho do heap linear (cacheado) precisa de flush. */
+    if (!tex->in_vram) C3D_TexFlush(&tex->tex);
 
     tex->valid = true;
     tex->pot_bytes = (unsigned)(tw * th * 4);
+    tex->create_frame    = s_frame_count;   /* SUPER: idade */
+    tex->last_blit_frame = -1;              /* SUPER: ainda nao desenhada */
+    s_live_texs.push_back(tex);             /* SUPER: registo de vivas */
     s_tex_created++;
     s_tex_alive++;
     s_tex_bytes += tex->pot_bytes;
+    if (tex->in_vram) { s_tex_vram_live++; s_tex_vram_bytes += tex->pot_bytes; }
     if (s_tex_alive > s_tex_alive_peak) s_tex_alive_peak = s_tex_alive;
     if (s_tex_bytes > s_tex_bytes_peak) s_tex_bytes_peak = s_tex_bytes;
     s_tex_hist[tex_bucket(tex->pot_bytes)]++;
@@ -416,6 +548,14 @@ void display_3ds_free_texture(DS3Texture* t) {
         printf("[TEX|FREE] chamado com t=NULL (double-free?)\n");
         return;
     }
+    /* SUPER: tirar do registo de vivas (swap-pop). */
+    for (size_t i = 0; i < s_live_texs.size(); i++) {
+        if (s_live_texs[i] == t) {
+            s_live_texs[i] = s_live_texs.back();
+            s_live_texs.pop_back();
+            break;
+        }
+    }
     /* Este log disparava por-frame no menu de load (texturas 408x222 recriadas
      * a cada frame) -> escrita ao SD constante -> 1 FPS. Movido para a categoria
      * DBG_TEXTURE, DESLIGADA por defeito. Para diagnosticar texturas outra vez:
@@ -428,13 +568,136 @@ void display_3ds_free_texture(DS3Texture* t) {
         printf("[TEX|FREE]   → create_texture falhou e caller não verificou nullptr?\n");
     }
     if (t->valid) {
-        C3D_TexDelete(&t->tex);
+        /* VRAM e linear vêm de alocadores diferentes: libertar pelo caminho
+         * certo (vramFree vs linearFree/C3D_TexDelete) evita corrupcao do heap. */
+        if (t->in_vram) {
+            if (t->tex.data) vramFree(t->tex.data);
+            t->tex.data = nullptr;
+            s_tex_vram_live--;
+            if (s_tex_vram_bytes >= t->pot_bytes) s_tex_vram_bytes -= t->pot_bytes;
+            else                                  s_tex_vram_bytes = 0;
+        } else {
+            C3D_TexDelete(&t->tex);
+        }
         s_tex_alive--;
         s_tex_hist[tex_bucket(t->pot_bytes)]--;
         if (s_tex_bytes >= t->pot_bytes) s_tex_bytes -= t->pot_bytes;
         else                             s_tex_bytes = 0;
     }
     delete t;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * super_snapshot  (DBG_SUPER, OFF por defeito)
+ * Censo COMPLETO de recursos GPU por intervalo, num so' bloco:
+ *   - OCUPACAO   : texturas vivas, bytes, heap linear livre, VRAM livre
+ *   - THRESHOLD  : limites (POT max, cap de overflow p/ VRAM, pico de linear)
+ *   - HIST       : distribuicao por tamanho
+ *   - DELTA      : criadas/libertadas e objetos Ruby criados/libertados no intervalo
+ *   - CARREGADA  : texturas NOVAS desde o ultimo snapshot (tamanho/POT/local)
+ *   - PESO       : top por bytes (% do total) + NECESSIDADE (desenhada vs ociosa)
+ *   - NECESSIDADE: agregado de vivas nao desenhadas ha' muito = candidatas a fuga
+ * Generico (engine-level), nao game-specific. Custo zero quando DBG_SUPER off.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void super_snapshot(void) {
+    static int      prev_frame   = 0;
+    static int      prev_created = 0;
+    static int      prev_freedc  = 0;   /* libertadas cumulativo = criadas - vivas */
+    static uint64_t prev_objs    = 0;
+    static uint64_t prev_frees   = 0;
+
+    int fdelta = s_frame_count - prev_frame; if (fdelta <= 0) fdelta = 1;
+    int freedc = s_tex_created - s_tex_alive;
+    int cre_i  = s_tex_created - prev_created;
+    int fre_i  = freedc        - prev_freedc;
+    uint64_t obj_i  = (g_prof_objs_created >= prev_objs)  ? (g_prof_objs_created - prev_objs)  : 0;
+    uint64_t fre_oi = (g_prof_frees        >= prev_frees) ? (g_prof_frees        - prev_frees) : 0;
+
+    double tex_kb = s_tex_bytes/1024.0, pk_kb = s_tex_bytes_peak/1024.0;
+
+    printf("\n========== [SUPER] frame=%d (+%d frames desde o ultimo snapshot) ==========\n",
+           s_frame_count, fdelta);
+
+    printf("[SUPER|OCUPACAO] texturas_vivas=%d (pico %d) | bytes_tex=%.0fKB (pico %.0fKB)\n",
+           s_tex_alive, s_tex_alive_peak, tex_kb, pk_kb);
+    printf("[SUPER|OCUPACAO] heap_linear_livre=%.0fKB | VRAM_livre=%.0fKB | em_VRAM=%d tex/%.0fKB\n",
+           linearSpaceFree()/1024.0, vramSpaceFree()/1024.0,
+           s_tex_vram_live, s_tex_vram_bytes/1024.0);
+
+    printf("[SUPER|THRESHOLD] POT_max=1024x1024 (4MB/tex) | overflow_VRAM<=%.0fKB (folga %.0fKB) | pico_linear=%.0fKB\n",
+           VRAM_OVERFLOW_MAX/1024.0, VRAM_OVERFLOW_KEEP/1024.0, pk_kb);
+
+    printf("[SUPER|HIST] <=16K=%d <=64K=%d <=256K=%d <=1M=%d <=4M=%d >4M=%d | maior=%dx%d\n",
+           s_tex_hist[0],s_tex_hist[1],s_tex_hist[2],s_tex_hist[3],s_tex_hist[4],s_tex_hist[5],
+           s_tex_big_w,s_tex_big_h);
+
+    printf("[SUPER|DELTA] texturas: +%d criadas, -%d libertadas (net %+d) | blits_total=%d falhas_tex=%d\n",
+           cre_i, fre_i, cre_i - fre_i, s_blit_total, s_tex_failed);
+    printf("[SUPER|DELTA] objetos_Ruby: +%llu criados, -%llu libertados (net %+lld) neste intervalo\n",
+           (unsigned long long)obj_i, (unsigned long long)fre_oi,
+           (long long)((long long)obj_i - (long long)fre_oi));
+
+    /* CARREGADAS neste intervalo */
+    {
+        int shown = 0, total_new = 0; double new_kb = 0;
+        for (size_t i = 0; i < s_live_texs.size(); i++) {
+            DS3Texture* t = s_live_texs[i];
+            if (t->create_frame > prev_frame) {
+                total_new++; new_kb += t->pot_bytes/1024.0;
+                if (shown < 20) {
+                    printf("[SUPER|CARREGADA] src=%dx%d pot=%.0fKB %s (criada f=%d)\n",
+                           t->width, t->height, t->pot_bytes/1024.0,
+                           t->in_vram ? "VRAM" : "linear", t->create_frame);
+                    shown++;
+                }
+            }
+        }
+        printf("[SUPER|CARREGADA] total_novas=%d (%.0fKB)%s\n",
+               total_new, new_kb, (total_new>shown) ? " [lista truncada a 20]" : "");
+    }
+
+    /* TOP por PESO + NECESSIDADE */
+    {
+        std::vector<DS3Texture*> tmp(s_live_texs);
+        std::sort(tmp.begin(), tmp.end(),
+                  [](DS3Texture* a, DS3Texture* b){ return a->pot_bytes > b->pot_bytes; });
+        size_t topn = tmp.size() < 12 ? tmp.size() : 12;
+        for (size_t i = 0; i < topn; i++) {
+            DS3Texture* t = tmp[i];
+            double pct = (s_tex_bytes>0) ? (100.0 * t->pot_bytes / (double)s_tex_bytes) : 0.0;
+            int idade = s_frame_count - t->create_frame;
+            int desde = (t->last_blit_frame < 0) ? -1 : (s_frame_count - t->last_blit_frame);
+            const char* tag = (t->last_blit_frame < 0) ? "NUNCA-DESENHADA"
+                            : (desde <= fdelta)         ? "DESENHADA"
+                            : (desde > 2*s_super_every) ? "OCIOSA(suspeita-fuga)"
+                            :                             "ociosa";
+            char db[16];
+            if (desde < 0) snprintf(db, sizeof(db), "nunca");
+            else           snprintf(db, sizeof(db), "%df", desde);
+            printf("[SUPER|PESO] #%u src=%dx%d %.0fKB (%.1f%%) %s idade=%df ult_desenho=%s -> %s\n",
+                   (unsigned)(i+1), t->width, t->height, t->pot_bytes/1024.0, pct,
+                   t->in_vram ? "VRAM" : "lin", idade, db, tag);
+        }
+    }
+
+    /* NECESSIDADE agregada: vivas nao desenhadas ha' > 1 intervalo = fuga/cache */
+    {
+        int idle_n = 0; double idle_kb = 0;
+        for (size_t i = 0; i < s_live_texs.size(); i++) {
+            DS3Texture* t = s_live_texs[i];
+            int desde = (t->last_blit_frame < 0) ? (s_frame_count - t->create_frame)
+                                                 : (s_frame_count - t->last_blit_frame);
+            if (desde > s_super_every) { idle_n++; idle_kb += t->pot_bytes/1024.0; }
+        }
+        printf("[SUPER|NECESSIDADE] vivas_nao_desenhadas_ha_>%df = %d tex / %.0fKB "
+               "(candidatas a fuga/cache; perto de 0 fora de transicoes)\n",
+               s_super_every, idle_n, idle_kb);
+    }
+
+    printf("==========================================================================\n\n");
+
+    prev_frame = s_frame_count; prev_created = s_tex_created; prev_freedc = freedc;
+    prev_objs  = g_prof_objs_created; prev_frees = g_prof_frees;
 }
 
 /* Define o filtro de amostragem da textura (mag, min). Custo zero: e' so' um
@@ -477,6 +740,7 @@ void display_3ds_blit(DS3Texture* t,
 
     s_blit_count++;
     s_blit_total++;
+    t->last_blit_frame = s_frame_count;   /* SUPER: necessidade (foi desenhada) */
 
     /* GUARDA: opacity do sprite e' INT e pode sair de [0,255] (ex: fade do
      * MODTS faz opacity += float). alpha>1.0 ou <0.0 da cor/transparencia
@@ -580,6 +844,7 @@ void display_3ds_blit_ex(DS3Texture* t,
 
     s_blit_count++;
     s_blit_total++;
+    t->last_blit_frame = s_frame_count;   /* SUPER: necessidade (foi desenhada) */
 
     /* GUARDA: opacity do sprite e' INT e pode sair de [0,255] (ex: fade do
      * MODTS faz opacity += float). alpha>1.0 ou <0.0 da cor/transparencia
@@ -620,9 +885,11 @@ void display_3ds_blit_ex(DS3Texture* t,
     float v_bottom = 1.0f - ((sy + sh) / th);
 
     /* DIAG TEXFLOW: blit de um bitmap COM TEXTO para o ecra. Mapeamento EXACTO
-     * src->dst + fator de stretch. Throttle 1x/12 frames (mapeamento constante
-     * durante a mensagem). Incondicional. */
-    if (t->has_text && (s_frame_count % 12 == 0)) {
+     * src->dst + fator de stretch. Agora atras de DBG_SUPER (off por defeito): a
+     * caixa de dialogo esta' resolvida ("Perfeito") e o fluxo de texto ja' foi
+     * diagnosticado, por isso nao precisa de escrever ~1x/12f durante cada
+     * mensagem no perfil de jogo. Reativa com DBG_SUPER. */
+    if (DBGV(DBG_SUPER) && t->has_text && (s_frame_count % 12 == 0)) {
         printf("[TEXFLOW|SCR] f%d texbmp=%dx%d src=(%.0f,%.0f,%.0fx%.0f) -> dst=%.1fx%.1f @(%.1f,%.1f) stretch=x%.2f,y%.2f\n",
                s_frame_count, t->width, t->height, sx, sy, sw, sh,
                fdw, fdh, fdx, fdy,

@@ -93,6 +93,10 @@ void sprites_draw_all() {
             if (s->bitmap->pixels && s->bitmap->width > 0 && s->bitmap->height > 0) {
                 s->bitmap->tex = display_3ds_create_texture(
                     s->bitmap->width, s->bitmap->height, s->bitmap->pixels);
+                /* [EVICT] registar o slot do dono (&s->bitmap->tex) para eviccao
+                 * segura: se esta textura for libertada por falta de heap linear,
+                 * o campo fica nullptr e e' recriada a partir de pixels (em RAM). */
+                display_3ds_set_texture_owner(s->bitmap->tex, &s->bitmap->tex);
                 /* FIX BORRAO: este caminho (sprites) cria a textura DIRETAMENTE,
                  * sem passar pelo bmp_flush -> o filtro LINEAR p/ texto NUNCA era
                  * aplicado aqui. Resultado: o conteudo de texto das caixas (que e'
@@ -111,6 +115,29 @@ void sprites_draw_all() {
 
         int src_w = s->src_w > 0 ? s->src_w : s->bitmap->width;
         int src_h = s->src_h > 0 ? s->src_h : s->bitmap->height;
+
+        /* [DIAG SETAS] Generico: deteta uma TIRA de animacao (sprite-sheet
+         * horizontal) desenhada SEM recorte de frame (src_rect por definir) ->
+         * todos os frames aparecem de uma vez. E' a causa mais provavel das
+         * "4 setas ▼" (downarrow ~224x40 com ~4 frames). NAO altera o desenho;
+         * regista 1x por dimensao unica para identificar o bitmap no log e
+         * confirmar se vem com src_rect ou nao. */
+        if (s->src_w <= 0 && s->bitmap->height > 0 && s->bitmap->height <= 64
+                          && s->bitmap->width >= 3 * s->bitmap->height) {
+            static int seenW[24] = {0}, seenH[24] = {0}, seenN = 0;
+            bool seen = false;
+            for (int i = 0; i < seenN; i++)
+                if (seenW[i] == s->bitmap->width && seenH[i] == s->bitmap->height) { seen = true; break; }
+            if (!seen && seenN < 24) {
+                seenW[seenN] = s->bitmap->width; seenH[seenN] = s->bitmap->height; seenN++;
+                printf("[SHEET?] tira sem src_rect: bmp=%dx%d desenhada INTEIRA -> "
+                       "dst=%.0fx%.0f @(%.0f,%.0f) vis=%d op=%d (provavel multi-frame)\n",
+                       s->bitmap->width, s->bitmap->height,
+                       (double)(s->bitmap->width  * s->zoom_x),
+                       (double)(s->bitmap->height * s->zoom_y),
+                       (double)s->x, (double)s->y, s->visible ? 1 : 0, s->opacity);
+            }
+        }
 
         /* FIX BUG 5: tamanho de destino tem em conta zoom.
          * zoom_x/zoom_y por omissão são 1.0, por isso não afecta o caso normal.

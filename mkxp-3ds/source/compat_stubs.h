@@ -390,19 +390,67 @@ begin
 rescue; end
 
 # -- Plane ---------------------------------------------------------------------
-# FIX: Plane é uma classe Ruby pura (sem binding C++) -- definir normalmente.
+# FIX: Plane é uma classe Ruby pura (sem binding C++). O motor 3DS so' desenha
+# Sprites (g_sprites), por isso um Plane sem Sprite interno NUNCA aparece -- o
+# background de cenas Essentials que usam addBackgroundPlane (ecra de nome
+# "Naming/bg_2", Trainer Card "Trainer Card/bg", creditos, etc.) ficava por
+# desenhar e no seu lugar via-se lixo de VRAM (padrao xadrez amarelo). Damos ao
+# Plane um Sprite interno que mostra o @bitmap, espelhando o que ja' se faz na
+# classe Window (@__csprite). ox/oy (scroll do plano) -> deslocam o sprite;
+# visible/z/opacity/zoom/blend sincronizados. Sem custo por-frame extra alem do
+# que o Sprite ja' tem. Generico p/ qualquer cena RMXP/Essentials.
 begin
   class Plane
-    attr_accessor :bitmap,:visible,:z,:ox,:oy,:zoom_x,:zoom_y,:opacity
-    attr_accessor :blend_type,:color,:tone,:viewport
+    attr_accessor :zoom_x,:zoom_y,:opacity,:blend_type,:color,:tone,:viewport
     def initialize(viewport=nil)
       @visible=true; @z=0; @ox=0; @oy=0; @zoom_x=1.0; @zoom_y=1.0
       @opacity=255; @blend_type=0; @color=Color.new(0,0,0,0)
-      @tone=Tone.new; @viewport=viewport; @disposed=false
+      @tone=Tone.new; @viewport=viewport; @disposed=false; @bitmap=nil
+      begin
+        @__psprite = Sprite.new(@viewport)
+        @__psprite.z = @z
+      rescue
+        @__psprite = nil
+      end
     end
+    def bitmap; @bitmap; end
+    def bitmap=(v)
+      @bitmap = v
+      begin
+        if @__psprite && !@__psprite.disposed?
+          @__psprite.bitmap = v
+          __sync_psprite
+        end
+      rescue; end
+      v
+    end
+    def __sync_psprite
+      return unless @__psprite && (@__psprite.disposed? rescue true)==false
+      begin
+        @__psprite.x = -(@ox || 0)
+        @__psprite.y = -(@oy || 0)
+        @__psprite.z = @z
+        @__psprite.visible = @visible
+        @__psprite.opacity = @opacity
+        (@__psprite.zoom_x = @zoom_x) rescue nil
+        (@__psprite.zoom_y = @zoom_y) rescue nil
+        (@__psprite.blend_type = @blend_type) rescue nil
+      rescue; end
+    end
+    def visible; @visible; end
+    def visible=(v); @visible=v; __sync_psprite; v; end
+    def z; @z; end
+    def z=(v); @z=v; __sync_psprite; v; end
+    def ox; @ox; end
+    def ox=(v); @ox=v; __sync_psprite; v; end
+    def oy; @oy; end
+    def oy=(v); @oy=v; __sync_psprite; v; end
     def disposed?; @disposed; end
-    def dispose; @disposed=true; end
-    def update; end
+    def dispose
+      @disposed=true
+      begin; @__psprite.dispose if @__psprite && !@__psprite.disposed?; rescue; end
+    end
+    def update; __sync_psprite; end
   end
 rescue; end
 
@@ -2072,22 +2120,29 @@ begin
 rescue; end
 
 # -- AnimatedPlane stub --------------------------------------------------------
-# Spriteset_Map usa AnimatedPlane para panorama e fog.
+# Spriteset_Map usa AnimatedPlane para panorama e fog; addBackgroundPlane usa-o
+# para fundos de cena. Herda o render do Plane (sprite interno): todos os
+# caminhos que definem o bitmap (setBitmap/setPanorama/setFog/bitmap=) passam
+# pelo setter bitmap= do pai (super) para o sprite ser atualizado e DESENHADO.
 begin
   unless Object.const_defined?(:AnimatedPlane)
     class AnimatedPlane < Plane
-      def initialize(viewport=nil); super; @bmp=nil; end
-      def setPanorama(name,hue=0)
-        if name.nil?
-          @bitmap=nil
+      def initialize(viewport=nil); super; end
+      def setBitmap(name,hue=0)
+        if name.nil? || name.to_s.empty?
+          self.bitmap = nil
         else
-          begin; @bitmap=AnimatedBitmap.new(name,hue).deanimate; rescue; @bitmap=nil; end
+          begin
+            bmp = AnimatedBitmap.new(name,hue).deanimate
+            self.bitmap = bmp
+          rescue
+            self.bitmap = nil
+          end
         end
       end
-      def setFog(name,hue=0); setPanorama(name,hue); end
-      def update; end
-      def bitmap; @bitmap; end
-      def bitmap=(v); @bitmap=v; end
+      def setPanorama(name,hue=0); setBitmap(name,hue); end
+      def setFog(name,hue=0); setBitmap(name,hue); end
+      def update; super; end
     end
   end
 rescue; end

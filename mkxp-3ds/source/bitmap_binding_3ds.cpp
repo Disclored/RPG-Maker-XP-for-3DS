@@ -104,10 +104,16 @@ void __attribute__((used)) bmp_flush(Bitmap3DS *b) {
         b->tex = display_3ds_create_texture(b->width, b->height, b->pixels);
         if (!b->tex)
             printf("[BMP] AVISO: create_texture falhou %dx%d\n", b->width, b->height);
-        else if (b->has_text) {
-            /* texto: LINEAR no downscale (GPU, custo zero) -> legivel em vez de papa */
-            display_3ds_set_texture_filter(b->tex, true);
-            b->tex->has_text = true;   /* DIAG: marca a textura p/ log TEXFLOW no ecra */
+        else {
+            /* [EVICT] registar o slot do dono para eviccao segura: se esta
+             * textura for libertada por falta de heap, b->tex fica a nullptr e
+             * e' recriada a partir de b->pixels (intactos em RAM) quando precisar. */
+            display_3ds_set_texture_owner(b->tex, &b->tex);
+            if (b->has_text) {
+                /* texto: LINEAR no downscale (GPU, custo zero) -> legivel em vez de papa */
+                display_3ds_set_texture_filter(b->tex, true);
+                b->tex->has_text = true;   /* DIAG: marca a textura p/ log TEXFLOW no ecra */
+            }
         }
     }
     b->tex_dirty = false;
@@ -230,12 +236,43 @@ static Bitmap3DS *bmp_load_file(const char *path) {
         if (g_dbglog) fflush(g_dbglog);
     }
     fflush(stdout);
+    /* [FALLBACK-COR] Escolher a cor do placeholder 32x32 conforme a pasta:
+     *  - Graphics/Pictures/*  -> TRANSPARENTE (alpha=0). Sao imagens decorativas/
+     *    opcionais (retratos, overlays de cutscene). No PC, um bitmap em falta
+     *    aqui fica invisivel; o magenta tornava-o um quadrado gritante (ex:
+     *    PlayerSprites/0 na cutscene da Xenia). Transparente iguala o PC.
+     *  - Tudo o resto (System/, Windowskins/, Tilesets/, etc.) -> MAGENTA visivel,
+     *    porque aí um asset em falta E' um erro real que convem ver no ecra.
+     * O logging [BMP|MISS] acima mantem-se intacto em ambos os casos -> o
+     * diagnostico continua completo no log, so' muda a COR mostrada. */
+    bool is_picture = false;
+    if (path) {
+        for (const char *p = path; *p; p++) {
+            if ((p[0]=='P'||p[0]=='p') &&
+                (strncmp(p, "Pictures/", 9) == 0 || strncmp(p, "pictures/", 9) == 0)) {
+                is_picture = true; break;
+            }
+        }
+    }
     Bitmap3DS *b = bmp_alloc(32, 32);
-    for (int i = 0; i < 32 * 32; i++) {
-        b->pixels[i*4+0] = 255;
-        b->pixels[i*4+1] = 0;
-        b->pixels[i*4+2] = 255;
-        b->pixels[i*4+3] = 255;
+    if (is_picture) {
+        /* transparente: alpha=0 (RGB irrelevante) -> invisivel, como no PC */
+        for (int i = 0; i < 32 * 32; i++) {
+            b->pixels[i*4+0] = 0;
+            b->pixels[i*4+1] = 0;
+            b->pixels[i*4+2] = 0;
+            b->pixels[i*4+3] = 0;
+        }
+        extern FILE *g_dbglog;
+        if (g_dbglog) fprintf(g_dbglog, "[BMP|MISS]   -> fallback TRANSPARENTE (e' Pictures, decorativo)\n");
+    } else {
+        /* magenta opaco: erro de asset visivel (System/Windowskins/Tilesets...) */
+        for (int i = 0; i < 32 * 32; i++) {
+            b->pixels[i*4+0] = 255;
+            b->pixels[i*4+1] = 0;
+            b->pixels[i*4+2] = 255;
+            b->pixels[i*4+3] = 255;
+        }
     }
     b->tex_dirty = true;
     bmp_flush(b);
@@ -325,7 +362,21 @@ mrb_value bmp_init(mrb_state *mrb, mrb_value self) {
 
 static mrb_value bmp_dispose(mrb_state*, mrb_value self) {
     Bitmap3DS *b = GET_BMP(self);
-    if (b) b->disposed = true;
+    if (b && !b->disposed) {
+        /* RGSS semantics: dispose() must release GPU + CPU memory IMMEDIATELY,
+         * not defer to GC. This is critical on 3DS hardware: the linear heap
+         * (texture memory) is small (~32MB) and RMXP games dispose bitmaps
+         * constantly (scene transitions, temporary sprites, message boxes,
+         * animations). Deferring the free to GC lets disposed textures pile up
+         * in the linear heap under allocation churn -> heap exhaustion and
+         * C3D_TexInit failures. Freeing here is generic and correct for any
+         * RPG Maker XP game. bitmap_free() (GC path) is null-safe, so the
+         * eventual collection of this object will not double-free. */
+        if (b->tex)    { display_3ds_free_texture(b->tex); b->tex = nullptr; }
+        if (b->pixels) { free(b->pixels); b->pixels = nullptr; }
+        b->tex_dirty = false;
+        b->disposed  = true;
+    }
     return mrb_nil_value();
 }
 static mrb_value bmp_disposed(mrb_state*, mrb_value self) {
@@ -358,7 +409,7 @@ static mrb_value bmp_clear(mrb_state*, mrb_value self) {
 
 static mrb_value bmp_fill_rect(mrb_state *mrb, mrb_value self) {
     Bitmap3DS *b = GET_BMP(self);
-    if (!b) return mrb_nil_value();
+    if (!b || !b->pixels) return mrb_nil_value();
 
     int x = 0, y = 0, w = 0, h = 0;
     float cr = 255, cg = 255, cb = 255, ca = 255;
@@ -394,7 +445,7 @@ static mrb_value bmp_fill_rect(mrb_state *mrb, mrb_value self) {
 
 static mrb_value bmp_blt(mrb_state *mrb, mrb_value self) {
     Bitmap3DS *dst = GET_BMP(self);
-    if (!dst) return mrb_nil_value();
+    if (!dst || !dst->pixels) return mrb_nil_value();
     mrb_int dx, dy, opacity = 255;
     mrb_value srco, sro;
     mrb_get_args(mrb, "iioo|i", &dx, &dy, &srco, &sro, &opacity);
@@ -418,6 +469,34 @@ static mrb_value bmp_blt(mrb_state *mrb, mrb_value self) {
         }
     }
     dst->tex_dirty = true;
+    /* ── [SHEET?|BLT] Diagnóstico das "4 setas" ───────────────────────────────
+     * O caminho de sprite ([SHEET?]) não disparou para a downarrow 224x40 -> a
+     * tira de setas deve ser desenhada por BLT (copiada para os "contents" da
+     * janela), não como sprite. Aqui detetamos uma TIRA horizontal (folha de
+     * frames: altura<=64 e largura>=3x altura) copiada com a LARGURA TODA
+     * (sw>=largura da origem) -> ou seja, todas as frames de uma vez, em vez de
+     * recortar uma só (o que produz o efeito visual de várias setas lado a lado).
+     * Dedup por dimensão (máx. 16), escreve no g_dbglog (aparece no log .txt).
+     * Só diagnóstico: identifica a origem para o conserto definitivo. */
+    if (src->height > 0 && src->height <= 64 && !src->has_text &&
+        src->width >= 3 * src->height && sw >= src->width) {
+        static int seen_w[16], seen_h[16], seen_n = 0;
+        bool dup = false;
+        for (int i = 0; i < seen_n; i++)
+            if (seen_w[i] == src->width && seen_h[i] == src->height) { dup = true; break; }
+        if (!dup && seen_n < 16) {
+            seen_w[seen_n] = src->width; seen_h[seen_n] = src->height; seen_n++;
+            extern FILE *g_dbglog;
+            if (g_dbglog) {
+                fprintf(g_dbglog,
+                    "[SHEET?|BLT] tira %dx%d copiada INTEIRA por blt (sw=%d, sx0=%d) "
+                    "-> SUSPEITA das setas (todas as frames de uma vez). dst=%dx%d @(%d,%d)\n",
+                    src->width, src->height, sw, sx0,
+                    dst->width, dst->height, (int)dx, (int)dy);
+                fflush(g_dbglog);
+            }
+        }
+    }
     /* DIAG TEXFLOW: copia que ENVOLVE texto (origem ou destino). Mostra a cadeia:
      * bitmap-de-texto -> contents/janela. Incondicional (so' p/ bitmaps de texto,
      * nao inunda com o tilemap). Se a origem tem texto, o destino passa a ter
@@ -438,7 +517,7 @@ static mrb_value bmp_blt(mrb_state *mrb, mrb_value self) {
 
 static mrb_value bmp_stretch_blt(mrb_state *mrb, mrb_value self) {
     Bitmap3DS *dst = GET_BMP(self);
-    if (!dst) return mrb_nil_value();
+    if (!dst || !dst->pixels) return mrb_nil_value();
 
     mrb_value dro, srco, sro;
     mrb_int opacity = 255;
@@ -485,6 +564,27 @@ static mrb_value bmp_stretch_blt(mrb_state *mrb, mrb_value self) {
         }
     }
     dst->tex_dirty = true;
+    /* [SHEET?|STRETCH] mesma heurística do blt, para o caminho de stretch_blt:
+     * tira horizontal (h<=64, w>=3h, não-texto) esticada com a LARGURA TODA
+     * (sw>=largura da origem) = todas as frames de uma vez -> suspeita das setas. */
+    if (src->height > 0 && src->height <= 64 && !src->has_text &&
+        src->width >= 3 * src->height && sw >= src->width) {
+        static int seen_w[16], seen_h[16], seen_n = 0;
+        bool dup = false;
+        for (int i = 0; i < seen_n; i++)
+            if (seen_w[i] == src->width && seen_h[i] == src->height) { dup = true; break; }
+        if (!dup && seen_n < 16) {
+            seen_w[seen_n] = src->width; seen_h[seen_n] = src->height; seen_n++;
+            extern FILE *g_dbglog;
+            if (g_dbglog) {
+                fprintf(g_dbglog,
+                    "[SHEET?|STRETCH] tira %dx%d esticada INTEIRA (sw=%d, sx0=%d) -> "
+                    "SUSPEITA das setas. dst d=(%d,%d,%d,%d)\n",
+                    src->width, src->height, sw, sx0, dx, dy, dw, dh);
+                fflush(g_dbglog);
+            }
+        }
+    }
     /* DIAG TEXFLOW: ESTICAMENTO que envolve texto. ESTE e' o suspeito principal:
      * se o bitmap de texto (ex: 216x32) for esticado para a janela (ex: 512x96),
      * o fator de stretch >1 explica o borrao. Incondicional p/ bitmaps de texto. */
@@ -571,7 +671,7 @@ static u32 fnt_utf8_next(const char *s, int len, int *i) {
 /* Escala do texto. A fonte do sistema e' grande (~30px de linha); o RGSS usa
  * tipicamente ~24-32px de altura de linha. Usamos uma escala que da' ~22px de
  * altura, adequada para caber nas caixas do Essentials. */
-static const float FNT_SCALE = 0.70f;
+static const float FNT_SCALE = 0.65f;
 
 /* Garante que a fonte do sistema esta' carregada e mapeada. fontGetSystemFont()
  * pode devolver a fonte mas as sheets de glifos so' ficam acessiveis apos
@@ -795,7 +895,7 @@ static mrb_value bmp_get_pixel(mrb_state *mrb, mrb_value self) {
     Bitmap3DS *b = GET_BMP(self);
     mrb_int x, y; mrb_get_args(mrb, "ii", &x, &y);
     float r = 0, g = 0, bl = 0, a = 0;
-    if (b && x >= 0 && y >= 0 && x < b->width && y < b->height) {
+    if (b && b->pixels && x >= 0 && y >= 0 && x < b->width && y < b->height) {
         int idx = (y * b->width + x) * 4;
         r = b->pixels[idx]; g = b->pixels[idx+1];
         bl = b->pixels[idx+2]; a = b->pixels[idx+3];
@@ -813,7 +913,7 @@ static mrb_value bmp_set_pixel(mrb_state *mrb, mrb_value self) {
     mrb_int x, y; mrb_value co;
     mrb_get_args(mrb, "iio", &x, &y, &co);
     float cr, cg, cb2, ca;
-    if (b && extract_color(mrb, co, &cr, &cg, &cb2, &ca)
+    if (b && b->pixels && extract_color(mrb, co, &cr, &cg, &cb2, &ca)
          && x >= 0 && y >= 0 && x < b->width && y < b->height) {
         int idx = (y * b->width + x) * 4;
         b->pixels[idx]   = (unsigned char)cr;

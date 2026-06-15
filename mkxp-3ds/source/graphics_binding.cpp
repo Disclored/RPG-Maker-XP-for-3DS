@@ -2,6 +2,7 @@
 #include <mruby/class.h>
 #include <mruby/variable.h>
 #include <mruby/string.h>
+#include <mruby/gc.h>
 #include <3ds.h>
 #include "display_3ds.h"
 #include "input_3ds.h"
@@ -228,6 +229,25 @@ static mrb_value grph_freeze(mrb_state *mrb, mrb_value self) {
            s_freeze_count, s_frame_count);
     dbg_dump_scene(mrb, "freeze");
     printf("[GFX|FREEZE]   → ecrã ficará preto até Graphics.transition() ser chamado!\n");
+
+    /* ── [FCRAM] full_gc determinístico na transição de cena ──────────────────
+     * O freeze marca SEMPRE uma troca de cena em RMXP (o ecrã fica congelado a
+     * seguir). Aproveitamos esse instante — em que o jogo não está a desenhar —
+     * para correr um full GC: o "hitch" fica invisível (ecrã congelado) e a
+     * cena seguinte, que vai alocar muitos bitmaps/objetos, encontra o heap
+     * malloc limpo. Isto ataca diretamente o OOM observado ([POOL|GROW] malloc
+     * FALHOU) que acontecia DURANTE diálogos longos logo após uma transição:
+     * o lixo Ruby acumulado da cena anterior é recolhido antes do pico, em vez
+     * de forçar o pool a crescer até esgotar a FCRAM. Genérico para qualquer
+     * jogo RMXP. mrb_full_gc é sempre seguro. */
+    {
+        size_t vivos_antes = mrb->gc.live;
+        mrb_full_gc(mrb);
+        size_t vivos_depois = mrb->gc.live;
+        printf("[GC|FREEZE] full_gc na transicao: vivos %u -> %u (recolheu %d)\n",
+               (unsigned)vivos_antes, (unsigned)vivos_depois,
+               (int)((long)vivos_antes - (long)vivos_depois));
+    }
     return mrb_nil_value();
 }
 
