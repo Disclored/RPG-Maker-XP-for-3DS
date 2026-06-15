@@ -18,6 +18,14 @@ struct Bitmap3DS {
                                * downscale (texto pequeno fica legivel; o NEAREST
                                * larga pixeis e parte as letras). Filtro de GPU =
                                * custo zero (sem CPU/RAM extra). */
+    bool           tex_failed; /* true = a criacao da textura GPU JA' falhou para
+                               * este bitmap (ex: imagem >1024 que nao cabe no POT
+                               * 1024x1024, ou VRAM esgotada de forma persistente).
+                               * Evita re-tentar create_texture TODOS os frames
+                               * (que fazia EVICT-thrashing + C3D_TexInit em loop ->
+                               * 2.2 fps). Limpo automaticamente quando tex_dirty
+                               * volta a true (pixels mudaram -> vale a pena tentar
+                               * outra vez). */
 };
 
 extern const mrb_data_type Bitmap3DSType;

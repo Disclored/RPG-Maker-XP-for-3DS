@@ -1658,16 +1658,29 @@ rescue; end
 # O script FileTests (script 19) redefine FileTest.exists? com validate interno
 # que chama o binding C nativo com assinatura incompativel -> ArgumentError.
 # Redefinimos AQUI, depois de todos os scripts carregarem, para garantir override.
+# FIX RAIZ (recursos em subpastas que nao carregavam, ex: teclado "Naming/bg_2"):
+# antes estes metodos devolviam SEMPRE false -> safeExists?/pbResolveBitmap davam
+# nil -> addBackgroundPlane fazia bitmap=nil -> Plane invisivel -> faixa amber
+# visivel por tras. Agora exist?/file? perguntam ao loader C++ nativo
+# (Bitmap._native_exist?), que testa o ficheiro nas raizes do jogo + extensoes --
+# exactamente o que o loader de imagens faz. Assim o que existe no SD passa a ser
+# encontrado, em qualquer subpasta. Generico p/ todo o jogo.
 begin
   module FileTest
-    def self.exist?(p);       false; end
-    def self.exists?(p);      false; end
-    def self.file?(p);        false; end
+    def self.__mkxp_exist?(p)
+      return false if !p
+      s = p.to_s
+      return false if s.empty?
+      (Bitmap._native_exist?(s) rescue false)
+    end
+    def self.exist?(p);       __mkxp_exist?(p); end
+    def self.exists?(p);      __mkxp_exist?(p); end
+    def self.file?(p);        __mkxp_exist?(p); end
     def self.directory?(p);   false; end
-    def self.audio_exist?(p); false; end
+    def self.audio_exist?(p); __mkxp_exist?(p); end
     def self.size?(p);        nil;   end
     def self.zero?(p);        true;  end
-    def self.readable?(p);    false; end
+    def self.readable?(p);    __mkxp_exist?(p); end
     def self.writable?(p);    false; end
     def self.executable?(p);  false; end
   end

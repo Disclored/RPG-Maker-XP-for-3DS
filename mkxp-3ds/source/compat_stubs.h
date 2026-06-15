@@ -426,6 +426,23 @@ begin
           __sync_psprite
         end
       rescue; end
+      # DIAGNOSTICO (bg de cenas que nao aparece, ex: teclado "Naming/bg_2"):
+      # logar o estado do psprite nas primeiras vezes p/ ver se recebe o bitmap.
+      begin
+        $__plane_diag ||= 0
+        if $__plane_diag < 8
+          $__plane_diag += 1
+          bw = (v && !(v.disposed? rescue true)) ? "#{(v.width rescue '?')}x#{(v.height rescue '?')}" : "nil"
+          ps = @__psprite ? "ok" : "NIL"
+          psb = "?"
+          if @__psprite && !(@__psprite.disposed? rescue true)
+            pb = (@__psprite.bitmap rescue nil)
+            psb = (pb && !(pb.disposed? rescue true)) ? "#{(pb.width rescue '?')}x#{(pb.height rescue '?')}" : "nil"
+          end
+          vpz = (@viewport && (@viewport.z rescue nil)) ? (@viewport.z rescue '?') : "sem-vp"
+          (dbg "[PLANE-DIAG] bitmap= recebido=#{bw} psprite=#{ps} psprite.bitmap=#{psb} vis=#{@visible} vpz=#{vpz}") rescue nil
+        end
+      rescue; end
       v
     end
     def __sync_psprite
@@ -2139,12 +2156,22 @@ begin
       def setBitmap(name,hue=0)
         if name.nil? || name.to_s.empty?
           self.bitmap = nil
+          (dbg "[PLANE-DIAG] AnimatedPlane.setBitmap nome VAZIO -> bitmap=nil") rescue nil
         else
           begin
             bmp = AnimatedBitmap.new(name,hue).deanimate
             self.bitmap = bmp
-          rescue
+            begin
+              $__aplane_diag ||= 0
+              if $__aplane_diag < 8
+                $__aplane_diag += 1
+                bsz = (bmp && !(bmp.disposed? rescue true)) ? "#{(bmp.width rescue '?')}x#{(bmp.height rescue '?')}" : "nil/disposed"
+                (dbg "[PLANE-DIAG] AnimatedPlane.setBitmap '#{name}' -> #{bsz}") rescue nil
+              end
+            rescue; end
+          rescue => _pe
             self.bitmap = nil
+            (dbg "[PLANE-DIAG] AnimatedPlane.setBitmap '#{name}' EXCECAO #{_pe.class}: #{_pe.message}") rescue nil
           end
         end
       end

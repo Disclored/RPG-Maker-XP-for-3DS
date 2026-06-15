@@ -96,14 +96,35 @@ static Bitmap3DS *bmp_alloc(int w, int h) {
 
 void __attribute__((used)) bmp_flush(Bitmap3DS *b) {
     if (!b || !b->tex_dirty || b->disposed) return;
+    /* FIX RAIZ (tilesets gigantes a falhar + magenta + 2.2 fps): o PICA200 so'
+     * suporta texturas ate' 1024x1024. Tilesets do Essentials sao 256x31040 (!),
+     * impossiveis de meter numa textura. MAS esses bitmaps gigantes NUNCA sao
+     * desenhados como sprite -- servem so' de FONTE de blt (cópia RAM->RAM) para
+     * o layer do tilemap (832x704, que cabe). O blt opera em b->pixels (RAM), nao
+     * precisa de textura GPU. Por isso: se o bitmap excede 1024 em qualquer eixo,
+     * NAO tentamos criar a textura (que falharia, deixava magenta e re-tentava
+     * todos os frames). Deixamos os pixels em RAM (intactos p/ o blt) e marcamos
+     * tex_failed (o draw ignora; se algum dia for desenhado direto, nao re-tenta).
+     * Isto resolve os 32 tilesets gigantes do jogo sem tocar nos scripts. */
+    if (b->width > 1024 || b->height > 1024) {
+        b->tex_failed = true;
+        b->tex_dirty  = false;   /* pixels continuam validos em RAM p/ blt */
+        return;
+    }
     if (b->tex) {
         display_3ds_free_texture(b->tex);
         b->tex = nullptr;
     }
     if (b->pixels && b->width > 0 && b->height > 0) {
         b->tex = display_3ds_create_texture(b->width, b->height, b->pixels);
-        if (!b->tex)
+        if (!b->tex) {
+            /* FIX FPS: marcar que falhou p/ nao re-tentar todos os frames (o
+             * draw verifica tex_failed). So' se re-tenta quando tex_dirty voltar
+             * a true (pixels mudaram). Caso tipico: tileset >1024 (POT 1024 nao
+             * chega) ou VRAM esgotada. Sem isto, loop de C3D_TexInit -> 2.2 fps. */
+            b->tex_failed = true;
             printf("[BMP] AVISO: create_texture falhou %dx%d\n", b->width, b->height);
+        }
         else {
             /* [EVICT] registar o slot do dono para eviccao segura: se esta
              * textura for libertada por falta de heap, b->tex fica a nullptr e
@@ -130,6 +151,51 @@ static const char *s_game_roots[] = {
     "",
     nullptr
 };
+
+/* FIX RAIZ (recursos em subpastas que nao carregam, ex: background do teclado
+ * "Naming/bg_2"): o FileTest.exist? do Ruby (e logo safeExists? e pbResolveBitmap)
+ * devolvia SEMPRE false. Por isso pbResolveBitmap("Graphics/Pictures/Naming/bg_2")
+ * dava nil, e addBackgroundPlane fazia bitmap=nil -> Plane invisivel -> via-se a
+ * faixa amber (introPlayerbg) por tras. Esta funcao testa MESMO o ficheiro no
+ * filesystem do 3DS, percorrendo as raizes do jogo (s_game_roots) e as extensoes
+ * comuns -- a MESMA logica do loader bmp_load_file, por isso o que esta funcao diz
+ * existir, o loader consegue carregar. Exposta ao Ruby como Bitmap._native_exist?
+ * e usada pelo FileTest.exist?. Generico p/ QUALQUER recurso em qualquer subpasta. */
+extern "C" int mkxp_native_file_exists(const char *path) {
+    if (!path || path[0] == '\0') return 0;
+    static const char *exts[] = { "", ".png", ".gif", ".jpg", ".jpeg", ".bmp",
+                                  ".PNG", ".GIF", ".JPG", ".BMP", ".ogg", ".wav",
+                                  ".dat", ".rxdata", ".txt", nullptr };
+    for (int ri = 0; s_game_roots[ri] != nullptr; ri++) {
+        const char *root = s_game_roots[ri];
+        for (int ei = 0; exts[ei] != nullptr; ei++) {
+            char full[512];
+            if (root[0] != '\0' && path[0] == '/') {
+                snprintf(full, sizeof(full), "%s%s%s", root, path + 1, exts[ei]);
+            } else {
+                snprintf(full, sizeof(full), "%s%s%s", root, path, exts[ei]);
+            }
+            /* fopen em vez de stat(): mais portavel no devkitARM/3DS (nao precisa
+             * de <sys/stat.h>) e testa exactamente o que importa -- se o ficheiro
+             * abre para leitura. E' a mesma verificacao que o loader bmp_load_file
+             * faz logo a seguir, por isso o que abre aqui, o loader carrega. */
+            FILE *fp = fopen(full, "rb");
+            if (fp) { fclose(fp); return 1; }
+        }
+    }
+    return 0;
+}
+
+/* Wrapper Ruby: Bitmap._native_exist?(path) -> true/false. Metodo de classe de
+ * Bitmap (Bitmap ja' existe como binding, e' o sitio natural sem criar classes). */
+static mrb_value bmp_native_exist(mrb_state *mrb, mrb_value) {
+    const char *p = nullptr; mrb_int plen = 0;
+    mrb_get_args(mrb, "s", &p, &plen);
+    char buf[512];
+    int n = (plen < (mrb_int)sizeof(buf)-1) ? (int)plen : (int)sizeof(buf)-1;
+    memcpy(buf, p, n); buf[n] = '\0';
+    return mkxp_native_file_exists(buf) ? mrb_true_value() : mrb_false_value();
+}
 
 static void str_tolower(char *s) {
     for (; *s; s++) if (*s >= 'A' && *s <= 'Z') *s += 32;
@@ -983,6 +1049,15 @@ static mrb_value bmp_max_size(mrb_state *mrb, mrb_value self) {
 }
 
 MRB_CB bmp_animated      (mrb_state *mrb, mrb_value s) { (void)mrb; (void)s; return mrb_false_value();   }
+/* mega? = false SEMPRE (decisao p/ 3DS): no Essentials, mega? a true faz o
+ * CustomTilemap chamar TileWrap.wrapTileset, que COPIA o tileset gigante
+ * (256x31040 = 30MB) para um novo bitmap re-empacotado em colunas -- mais 30MB
+ * de RAM + 31 blts lentos, e o resultado (7936x1024) na mesma nao cabe numa
+ * textura. Em vez disso mantemos mega?=false: o jogo usa o tileset ORIGINAL
+ * direto como fonte de blt. Como o bmp_flush ja' NAO cria textura p/ bitmaps
+ * >1024 (ficam em RAM), o tileset gigante existe inteiro em b->pixels e o blt de
+ * cada tile 32x32 recorta-o em qualquer altura (incl. y>1024) sem problema. Isto
+ * evita a copia, poupa RAM e e' o caminho mais leve para o hardware 3DS. */
 MRB_CB bmp_mega          (mrb_state *mrb, mrb_value s) { (void)mrb; (void)s; return mrb_false_value();   }
 MRB_CB bmp_frame_count   (mrb_state *mrb, mrb_value s) { (void)mrb; (void)s; return mrb_fixnum_value(1); }
 MRB_CB bmp_current_frame (mrb_state *mrb, mrb_value s) { (void)mrb; (void)s; return mrb_fixnum_value(0); }
@@ -1038,6 +1113,7 @@ void bitmapBindingInit(mrb_state *mrb) {
     mrb_define_method(mrb, k, "font",               bmp_font,              MRB_ARGS_NONE());
     mrb_define_method(mrb, k, "font=",              bmp_set_font,          MRB_ARGS_REQ(1));
     mrb_define_class_method(mrb, k, "max_size",     bmp_max_size,          MRB_ARGS_NONE());
+    mrb_define_class_method(mrb, k, "_native_exist?", bmp_native_exist,    MRB_ARGS_REQ(1));
 
     mrb_define_method(mrb, k, "animated?",          bmp_animated,          MRB_ARGS_NONE());
     mrb_define_method(mrb, k, "mega?",              bmp_mega,              MRB_ARGS_NONE());

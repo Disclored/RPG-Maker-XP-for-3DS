@@ -113,6 +113,14 @@ void sprites_draw_all() {
         /* FIX BUG 3: fazer upload sempre que tex_dirty=true OU tex=nullptr.
          * tex pode ser nullptr mesmo com tex_dirty=false se o bitmap foi
          * recriado externamente (ex: bmp_clear seguido de draw sem flush). */
+        /* FIX FPS (texturas >1024 / VRAM esgotada): se a textura JA' falhou e os
+         * pixels NAO mudaram (tex_dirty=false), NAO re-tentar -- senao tentava-se
+         * criar a mesma textura impossivel TODOS os frames, com EVICT-thrashing +
+         * C3D_TexInit em loop (provado: tex_fail subia 100/frame, 2.2 fps em mapas
+         * com tilesets grandes 1696x704). Quando os pixels mudam, tex_dirty volta
+         * a true e limpamos o flag para dar nova oportunidade. */
+        if (s->bitmap->tex_dirty) s->bitmap->tex_failed = false;
+        if (s->bitmap->tex_failed && !s->bitmap->tex) continue;
         if (s->bitmap->tex_dirty || !s->bitmap->tex) {
             if (s->bitmap->tex) {
                 display_3ds_free_texture(s->bitmap->tex);
@@ -121,6 +129,9 @@ void sprites_draw_all() {
             if (s->bitmap->pixels && s->bitmap->width > 0 && s->bitmap->height > 0) {
                 s->bitmap->tex = display_3ds_create_texture(
                     s->bitmap->width, s->bitmap->height, s->bitmap->pixels);
+                /* se a criacao falhou (nullptr), marcar para nao re-tentar todos
+                 * os frames; so' se re-tenta quando os pixels mudarem (acima). */
+                if (!s->bitmap->tex) s->bitmap->tex_failed = true;
                 /* [EVICT] registar o slot do dono (&s->bitmap->tex) para eviccao
                  * segura: se esta textura for libertada por falta de heap linear,
                  * o campo fica nullptr e e' recriada a partir de pixels (em RAM). */
