@@ -2128,7 +2128,7 @@ rescue; end
 # -- RPG::Weather stub ---------------------------------------------------------
 # Spriteset_Map cria RPG::Weather -- nao existe no compat por default.
 begin
-  unless defined?(RPG::Weather)
+  unless (RPG.const_defined?(:Weather) rescue false)
     module RPG
       class Weather
         def initialize(viewport=nil); @type=:None; @max=0; @ox=0; @oy=0; end
@@ -2226,5 +2226,202 @@ def __sm_tick_debug__
     $__sm_last_scene   = cur
     puts "[SM_DEBUG] SCENE CHANGED -> #{cur} (tick=#{$__sm_update_count})"
   end
+end
+
+# ─── PROFILER GRANULAR DO UPDATE (isolar o gargalo de ~157ms/frame) ───────────
+# O log mostra update=157ms render=1.2ms (Ruby domina) mas nao QUAL parte. Em vez
+# de adivinhar, MEDIMOS cada peca pesada do loop de mapa com __mkxp_ms (relogio
+# ARM11 real). Acumula tempo por categoria e despeja a media a cada N frames.
+# Tudo protegido: se algo falhar, o jogo continua. Custo: 2 leituras de relogio
+# por seccao (~ns) -- desprezavel face aos 157ms que estamos a investigar.
+# DETECAO de __mkxp_ms por CHAMADA DIRETA (nao por respond_to? nem defined?):
+#  - 'defined?(m)' LANCA no mruby 3.2 se m nao existe -> rebentava o bloco.
+#  - 'respond_to?(:m)' devolve FALSE para metodos PRIVADOS. __mkxp_ms e' definido
+#    em Kernel via mrb_define_method => e' PRIVADO (chama-se 'bare', sem receiver,
+#    mas respond_to? nao o ve). Foi ISTO que impediu o profiler de instalar.
+#  - A chamada bare '__mkxp_ms' funciona p/ metodo privado de Kernel a partir de
+#    qualquer contexto. Se nao existir -> NoMethodError, que apanhamos. Robusto.
+__rp_has_ms = false
+__rp_t = nil
+begin
+  __rp_t = __mkxp_ms
+  __rp_has_ms = true
+rescue => __rp_e
+  __rp_has_ms = false
+end
+if __rp_has_ms
+  (dbg sprintf("[RUBYPROF] __mkxp_ms PRESENTE (teste=%.1fms) -> a instalar profiler", __rp_t)) rescue (puts "[RUBYPROF] __mkxp_ms presente")
+  $__prof = Hash.new(0.0)
+  $__prof_n = 0
+  $__prof_calls = Hash.new(0)
+
+  def __prof_acc(key, t0)
+    $__prof[key] += (__mkxp_ms - t0)
+    $__prof_calls[key] += 1
+  rescue; end
+
+  def __prof_dump_maybe
+    $__prof_n += 1
+    return unless ($__prof_n % 120) == 0   # ~a cada 120 frames
+    line = "[RUBYPROF] f=#{$__prof_n}"
+    total = 0.0
+    $__prof.each { |k, v| total += v }
+    # ordenar por tempo desc
+    $__prof.sort_by { |k, v| -v }.each do |k, v|
+      avg = v / 120.0
+      calls = $__prof_calls[k] / 120.0
+      line += sprintf(" | %s=%.1fms(x%.0f)", k, avg, calls)
+    end
+    line += sprintf(" | TOTAL_medido=%.1fms/frame", total / 120.0)
+    (dbg line) rescue (puts line)
+    $__prof = Hash.new(0.0)
+    $__prof_calls = Hash.new(0)
+  end
+
+  # Instrumentar Sprite_Character#update (o suspeito #1 segundo XPAL/seniores)
+  if Object.const_defined?(:Sprite_Character) &&
+     Sprite_Character.method_defined?(:update) &&
+     !Sprite_Character.method_defined?(:__update_prof_orig)
+    class Sprite_Character
+      alias __update_prof_orig update
+      def update
+        t0 = __mkxp_ms
+        __update_prof_orig
+        __prof_acc(:sprite_char, t0)
+      end
+    end
+    (dbg "[RUBYPROF] Sprite_Character#update instrumentado") rescue nil
+  end
+
+  # Instrumentar Spriteset_Map#update (o contentor: sprites + tilemap + panorama)
+  if Object.const_defined?(:Spriteset_Map) &&
+     Spriteset_Map.method_defined?(:update) &&
+     !Spriteset_Map.method_defined?(:__update_prof_orig)
+    class Spriteset_Map
+      alias __update_prof_orig update
+      def update
+        t0 = __mkxp_ms
+        __update_prof_orig
+        __prof_acc(:spriteset_map, t0)
+        __prof_dump_maybe   # despeja periodicamente (uma vez por spriteset/frame)
+      end
+    end
+    (dbg "[RUBYPROF] Spriteset_Map#update instrumentado") rescue nil
+  end
+else
+  (dbg "[RUBYPROF] SKIP: __mkxp_ms AUSENTE -> binding_3ds.cpp NAO recompilado com o metodo nativo. Forcar rebuild: 'touch source/binding_3ds.cpp && make' (ou apagar binding_3ds.o). Sem isto o profiler nao mede nada.") rescue (puts "[RUBYPROF] SKIP __mkxp_ms ausente")
+end
+
+# ─── OTIMIZACAO 1: cache de pbDayNightTint por-FRAME ──────────────────────────
+# pbDayNightTint(object) e' chamado por CADA sprite de personagem, CADA frame
+# (54 eventos => 54x/frame). Faz lookups que sao IDENTICOS para todos os sprites
+# no mesmo frame: GameData::MapMetadata.exists?(map_id), .get(map_id).outdoor_map,
+# e PBDayNight.getTone. Em vez de repetir 54x, calculamos o TOM uma vez por frame
+# (chaveado por Graphics.frame_count) e so' aplicamos object.tone.set(...) a cada
+# sprite (que e' barato e necessario). SEGURO: o resultado e' identico -- todos os
+# sprites do mesmo mapa/frame recebem o mesmo tom; so' eliminamos lookups
+# redundantes. Reversivel: e' um alias do metodo original, que fica como fallback.
+# GENERICO: beneficia qualquer mapa com varios eventos.
+# NOTA mruby: respond_to? em vez de defined? (ver acima -- defined? lanca erro).
+if respond_to?(:pbDayNightTint) && !respond_to?(:__pbDayNightTint_cache_orig)
+  $__dnt_frame = -1            # frame em que o tom foi calculado
+  $__dnt_apply = false         # true = aplicar tom; false = limpar (set 0,0,0,0)
+  $__dnt_tone  = nil           # [r,g,b,gray] a aplicar quando $__dnt_apply
+
+  alias __pbDayNightTint_cache_orig pbDayNightTint
+  def pbDayNightTint(object)
+    return if !$scene.is_a?(Scene_Map)
+    fc = (Graphics.frame_count rescue 0)
+    if fc != $__dnt_frame
+      # recalcular UMA vez por frame
+      $__dnt_frame = fc
+      begin
+        if (Settings::TIME_SHADING && $PokemonSystem.daytone == 0) &&
+           GameData::MapMetadata.exists?($game_map.map_id) &&
+           GameData::MapMetadata.get($game_map.map_id).outdoor_map
+          t = PBDayNight.getTone
+          $__dnt_tone  = [t.red, t.green, t.blue, t.gray]
+          $__dnt_apply = true
+        else
+          $__dnt_apply = false
+        end
+      rescue
+        # em caso de erro, cair no comportamento original (sem cache)
+        return __pbDayNightTint_cache_orig(object)
+      end
+    end
+    # aplicar o resultado cacheado (barato: so' um set por sprite)
+    if $__dnt_apply && $__dnt_tone
+      object.tone.set($__dnt_tone[0], $__dnt_tone[1], $__dnt_tone[2], $__dnt_tone[3])
+    else
+      object.tone.set(0, 0, 0, 0)
+    end
+  rescue
+    (__pbDayNightTint_cache_orig(object) rescue nil)
+  end
+  (dbg "[OPT] pbDayNightTint com cache por-frame instalado") rescue nil
+end
+
+# ─── [J3] THROTTLE do SPRITESET VIZINHO ───────────────────────────────────────
+# Mapas ligados (PokemonMapFactory) fazem o Scene_Map manter UM Spriteset_Map por
+# mapa. Em Gardenia o log mostra @spritesets=Hash(2): DOIS mapas a fazer update
+# completo por frame. O grosso do custo e' o loop:
+#     for sprite in @character_sprites; sprite.update; end
+# So' o mapa ATIVO (@map == $game_map) precisa dos NPCs a 30fps; o(s) vizinho(s)
+# (so' visiveis na costura) podem animar a 1 em cada N frames.
+#
+# COMO (seguro, SEM tearing): num frame a saltar corremos o update ORIGINAL na
+# mesma, mas com @character_sprites temporariamente VAZIO. Assim o scroll do
+# tilemap, panorama, fog e weather atualizam CERTO (a juncao nao rasga); so' o
+# loop dos NPCs do vizinho e' que e' saltado. Em mensagem ativa, o vizinho fica
+# parado de todo. Reversivel; controlado por $MKXP_PERF_J3 / $MKXP_PERF_J3_EVERY.
+$MKXP_PERF_J3       = true if $MKXP_PERF_J3.nil?
+$MKXP_PERF_J3_EVERY = 3    if $MKXP_PERF_J3_EVERY.nil?
+$__j3_skipped = 0
+$__j3_ran     = 0
+if (Object.const_defined?(:Spriteset_Map) rescue false) &&
+   (Spriteset_Map.method_defined?(:update) rescue false) &&
+   !(Spriteset_Map.method_defined?(:__j3_update_orig) rescue false)
+  class Spriteset_Map
+    J3_EMPTY = [].freeze
+    alias __j3_update_orig update
+    def update(*a)
+      throttle = false
+      if $MKXP_PERF_J3
+        begin
+          neighbor = (@map && $game_map && @map != $game_map)
+          if neighbor
+            if $game_temp && $game_temp.message_window_showing
+              throttle = true                     # vizinho parado durante dialogo
+            else
+              @__j3_n = (@__j3_n || 0) + 1
+              throttle = ((@__j3_n % $MKXP_PERF_J3_EVERY) != 0)
+            end
+          end
+        rescue
+          throttle = false
+        end
+      end
+      if throttle
+        saved = @character_sprites
+        begin
+          @character_sprites = J3_EMPTY          # loop de NPCs do vizinho nao corre
+          __j3_update_orig(*a)
+        ensure
+          @character_sprites = saved             # restaura SEMPRE (mesmo com erro)
+        end
+        $__j3_skipped += 1
+      else
+        __j3_update_orig(*a)
+        $__j3_ran += 1
+      end
+      if (($__j3_skipped + $__j3_ran) % 600) == 0
+        (dbg "[J3] vizinho: #{$__j3_skipped} updates de NPC saltados / #{$__j3_ran} completos (every=#{$MKXP_PERF_J3_EVERY})") rescue nil
+      end
+    end
+  end
+  (dbg "[J3] throttle de spriteset vizinho instalado (every=#{$MKXP_PERF_J3_EVERY}, flag $MKXP_PERF_J3)") rescue nil
+else
+  (dbg "[J3] NAO instalado (Spriteset_Map ausente ou ja' aliasado)") rescue nil
 end
 )RUBY";

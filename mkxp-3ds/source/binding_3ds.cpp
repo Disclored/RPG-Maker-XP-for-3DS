@@ -7036,6 +7036,21 @@ end
      * inclui tamanho+mtime do rxdata original, por isso se editares os Data/
      * a cache invalida-se sozinha. Logs [RXCACHE] permitem medir o ganho.
      * Poe MKXP_RXDATA_CACHE a 0 para desligar e comparar tempos. */
+    /* __mkxp_ms: tempo real em ms (float) via relogio ARM11 (svcGetSystemTick).
+     * Exposto ao Ruby para PROFILING GRANULAR do update: o nosso log mostra
+     * update=157ms render=1.2ms (Ruby domina), mas nao QUAL parte do update.
+     * Com isto, os patches Ruby podem medir cada seccao (player, eventos,
+     * spritesets, tint) e isolar o gargalo real em vez de adivinhar. Custo: uma
+     * leitura de registo do sistema (~ns). So' e' chamado pelos patches de
+     * diagnostico, que logam periodicamente. */
+    mrb_define_method(mrb, mrb->kernel_module,
+        "__mkxp_ms",
+        [](mrb_state *mrb2, mrb_value) -> mrb_value {
+            (void)mrb2;
+            return mrb_float_value(mrb2, tick_to_ms(svcGetSystemTick()));
+        },
+        MRB_ARGS_NONE());
+
     mrb_define_method(mrb, mrb->kernel_module,
         "load_data",
         [](mrb_state *mrb2, mrb_value) -> mrb_value {

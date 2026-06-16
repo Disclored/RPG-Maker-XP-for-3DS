@@ -715,6 +715,61 @@ void display_3ds_set_texture_filter(DS3Texture* t, bool linear) {
  * display_3ds_blit
  * [DBG] Skip detalhado: porquê é que este blit foi ignorado?
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* ── Clip à AREA DE JOGO ──────────────────────────────────────────────────────
+ * PORQUE: o jogo desenha em 512x384 logico, mas algumas imagens sao MAIORES que
+ * o ecra (ex: introPlayerbg 1024x160, uma faixa decorativa centrada). No PC a
+ * janela corta o que sai; no 3DS, sem corte, a imagem vaza para as BARRAS PRETAS
+ * laterais (os 40px de cada lado) e ate' para fora do ecra. Resultado visivel:
+ * "o amarelo passa as bordas pretas".
+ * COMO: depois de transformar para coords FISICAS (fd*), intersectamos o retangulo
+ * de destino com a area de jogo fisica [OFF_X..OFF_X+320] x [OFF_Y..OFF_Y+240] e
+ * encolhemos os UVs (u0/u1/v) na MESMA proporcao do que foi cortado, para a parte
+ * visivel continuar a mapear o pedaco certo da textura (sem esticar). Puramente
+ * matematico -- nao depende da orientacao da framebuffer (ao contrario do scissor
+ * do PICA, que opera na framebuffer rodada 90 e e' arriscado). GENERICO: qualquer
+ * sprite que ultrapasse a area logica fica corretamente contido. Custo: ~6 ifs. */
+static inline bool clip_to_game_area(float &fdx, float &fdy, float &fdw, float &fdh,
+                                     float &u0, float &u1, float &v_top, float &v_bottom) {
+    const float gx0 = DISP_OFF_X;
+    const float gy0 = DISP_OFF_Y;
+    const float gx1 = DISP_OFF_X + GAME_W * DISP_SCALE;   /* 40 + 320 = 360 */
+    const float gy1 = DISP_OFF_Y + GAME_H * DISP_SCALE;   /* 0 + 240 = 240 */
+    if (fdw <= 0.0f || fdh <= 0.0f) return false;
+    /* corte ESQUERDA */
+    if (fdx < gx0) {
+        float cut = gx0 - fdx;
+        if (cut >= fdw) return false;            /* todo fora */
+        float frac = cut / fdw;
+        u0 += (u1 - u0) * frac;                   /* avanca a UV-x na mesma proporcao */
+        fdx += cut; fdw -= cut;
+    }
+    /* corte DIREITA */
+    if (fdx + fdw > gx1) {
+        float cut = (fdx + fdw) - gx1;
+        if (cut >= fdw) return false;
+        float frac = cut / fdw;
+        u1 -= (u1 - u0) * frac;
+        fdw -= cut;
+    }
+    /* corte TOPO (nota: v_top corresponde a sy menor; em UV invertido v_top>v_bottom) */
+    if (fdy < gy0) {
+        float cut = gy0 - fdy;
+        if (cut >= fdh) return false;
+        float frac = cut / fdh;
+        v_top += (v_bottom - v_top) * frac;
+        fdy += cut; fdh -= cut;
+    }
+    /* corte FUNDO */
+    if (fdy + fdh > gy1) {
+        float cut = (fdy + fdh) - gy1;
+        if (cut >= fdh) return false;
+        float frac = cut / fdh;
+        v_bottom -= (v_bottom - v_top) * frac;
+        fdh -= cut;
+    }
+    return true;
+}
+
 void display_3ds_blit(DS3Texture* t,
                       float dx, float dy,
                       float sx, float sy, float sw, float sh,
@@ -777,6 +832,14 @@ void display_3ds_blit(DS3Texture* t,
     float v_top    = 1.0f - (sy / th);
     float v_bottom = 1.0f - ((sy + sh) / th);
 
+    /* CLIP a area de jogo: impede imagens maiores que o ecra (ex: introPlayerbg
+     * 1024x160) de vazar para as barras pretas laterais. Se nada sobra visivel,
+     * nao desenha. Ajusta UVs proporcionalmente (ver clip_to_game_area). */
+    if (!clip_to_game_area(fdx, fdy, fdw, fdh, u0, u1, v_top, v_bottom)) {
+        s_blit_skipped++;
+        return;
+    }
+
     /* Super Debug: sprites GRANDES (logo/fundo) -- dimensoes e UVs reais.
      * Diagnostica o "corte a meio": ver se U[..] cobre a imagem toda e se
      * fdw cabe no ecra. ~1x cada 300 frames. */
@@ -790,9 +853,12 @@ void display_3ds_blit(DS3Texture* t,
 
     /* FIX ESPELHO HORIZONTAL: a imagem aparecia espelhada na horizontal
      * (texto lia-se da direita p/ esquerda). Os campos left/right (U) da
-     * SubTexture estavam trocados -> passar u1 como left e u0 como right. */
+     * SubTexture estavam trocados -> passar u1 como left e u0 como right.
+     * A largura/altura da SubTexture (em texels) deriva dos UVs JA' clipados
+     * (u1-u0)*tw, para a regiao mostrada bater com a parte visivel apos o clip. */
     Tex3DS_SubTexture sub = {
-        (u16)(int)(sw + 0.5f), (u16)(int)(sh + 0.5f),
+        (u16)(int)((u1 - u0) * tw + 0.5f),
+        (u16)(int)((v_top - v_bottom) * th + 0.5f),
         u0, v_top, u1, v_bottom
     };
     C2D_Image img = { &t->tex, &sub };
@@ -884,6 +950,13 @@ void display_3ds_blit_ex(DS3Texture* t,
     float v_top    = 1.0f - (sy / th);
     float v_bottom = 1.0f - ((sy + sh) / th);
 
+    /* CLIP a area de jogo (ver display_3ds_blit): contem imagens maiores que o
+     * ecra dentro da area logica, sem vazar para as barras pretas. */
+    if (!clip_to_game_area(fdx, fdy, fdw, fdh, u0, u1, v_top, v_bottom)) {
+        s_blit_skipped++;
+        return;
+    }
+
     /* DIAG TEXFLOW: blit de um bitmap COM TEXTO para o ecra. Mapeamento EXACTO
      * src->dst + fator de stretch. Agora atras de DBG_SUPER (off por defeito): a
      * caixa de dialogo esta' resolvida ("Perfeito") e o fluxo de texto ja' foi
@@ -909,9 +982,11 @@ void display_3ds_blit_ex(DS3Texture* t,
 
     /* FIX ESPELHO HORIZONTAL: a imagem aparecia espelhada na horizontal
      * (texto lia-se da direita p/ esquerda). Os campos left/right (U) da
-     * SubTexture estavam trocados -> passar u1 como left e u0 como right. */
+     * SubTexture estavam trocados -> passar u1 como left e u0 como right.
+     * Largura/altura (texels) derivada dos UVs JA' clipados, ver display_3ds_blit. */
     Tex3DS_SubTexture sub = {
-        (u16)(int)(sw + 0.5f), (u16)(int)(sh + 0.5f),
+        (u16)(int)((u1 - u0) * tw + 0.5f),
+        (u16)(int)((v_top - v_bottom) * th + 0.5f),
         u0, v_top, u1, v_bottom
     };
     C2D_Image img = { &t->tex, &sub };

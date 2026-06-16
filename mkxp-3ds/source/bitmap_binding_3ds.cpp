@@ -94,6 +94,25 @@ static Bitmap3DS *bmp_alloc(int w, int h) {
     return b;
 }
 
+/* FIX MEMORIA (tilesets gigantes 256x31040 = 30MB que NAO carregavam): o caminho
+ * normal era stbi_load (aloca 30MB) + bmp_alloc (aloca OUTROS 30MB) + memcpy ->
+ * PICO de 60MB. No Old 3DS (RAM ~64MB) isso esgota a memoria e o load FALHA (->
+ * MISS -> tile magenta). Esta variante faz o Bitmap ADOTAR o buffer que o stbi
+ * ja' alocou (mesmo allocator: stb usa malloc/free, e bitmap_free usa free), em
+ * vez de alocar um segundo buffer e copiar. Resultado: pico cai de 60MB p/ 30MB
+ * (so' o buffer do stbi), sem memcpy. Generico: qualquer imagem grande beneficia. */
+static Bitmap3DS *bmp_alloc_adopt(int w, int h, unsigned char *owned_pixels) {
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    Bitmap3DS *b  = (Bitmap3DS*)calloc(1, sizeof(Bitmap3DS));
+    b->width      = w;
+    b->height     = h;
+    b->pixels     = owned_pixels;   /* adota -- libertado por bitmap_free (free) */
+    b->tex_dirty  = true;
+    b->tex        = nullptr;
+    return b;
+}
+
 void __attribute__((used)) bmp_flush(Bitmap3DS *b) {
     if (!b || !b->tex_dirty || b->disposed) return;
     /* FIX RAIZ (tilesets gigantes a falhar + magenta + 2.2 fps): o PICA200 so'
@@ -238,6 +257,38 @@ static Bitmap3DS *bmp_load_file(const char *path) {
             }
 
             int w, h, ch;
+
+            /* ── [M1] CURTO-CIRCUITO de tilesets gigantes ───────────────────────
+             * Tilesets Gen4 do Essentials sao 256x31040 (30.3MB) / 256x29632
+             * (28.9MB). Em Old 3DS NUNCA cabem em RAM (malloc livre cai a ~1.4MB
+             * tarde no mapa), logo o stbi_load gasta ~768ms a ler+tentar alocar
+             * e FALHA na mesma -> magenta. Aqui lemos so' o CABECALHO (stbi_info,
+             * barato) ANTES do decode caro: se a imagem excede um limite que nem
+             * com VWrap caberia, saltamos o decode e vamos direto ao fallback.
+             * SEGURANCA: so' salta quando stbi_info TEM SUCESSO e reporta tamanho
+             * acima do limite. Se stbi_info falhar (ex: GIF que o info nao le mas
+             * o load leria), NAO salta -> comportamento inalterado, zero regressao.
+             * Limite 24MB: apanha os Gen4 (28-30MB) e nada mais (um tileset de
+             * 8-16MB ainda e' tentado, pode carregar via adopt+blt-de-RAM). */
+            {
+                static const long M1_MAX_DECODE_BYTES = 24L * 1024 * 1024; /* 24 MB */
+                int iw = 0, ih = 0, ic = 0;
+                if (stbi_info(full, &iw, &ih, &ic)) {
+                    long need = (long)iw * ih * 4;
+                    if (need > M1_MAX_DECODE_BYTES) {
+                        printf("[BMP|SKIP-BIG] '%s' info=%dx%d (%.1fMB) > limite %ldMB "
+                               "-- decode SALTADO [M1], poupa ~stbi_load fútil; fallback magenta\n",
+                               full, iw, ih, need / 1048576.0,
+                               M1_MAX_DECODE_BYTES / (1024 * 1024));
+                        if (g_dbglog)
+                            fprintf(g_dbglog, "[BMP|SKIP-BIG] '%s' info=%dx%d (%.1fMB) "
+                                    "decode saltado [M1]\n", full, iw, ih, need / 1048576.0);
+                        fflush(stdout);
+                        continue;   /* nao decodifica; tenta proxima ext/raiz -> fallback */
+                    }
+                }
+            }
+
             unsigned char *px = stbi_load(full, &w, &h, &ch, 4);
             if (px) {
                 /* diagnostico: para imagens do titulo (MODTS/Titles), mostra
@@ -248,9 +299,10 @@ static Bitmap3DS *bmp_load_file(const char *path) {
                     printf("[BMP|OK] '%s' -> '%s' (%dx%d)\n", path, full, w, h);
                     fflush(stdout);
                 }
-                Bitmap3DS *b = bmp_alloc(w, h);
-                memcpy(b->pixels, px, (size_t)(w * h * 4));
-                stbi_image_free(px);
+                /* FIX MEMORIA: ADOTA o buffer do stbi (sem bmp_alloc+memcpy) ->
+                 * pico de RAM cai p/ metade. Critico p/ tilesets 256x31040 (30MB)
+                 * que de outra forma precisavam de 60MB e falhavam no Old 3DS. */
+                Bitmap3DS *b = bmp_alloc_adopt(w, h, px);
                 b->tex_dirty = true;
                 bmp_flush(b);
                 return b;
@@ -264,12 +316,27 @@ static Bitmap3DS *bmp_load_file(const char *path) {
             if (dot && strcmp(full_lc, full) != 0) {
                 px = stbi_load(full_lc, &w, &h, &ch, 4);
                 if (px) {
-                    Bitmap3DS *b = bmp_alloc(w, h);
-                    memcpy(b->pixels, px, (size_t)(w * h * 4));
-                    stbi_image_free(px);
+                    /* FIX MEMORIA: adota o buffer (sem copia) -- ver acima. */
+                    Bitmap3DS *b = bmp_alloc_adopt(w, h, px);
                     b->tex_dirty = true;
                     bmp_flush(b);
                     return b;
+                }
+                /* DIAGNOSTICO (tilesets gigantes que falham a CARREGAR, nao a
+                 * texturizar): se o stbi falhou e a dimensao seria grande, o mais
+                 * provavel e' falta de RAM (256x31040 = 30MB). Logar a razao do
+                 * stbi ajuda a confirmar (vs ficheiro corrompido/ausente). */
+                int sw = 0, sh = 0, sc = 0;
+                if (stbi_info(full, &sw, &sh, &sc)) {
+                    long bytes = (long)sw * sh * 4;
+                    printf("[BMP|BIGFAIL] '%s' info=%dx%d (%.1fMB) mas stbi_load=NULL "
+                           "-- causa provavel: RAM insuficiente. stbi: %s\n",
+                           full, sw, sh, bytes/1048576.0, stbi_failure_reason());
+                    if (g_dbglog)
+                        fprintf(g_dbglog, "[BMP|BIGFAIL] '%s' info=%dx%d (%.1fMB) "
+                                "stbi_load=NULL RAM? stbi:%s\n",
+                                full, sw, sh, bytes/1048576.0, stbi_failure_reason());
+                    fflush(stdout);
                 }
             }
         }
