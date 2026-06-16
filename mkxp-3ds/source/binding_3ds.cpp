@@ -4916,6 +4916,25 @@ begin
 rescue NameError => e
   dbg "[MFD] alias failed: #{e.message}"
 end
+
+# ─── CHAMAR O INSTALL DEFERIDO (RUBYPROF + tint cache + J3) ───────────────────
+# Estamos no FIM do bloco MFD (~t=8.7s): os 376 scripts ja' correram e este bloco
+# ja' corrigiu/definiu Spriteset_Map, Sprite_Character, etc. 'dbg' tambem ja'
+# existe. E' o momento CERTO para instalar os patches que dependem das classes do
+# jogo -- coisa que o compat_stubs.h (corre a t=0.5s, antes dos scripts) NAO podia
+# fazer. A lambda foi registada la' em $__mkxp_perf_install; chamamo-la agora.
+# Cada ramo loga para o caso de erro se isolar no log sem adivinhar.
+begin
+  if $__mkxp_perf_install
+    dbg "[PERF] a chamar install deferido (RUBYPROF + J3)..."
+    $__mkxp_perf_install.call
+    dbg "[PERF] install deferido concluido OK"
+  else
+    dbg "[PERF] AVISO: $__mkxp_perf_install AUSENTE -> compat_stubs.h antigo/errado no build"
+  end
+rescue => e
+  dbg "[PERF] install deferido FALHOU: #{e.class}: #{e.message}"
+end
 )RUBY");
 	
 	DBGLOG("[TEST] depois do mrb_load_string\n");
@@ -6503,6 +6522,17 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
             DBGLOG("[STUBS] WARN: ios_compat_3ds.rb not found\n");
         }
     }
+
+	/* PROVA C-SIDE: qual compat_stubs.h o compilador realmente usou. A guarda
+	 * #ifndef garante que, se o binding for compilado contra um compat_stubs.h
+	 * ANTIGO (sem a tag), imprime 'DESCONHECIDO' em vez de partir o build. Como
+	 * o binding_3ds.cpp recompila sempre, esta linha diz a verdade no log mesmo
+	 * que o bloco Ruby do compat_stubs nem chegue a correr. */
+#ifndef MKXP_COMPAT_STUBS_BUILD_TAG
+#define MKXP_COMPAT_STUBS_BUILD_TAG "DESCONHECIDO (compat_stubs.h antigo, sem tag)"
+#endif
+	DBGLOG("[COMPAT_STUBS|C] header compilado tag=%s\n", MKXP_COMPAT_STUBS_BUILD_TAG);
+	if (g_dbglog) fflush(g_dbglog);  /* flush imediato: esta prova nao se perde num crash */
 
 	extern const char *COMPAT_STUBS_RUBY;  // declarado em compat_stubs.h
 	mrb_load_string(mrb, COMPAT_STUBS_RUBY);

@@ -1,7 +1,20 @@
 #pragma once
+/* TAG DE BUILD (em C, FORA do raw-string Ruby). O binding_3ds.cpp imprime-a no
+ * log mesmo que o Ruby nao corra -> prova QUAL compat_stubs.h o compilador usou.
+ * Bumpa a cada alteracao. Se o log mostrar 'DESCONHECIDO' ou uma tag antiga, o
+ * binding_3ds.cpp foi compilado contra OUTRO compat_stubs.h (pasta errada). */
+#define MKXP_COMPAT_STUBS_BUILD_TAG "2026-06-16-B"
 static const char *COMPAT_STUBS_RUBY = R"RUBY(
 $VERBOSE = nil
 $_INTL_defined = true
+
+# ─── CARIMBO DE VERSAO (verificacao de build) ─────────────────────────────────
+# Loga IMEDIATAMENTE qual compat_stubs.h esta' no binario. Se editas o header mas
+# nao recompilas o binding_3ds.cpp (que e' o unico .cpp que embebe esta string),
+# o Makefile mantem a versao ANTIGA -> e este carimbo prova-o no log. Bumpa a
+# string a cada alteracao; o log passa a isolar "build velho" sem adivinhar.
+$MKXP_COMPAT_STUBS_VERSION = "2026-06-16-B (install deferido p/ bloco MFD)"
+(dbg "[COMPAT_STUBS] versao #{$MKXP_COMPAT_STUBS_VERSION} carregada" rescue nil)
 
 # -- Settings ------------------------------------------------------------------
 module Settings
@@ -2228,6 +2241,16 @@ def __sm_tick_debug__
   end
 end
 
+# ─── INSTALL DEFERIDO (RUBYPROF + tint + J3) ──────────────────────────────────
+# IMPORTANTE: o COMPAT_STUBS_RUBY corre a ~t=0.5s, ANTES dos scripts do jogo.
+# Nessa altura NAO existem Spriteset_Map / Sprite_Character / pbDayNightTint, nem
+# o 'dbg'. Por isso NAO instalamos aqui (falhava em silencio). Em vez disso,
+# REGISTAMOS o install numa lambda global; o bloco MFD do binding_3ds.cpp (que
+# corre a ~t=8.7s, DEPOIS dos scripts, com 'dbg' e classes ja' definidas) chama
+# $__mkxp_perf_install.call. Ruby resolve 'dbg'/classes no momento da CHAMADA,
+# nao da definicao -> tudo existe quando corre.
+$__mkxp_perf_install = lambda do
+
 # ─── PROFILER GRANULAR DO UPDATE (isolar o gargalo de ~157ms/frame) ───────────
 # O log mostra update=157ms render=1.2ms (Ruby domina) mas nao QUAL parte. Em vez
 # de adivinhar, MEDIMOS cada peca pesada do loop de mapa com __mkxp_ms (relogio
@@ -2424,4 +2447,7 @@ if (Object.const_defined?(:Spriteset_Map) rescue false) &&
 else
   (dbg "[J3] NAO instalado (Spriteset_Map ausente ou ja' aliasado)") rescue nil
 end
+
+end  # fim da lambda $__mkxp_perf_install
+(dbg "[PERF] install deferido REGISTADO (sera' chamado pelo bloco MFD apos os scripts)" rescue nil)
 )RUBY";
