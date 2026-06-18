@@ -1,942 +1,663 @@
 # =============================================================================
-# debug_probe.rb -- v3: probe de diagnostico para mkxp-3ds
-# Carregar do SD: sdmc:/mkxp/debug_probe.rb
-# Escreve para sdmc:/mkxp/probe_out.txt E para MKXPDebug/printf
+#  debug_probe.rb  —  LOGGER SUPER DETALHADO POR MAPA (frame-a-frame)
+# -----------------------------------------------------------------------------
+#  COMO USAR:
+#    - Copia este ficheiro para:  sdmc:/mkxp/debug_probe.rb
+#    - O motor carrega-o automaticamente no arranque (mrb_load_string).
+#    - TUDO é escrito em sdmc:/mkxp/debug_binding.log (via MKXPDebug.log),
+#      com o prefixo [MFD] que o motor acrescenta. Procura os prefixos abaixo.
+#    - Para DESLIGAR: renomeia para  debug_probe.rb.off
+#
+#  O QUE REGISTA (sem especulação — factos do estado real do jogo):
+#    [MAPDUMP]  ao ENTRAR/MUDAR de mapa: id, nome, tamanho, tileset (id+nome),
+#               panorama/fog, nº de eventos.
+#    [TSTAT]    dimensões REAIS do tileset carregado (ex: 256x1280) ou
+#               "32x32 MAGENTA(FALHOU)" — diz logo se o tileset do mapa falhou.
+#    [MEVENT]   cada evento do mapa: id, nome, posição, charset, página ativa.
+#    [TF]       UMA linha por FRAME: cena, map, câmara, jogador, índice do
+#               comando do interpreter em execução.
+#    [TCMD]     cada comando de evento à medida que EXECUTA (code + params) —
+#               o "guião" real a correr, para comparar com o esperado.
+#    [TPIC]     imagens (Game_Picture) mostradas/movidas: número, nome, x/y, opac.
+#    [TERR]     qualquer erro interno do próprio logger (nunca rebenta o jogo).
+#
+#  FPS: este logger é PESADO de propósito (escreve muito ao SD). É só p/ debug.
 # =============================================================================
 
-# --- Log dedicado independente de MKXPDebug ---
-$_probe_file = nil
 begin
-  $_probe_file = File.open("sdmc:/mkxp/probe_out.txt", "w")
-rescue
-  begin; $_probe_file = File.open("probe_out.txt", "w"); rescue; $_probe_file = nil; end
-end
+  # NOTA: NAO mexer em $MKXP_VERBOSE. Os nossos prefixos ([MAPDUMP], [TF], [TCMD],
+  # [TSTAT], [MEVENT], [TPIC], [PROBE]) NAO estao na lista de supressao do motor,
+  # por isso passam sempre. (Versao anterior punha $MKXP_VERBOSE=true sem necessidade.)
 
-module Probe
-  # Throttle de escrita: o gargalo de FPS no 3DS e' o fwrite+flush no cartao
-  # SD a cada linha. Mantemos TODO o logging, mas (1) sem flush por linha
-  # (flush so' a cada N), e (2) colapsando linhas IDENTICAS consecutivas
-  # (o spam de Map000/EV exec repete a mesma linha centenas de vezes).
-  @last_line = nil
-  @dup_count = 0
-  @since_flush = 0
-  def self.log(msg)
-    line = "[PRB] #{msg}"
-    # colapsar duplicados consecutivos: em vez de escrever a mesma linha
-    # 300x, escrevemos 1x e depois "(xN)" quando muda.
-    if line == @last_line
-      @dup_count += 1
-      return if @dup_count < 200   # deixa passar 1 em cada 200 repeticoes
-      line = "#{line} (x#{@dup_count})"
-      @dup_count = 0
-    else
-      if @dup_count > 0
-        flush_line("#{@last_line} (x#{@dup_count})")
-        @dup_count = 0
-      end
-      @last_line = line
-    end
-    flush_line(line)
-  end
-  def self.flush_line(line)
-    begin
-      if $_probe_file
-        $_probe_file.write(line + "\n")
-        @since_flush += 1
-        if @since_flush >= 40          # flush em lotes, nao por linha
-          $_probe_file.flush rescue nil
-          @since_flush = 0
-        end
-      end
-    rescue; end
-    begin; printf("#{line}\n"); rescue; end
-    begin; MKXPDebug.log(line); rescue; end
-  end
+  # >>> ETIQUETA DE VERSAO <<< — confirma no log que estas a correr ESTA versao.
+  # Se NAO vires "[PROBE] === debug_probe V4 ===" no debug_binding.log, estas a
+  # correr um ficheiro antigo (o motor le' o ficheiro errado / nao foi substituido).
+  (MKXPDebug.log("[PROBE] === debug_probe V4 (logger + TSFIX disposeSpritesets, SEM GC.start) ATIVO ===") rescue nil)
 
-  def self.fmt(v)
-    return "nil" if v.nil?
-    return "true" if v == true
-    return "false" if v == false
-    begin
-      s = v.inspect
-      s.length > 80 ? s[0, 80] + "..." : s
-    rescue
-      begin
-        s = v.to_s
-        s.length > 80 ? s[0, 80] + "..." : s
-      rescue
-        "#<#{v.class}>"
-      end
-    end
-  end
+  module DBGTrace
+    @frame        = 0
+    @last_map     = -999999
+    @ts_confirmed = false
+    @last_cmd_key = nil
+    @last_pic_key = {}
 
-  def self.dump_globals
-    pairs = {
-      "$scene"         => $scene,
-      "$game_map"      => $game_map,
-      "$game_player"   => $game_player,
-      "$game_temp"     => $game_temp,
-      "$MapFactory"    => $MapFactory,
-      "$PokemonGlobal" => $PokemonGlobal,
-      "$DEBUG"         => $DEBUG,
-      "$MKXP"          => $MKXP,
-    }
-    log "-- globals --"
-    pairs.each { |n, v| log "  #{n} = #{v.nil? ? 'nil' : v.class}" }
-    log "-- /globals --"
-  end
-
-  def self.dump_bt(bt_or_exc, max=12)
-    bt = bt_or_exc.is_a?(Exception) ? (bt_or_exc.backtrace rescue nil) :
-         bt_or_exc.is_a?(Array)     ? bt_or_exc : nil
-    return log "  (sem backtrace)" unless bt && !bt.empty?
-    bt[0, max].each_with_index { |l, i| log "  bt[#{i}]: #{l}" }
-    log "  ... (+#{bt.length - max})" if bt.length > max
-  end
-
-  def self.dump_error(label, err)
-    log "ERROR #{label}: #{err.class}: #{err.message}"
-    dump_bt(err)
-  end
-end
-
-Probe.log "debug_probe.rb v3 carregado"
-
-# =============================================================================
-# DIAGNÓSTICO CRÍTICO 1: Sprite#initialize -- C-native ou Ruby override?
-# =============================================================================
-begin
-  if Object.const_defined?(:Sprite)
-    src = Sprite.instance_method(:initialize).source_location rescue nil
-    if src.nil?
-      Probe.log "[SPRITE_CHECK] Sprite#initialize = C-native (OK -- spr_init activo)"
-    else
-      Probe.log "[SPRITE_CHECK] PROBLEMA: Sprite#initialize = Ruby #{src.inspect}"
-      Probe.log "[SPRITE_CHECK] Aplicando fix: remove_method(:initialize)..."
-      fixed = false
-      begin
-        Sprite.send(:remove_method, :initialize)
-        src2 = Sprite.instance_method(:initialize).source_location rescue nil
-        if src2.nil?
-          Probe.log "[SPRITE_CHECK] FIXED via remove_method: agora C-native"
-          fixed = true
-        else
-          Probe.log "[SPRITE_CHECK] ainda Ruby apos remove_method: #{src2.inspect}"
-        end
-      rescue => e
-        Probe.log "[SPRITE_CHECK] remove_method falhou: #{e.class}: #{e.message}"
-      end
-      unless fixed
+    class << self
+      # --- escrita segura no debug_binding.log -------------------------------
+      def w(s)
         begin
-          Sprite.class_eval { undef_method :initialize }
-          src3 = Sprite.instance_method(:initialize).source_location rescue nil
-          Probe.log "[SPRITE_CHECK] apos undef_method: #{src3.nil? ? 'C-native OK' : "ainda Ruby #{src3.inspect}"}"
-        rescue => e2
-          Probe.log "[SPRITE_CHECK] undef_method tambem falhou: #{e2.message}"
+          MKXPDebug.log(s.to_s)
+        rescue
+          # último recurso: não fazer nada (nunca crashar por causa de log)
         end
       end
-    end
 
-    # Listar TODOS os metodos Ruby definidos directamente em Sprite
-    begin
-      ruby_methods = []
-      Sprite.instance_methods(false).each do |m|
-        src = Sprite.instance_method(m).source_location rescue nil
-        ruby_methods << [m, src] if src
-      end
-      if ruby_methods.empty?
-        Probe.log "[SPRITE_RUBY_METHODS] nenhum metodo Ruby directo em Sprite (OK)"
-      else
-        Probe.log "[SPRITE_RUBY_METHODS] #{ruby_methods.size} metodos Ruby em Sprite:"
-        ruby_methods.each { |m, src| Probe.log "[SPRITE_RUBY_METHODS]   #{m} => #{src.inspect}" }
-      end
-    rescue => e
-      Probe.log "[SPRITE_RUBY_METHODS] erro: #{e.message}"
-    end
-
-  else
-    Probe.log "[SPRITE_CHECK] Sprite nao existe"
-  end
-rescue => e
-  Probe.log "[SPRITE_CHECK] erro geral: #{e.message}"
-end
-
-# =============================================================================
-# DIAGNÓSTICO CRÍTICO 2: BitmapWrapper MRB_TT_DATA
-# =============================================================================
-begin
-  if Object.const_defined?(:BitmapWrapper) && Object.const_defined?(:Sprite)
-    anc = BitmapWrapper.ancestors.first(3).map(&:to_s) rescue []
-    Probe.log "[BW_CHECK] BitmapWrapper ancestors=#{anc.inspect}"
-
-    # --- Inspeccionar initialize do BitmapWrapper ---
-    begin
-      src_bw = BitmapWrapper.instance_method(:initialize).source_location rescue nil
-      Probe.log "[BW_INIT] initialize source_location=#{src_bw.inspect}"
-    rescue => e
-      Probe.log "[BW_INIT] erro: #{e.message}"
-    end
-
-    # --- Listar todos os metodos Ruby definidos directamente em BitmapWrapper ---
-    begin
-      bw_ruby_methods = []
-      BitmapWrapper.instance_methods(false).each do |m|
-        src = BitmapWrapper.instance_method(m).source_location rescue nil
-        bw_ruby_methods << [m, src]
-      end
-      Probe.log "[BW_METHODS] #{bw_ruby_methods.size} metodos em BitmapWrapper:"
-      bw_ruby_methods.each { |m, src| Probe.log "[BW_METHODS]   #{m} => #{src.inspect}" }
-    rescue => e
-      Probe.log "[BW_METHODS] erro: #{e.message}"
-    end
-
-    _bw = BitmapWrapper.new(4, 4) rescue nil
-    if _bw
-      Probe.log "[BW_CHECK] BitmapWrapper.new(4,4) OK: #{_bw.width rescue '?'}x#{_bw.height rescue '?'}"
-
-      # --- CRITICO: listar todas as ivars da instancia ---
-      begin
-        ivars = _bw.instance_variables rescue []
-        Probe.log "[BW_IVARS] instance_variables=#{ivars.inspect}"
-        ivars.each do |iv|
-          val = _bw.instance_variable_get(iv) rescue "ERRO"
-          Probe.log "[BW_IVARS]   #{iv} = #{val.nil? ? 'nil' : val.class} (#{val.inspect rescue val.to_s rescue '?'})"
+      def dims(b)
+        return "nil" if b.nil?
+        begin
+          return "disposed" if b.disposed?
+        rescue
         end
-        if ivars.empty?
-          Probe.log "[BW_IVARS] NENHUMA ivar! BitmapWrapper nao guarda o Bitmap base como ivar."
-          Probe.log "[BW_IVARS] O DATA_PTR tem de estar na propria instancia ou via heranca C."
+        begin
+          return "#{b.width}x#{b.height}"
+        rescue
+          return "?"
         end
-      rescue => e
-        Probe.log "[BW_IVARS] erro: #{e.message}"
       end
 
-      # --- Testar todos os metodos de acesso possiveis ---
-      begin
-        [:bitmap, :base, :__bmp__, :inner, :raw, :data, :wrapped].each do |m|
-          if _bw.respond_to?(m)
-            v = _bw.send(m) rescue "ERRO"
-            Probe.log "[BW_ACCESSOR] #{m} -> #{v.nil? ? 'nil' : v.class}"
+      # --- tenta obter o bitmap do tileset REALMENTE carregado no spriteset ---
+      # Devolve string de dimensões (ou "?"). 32x32 = fallback magenta.
+      def tileset_bitmap_dims(scene)
+        begin
+          spritesets = scene.instance_variable_get(:@spritesets)
+          return "?(sem @spritesets)" unless spritesets
+          ss = nil
+          begin
+            ss = spritesets[$game_map.map_id]
+          rescue
+          end
+          ss ||= (spritesets.values[0] rescue nil)
+          return "?(sem spriteset)" unless ss
+          tm = ss.instance_variable_get(:@tilemap)
+          return "?(sem @tilemap)" unless tm
+          # CustomTilemap (PE) guarda @tileset; TilemapLoader pode variar
+          tb = tm.instance_variable_get(:@tileset)
+          return dims(tb)
+        rescue => e
+          return "?(#{e.class})"
+        end
+      end
+
+      # --- bloco detalhado ao mudar de mapa ----------------------------------
+      def dump_map(scene)
+        begin
+          m = $game_map
+          mid = (m.map_id rescue -1)
+          name = nil
+          name = (pbGetMapNameFromId(mid) rescue nil)
+          name = name.to_s if name   # sem regex (mruby pode nao ter Onigmo)
+          size = "?"
+          begin; size = "#{m.width}x#{m.height}"; rescue; end
+          tsid = nil; tsname = nil
+          begin
+            md = m.instance_variable_get(:@map)
+            tsid = md.tileset_id
+            tsname = $data_tilesets[tsid].tileset_name
+          rescue
+          end
+          pano = nil; fog = nil
+          begin
+            md = m.instance_variable_get(:@map)
+            pano = (md.panorama_name rescue nil)
+            fog  = (md.fog_name rescue nil)
+          rescue
+          end
+          nev = 0
+          begin; nev = m.events.size; rescue; end
+          w("[MAPDUMP] ===== MAPA #{mid} '#{name}' size=#{size} " \
+            "tileset_id=#{tsid} tileset='#{tsname}' " \
+            "panorama='#{pano}' fog='#{fog}' eventos=#{nev}")
+
+          # eventos do mapa
+          begin
+            m.events.each do |id, ev|
+              evn = (ev.name rescue "?")
+              ex = (ev.x rescue -1); ey = (ev.y rescue -1)
+              ch = ""
+              begin
+                pg = ev.instance_variable_get(:@page)
+                ch = (pg.graphic.character_name rescue "") if pg
+              rescue
+              end
+              w("[MEVENT]   ev=#{id} '#{evn}' xy=(#{ex},#{ey}) char='#{ch}'")
+            end
+          rescue => e
+            w("[MEVENT|ERR] #{e.class}: #{e.message}")
+          end
+        rescue => e
+          w("[MAPDUMP|ERR] #{e.class}: #{e.message}")
+        end
+      end
+
+      # --- interpreter atual (qual comando corre) ----------------------------
+      def current_interp
+        ints = []
+        begin
+          gi = ($game_system.map_interpreter rescue nil)
+          ints << gi if gi
+        rescue
+        end
+        begin
+          mi = ($game_map.interpreter rescue nil)
+          ints << mi if mi
+        rescue
+        end
+        ints.each do |it|
+          begin
+            next unless it.running?
+            return it
+          rescue
           end
         end
-      rescue => e
-        Probe.log "[BW_ACCESSOR] erro: #{e.message}"
+        nil
       end
 
-      _spr = Sprite.new rescue nil
-      if _spr
+      def interp_index(it)
+        return -1 unless it
+        (it.instance_variable_get(:@index) rescue -1)
+      end
+
+      # --- chamado TODOS os frames ------------------------------------------
+      def per_frame(scene)
+        @frame += 1
         begin
-          _spr.bitmap = _bw
-          _got = _spr.bitmap rescue nil
-          Probe.log "[BW_CHECK] Sprite.bitmap= OK: bitmap=#{_got.nil? ? 'nil (DATA_PTR FALHOU!)' : _got.class}"
-        rescue => e
-          Probe.log "[BW_CHECK] Sprite.bitmap= CRASH: #{e.class}: #{e.message}"
-        ensure
-          _spr.dispose rescue nil
-        end
-      else
-        Probe.log "[BW_CHECK] Sprite.new falhou"
-      end
-    else
-      Probe.log "[BW_CHECK] BitmapWrapper.new falhou"
-    end
-  end
-rescue => e
-  Probe.log "[BW_CHECK] erro: #{e.message}"
-end
+          gm = $game_map
+          mid = (gm.map_id rescue -999)
 
-# =============================================================================
-# DIAGNÓSTICO 3: Subclasses de Sprite com initialize Ruby
-# =============================================================================
-begin
-  [
-    "Sprite_Character", "Sprite_Reflection", "Sprite_SurfBase",
-    "Sprite_Timer", "Sprite_Picture", "Sprite_DynamicShadows",
-    "Sprite_Battler", "IconSprite", "AnimatedSprite", "MosaicSprite",
-  ].each do |klass_name|
-    next unless Object.const_defined?(klass_name)
-    klass = Object.const_get(klass_name)
-    next unless klass.method_defined?(:initialize)
-    src = klass.instance_method(:initialize).source_location rescue nil
-    if src
-      Probe.log "[SUBSPRITE_CHECK] #{klass_name}#initialize = Ruby #{src.inspect}"
-    else
-      Probe.log "[SUBSPRITE_CHECK] #{klass_name}#initialize = C-native"
-    end
-  end
-rescue => e
-  Probe.log "[SUBSPRITE_CHECK] erro: #{e.message}"
-end
+          # mudança de mapa -> bloco detalhado + (re)confirmar tileset
+          if mid != @last_map
+            @last_map = mid
+            @ts_confirmed = false
+            @last_cmd_key = nil
+            @last_pic_key = {}
+            w("[MAPDUMP] >>>>>> MUDANCA DE MAPA no frame #{@frame} (novo map_id=#{mid}) <<<<<<")
+            dump_map(scene)
+          end
 
-# =============================================================================
-# PATCH: method_missing verboso
-# =============================================================================
-begin
-  class Object
-    def method_missing(m, *a, &blk)
-      n   = m.to_s
-      key = "#{self.class}##{n}"
-      if $_seen_errors && $_seen_errors[key]
-        $_seen_errors[key] += 1
-      else
-        $_seen_errors[key] = 1 if $_seen_errors
-        $_error_order << key if $_error_order
-        args_s = a.length > 0 ? "(#{a.map{|x| x.inspect rescue '?'}.join(',')[0,60]})" : "()"
-        Probe.log "MISSING #{key}#{args_s}"
-      end
-      n2 = n
-      return nil   if n2.start_with?("update","draw","dispose","refresh","clear",
-                                     "create","setup","start","terminate","pbOn",
-                                     "pbOff","set","load","save","init","reset",
-                                     "show","hide")
-      return false if n2.end_with?("?")
-      return false if n2.start_with?("is_","has_","can_","should_","will_")
-      return []    if n2.start_with?("all","list","each","get_all","find_all")
-      return ""    if n2.start_with?("name","title","filename","path",
-                                    "character","charset","tileset","text")
-      nil
-    end
-    def respond_to_missing?(m, ip=false); true; end
-  end
-  Probe.log "PATCH method_missing OK"
-rescue => e
-  Probe.log "PATCH method_missing falhou: #{e.message}"
-end
+          # dimensões reais do tileset carregado (tenta até conseguir)
+          unless @ts_confirmed
+            d = tileset_bitmap_dims(scene)
+            if d && d[0, 1] != "?"
+              flag = (d == "32x32") ? " <<<< 32x32 = FALLBACK MAGENTA (TILESET FALHOU)" : ""
+              w("[TSTAT] map=#{mid} tileset_bitmap=#{d}#{flag}")
+              @ts_confirmed = true
+            end
+          end
 
-# =============================================================================
-# PATCH: SceneProbe
-# =============================================================================
-begin
-  $_probe_scene_crashes = {}
+          # linha compacta por frame
+          sc  = (scene.class.name rescue "?")
+          cam = "-"
+          begin; cam = "(#{gm.display_x},#{gm.display_y})"; rescue; end
+          plr = "-"
+          begin
+            plr = "(#{$game_player.x},#{$game_player.y}/d#{$game_player.direction}" \
+                  "#{$game_player.moving? ? '/mov' : ''})"
+          rescue
+          end
+          it = current_interp
+          idx = interp_index(it)
+          w("[TF] f=#{@frame} sc=#{sc} map=#{mid} cam=#{cam} plr=#{plr} interp_idx=#{idx}")
 
-  module SceneProbe
-    def self.run(scene)
-      return if scene.nil?
-      klass = scene.class.to_s
-      Probe.log "SCENE start: #{klass}"
-      begin
-        Graphics.transition(0)
-      rescue => e
-        Probe.log "SCENE transition FALHOU: #{e.message}"
-      end
-      begin
-        scene.main
-        Probe.log "SCENE end ok: #{klass} -> $scene=#{$scene.nil? ? 'nil' : $scene.class}"
-        $_probe_scene_crashes[klass] = 0
-      rescue => e
-        count = ($_probe_scene_crashes[klass] ||= 0) + 1
-        $_probe_scene_crashes[klass] = count
-        Probe.log "SCENE CRASH ##{count}: #{klass}: #{e.class}: #{e.message}"
-        Probe.dump_bt(e)
-        Probe.dump_globals
-        $scene = nil
-      end
-    end
-  end
-  Probe.log "PATCH SceneProbe OK"
-rescue => e
-  Probe.log "PATCH SceneProbe falhou: #{e.message}"
-end
-
-# =============================================================================
-# PATCH: mainFunctionDebug verboso
-# =============================================================================
-begin
-  if respond_to?(:mainFunctionDebug)
-    alias __probe_mFD_orig mainFunctionDebug
-
-    def mainFunctionDebug
-      step = 0
-      Probe.log "mainFunctionDebug START"
-
-      # =======================================================================
-      # FIX CRÍTICO: BitmapWrapper#initialize Ruby -> remover para restaurar C-native
-      # O patch MFD em C++ adiciona um initialize Ruby ao BitmapWrapper que nao
-      # chama super, por isso DATA_PTR fica NULL. Este fix corre aqui, DEPOIS
-      # do patch MFD ter sido aplicado (ao contrario do rgss_stubs.rb que corre antes).
-      # =======================================================================
-      begin
-        if Object.const_defined?(:BitmapWrapper)
-          src = BitmapWrapper.instance_method(:initialize).source_location rescue nil
-          Probe.log "[BW_FIX] initialize source_location=#{src.inspect}"
-          if src
-            removed = false
+          # comando do interpreter em execução (só quando muda)
+          if it
             begin
-              BitmapWrapper.send(:remove_method, :initialize)
-              src2 = BitmapWrapper.instance_method(:initialize).source_location rescue nil
-              if src2.nil?
-                Probe.log "[BW_FIX] remove_method OK -- C-native restaurado"
-                removed = true
-              else
-                Probe.log "[BW_FIX] remove_method OK mas ainda Ruby: #{src2.inspect}"
+              eid = (it.instance_variable_get(:@event_id) rescue -1)
+              lst = (it.instance_variable_get(:@list) rescue nil)
+              if lst && lst[idx]
+                cmd = lst[idx]
+                code = (cmd.code rescue -1)
+                par  = (cmd.parameters rescue [])
+                key  = "#{mid}:#{eid}:#{idx}:#{code}"
+                if key != @last_cmd_key
+                  @last_cmd_key = key
+                  ps = par.inspect rescue "?"
+                  ps = ps[0, 160] if ps.length > 160
+                  w("[TCMD] map=#{mid} ev=#{eid} idx=#{idx} code=#{code} params=#{ps}")
+                end
               end
             rescue => e
-              Probe.log "[BW_FIX] remove_method falhou: #{e.message}"
+              w("[TCMD|ERR] #{e.class}: #{e.message}")
             end
-            unless removed
+          end
+
+          # imagens (Game_Picture) — log quando mudam
+          begin
+            scr = ($game_screen rescue nil)
+            if scr
+              pics = (scr.pictures rescue nil)
+              if pics
+                pics.each_with_index do |pic, i|
+                  next if pic.nil?
+                  nm = (pic.name rescue "")
+                  next if nm.nil? || nm == ""
+                  px = (pic.x rescue 0); py = (pic.y rescue 0)
+                  op = (pic.opacity rescue 0)
+                  key = "#{nm}|#{px.to_i}|#{py.to_i}|#{op.to_i}"
+                  if @last_pic_key[i] != key
+                    @last_pic_key[i] = key
+                    w("[TPIC] map=#{mid} pic##{i} name='#{nm}' xy=(#{px.to_i},#{py.to_i}) opac=#{op.to_i}")
+                  end
+                end
+              end
+            end
+          rescue => e
+            w("[TPIC|ERR] #{e.class}: #{e.message}")
+          end
+
+        rescue => e
+          w("[TERR] frame #{@frame}: #{e.class}: #{e.message}")
+        end
+      end
+    end
+  end
+
+  # --- HOOK: Scene_Map#update corre TODOS os frames em qualquer mapa ----------
+  # IMPORTANTE: usamos ALIAS-CHAINING (NAO prepend). O porte aplica os seus
+  # proprios patches a Scene_Map#update com `alias __orig update` DEPOIS deste
+  # probe. Com PREPEND, esse alias do porte captura o nosso modulo prepended e
+  # cria uma cadeia re-entrante partida -> o Scene_Map#update ORIGINAL (que corre
+  # pbMapInterpreter.update = o autorun) nunca e' alcançado -> ecra preto.
+  # Com alias-chaining, o porte encadeia POR CIMA do nosso (port -> nosso ->
+  # original), tudo corre, e o autorun arranca normalmente.
+  if defined?(Scene_Map)
+    class Scene_Map
+      unless method_defined?(:__dbgtrace_orig_update)
+        alias_method :__dbgtrace_orig_update, :update
+        def update(*a, &b)
+          __dbgtrace_orig_update(*a, &b)   # corre o update REAL (autorun incluido)
+          DBGTrace.per_frame(self)         # so' DEPOIS, logamos o estado
+        end
+      end
+    end
+    MKXPDebug.log("[PROBE] DBGTrace instalado em Scene_Map#update via alias-chaining (logger por-mapa frame-a-frame)")
+  else
+    MKXPDebug.log("[PROBE|AVISO] Scene_Map ainda nao definido — hook NAO instalado")
+  end
+
+  # ===========================================================================
+  #  FIX (NAO e' so' log!) — DESTRUIR SPRITESETS ANTIGOS ANTES DE CRIAR OS NOVOS
+  # ---------------------------------------------------------------------------
+  #  CAUSA RAIZ (provada pelo log): os tilesets NAO sao cacheados (pbGetTileset
+  #  cria um AnimatedBitmap novo). Ao mudar de mapa, o createSpritesets faz
+  #  `@spritesets = {}` -> DESREFERENCIA o spriteset antigo mas NAO o destroi.
+  #  O tileset antigo (ex: 'Gen4 Outside Town' 15.5MB RGBA4444) fica em malloc
+  #  a' espera do GC; quando o tileset do mapa novo (ex: 'Gen4 Interior' 8.5MB)
+  #  carrega, o malloc esta' cheio com o orfao -> falha -> magenta (Map3 casa).
+  #
+  #  PORQUE NAO GC.start: neste porte os Bitmap tem TEXTURA C++ por baixo. Um GC
+  #  global finaliza objetos cujas texturas o renderer ainda usa e mexe na
+  #  afinacao geracional do porte -> ECRA PRETO na cutscene (regressao observada).
+  #
+  #  FIX CIRURGICO: chamar disposeSpritesets() no inicio do createSpritesets. Isso
+  #  destroi os spritesets antigos PELA VIA NORMAL do jogo -> Spriteset_Map#dispose
+  #  faz `@tilemap.tileset.dispose` (liberta o tileset 4444, 15.5MB) ANTES de os
+  #  novos serem criados. Sem GC global, so' liberta o que ja' nao e' usado.
+  #  SEGURANCA: no 1o mapa (cutscene da professora) @spritesets e' nil ->
+  #  disposeSpritesets faz `return if !@spritesets` -> NAO destroi nada -> a
+  #  cutscene fica 100% intacta. So' a vila/casa (mapas seguintes) disparam isto.
+  #  alias-chaining (o porte tambem faz wrapper de createSpritesets).
+  if defined?(Scene_Map) && Scene_Map.method_defined?(:createSpritesets)
+    class Scene_Map
+      unless method_defined?(:__dbgfix_orig_createSpritesets)
+        alias_method :__dbgfix_orig_createSpritesets, :createSpritesets
+        def createSpritesets(*a, &b)
+          begin
+            had = (@spritesets && !@spritesets.empty?)
+            if had
+              MKXPDebug.log("[TSFIX] createSpritesets -> disposeSpritesets primeiro (libertar #{@spritesets.size} spriteset(s)+tileset(s) antigos)") rescue nil
+              disposeSpritesets
+            end
+          rescue => e
+            MKXPDebug.log("[TSFIX|ERR] #{e.class}: #{e.message}") rescue nil
+          end
+          __dbgfix_orig_createSpritesets(*a, &b)
+        end
+      end
+    end
+    MKXPDebug.log("[PROBE] TSFIX instalado: disposeSpritesets no inicio de Scene_Map#createSpritesets")
+  else
+    MKXPDebug.log("[PROBE|AVISO] Scene_Map#createSpritesets nao definido — TSFIX NAO instalado")
+  end
+
+rescue => e
+  begin
+    MKXPDebug.log("[PROBE|FATAL] #{e.class}: #{e.message}")
+  rescue
+  end
+end
+
+# =============================================================================
+# [TMDBG] DIAGNOSTICO DO QUARTO PRETO (render do tilemap com tileset 4444 gigante)
+# -----------------------------------------------------------------------------
+# Tudo no caminho ESTATICO esta correto (tileset 4444 carrega, mega?=false,
+# px_read le 4444, bmp_blt le qualquer y, camada 832x704 como o Map1). O preto e'
+# RUNTIME. Este hook regista, 1x por mapa, o estado REAL no momento do render:
+#   - se refreshLayer0 corre para o mapa do quarto (Map3)
+#   - @tileset: nil / DISPOSTO / dims + native_4444?  (e' o suspeito principal)
+#   - @layer0.bitmap: nil / DISPOSTO / dims
+#   - @shouldWrap (deve ser false), @firsttime, @usedsprites
+#   - se o refresh apanha alguma EXCECAO (que o jogo engole -> preto)
+# Com isto, o proximo log diz exatamente porque o quarto fica preto.
+# =============================================================================
+begin
+  if Object.const_defined?(:CustomTilemap)
+    klass = CustomTilemap
+    if klass.method_defined?(:refreshLayer0) && !klass.method_defined?(:__tmdbg_refreshLayer0)
+      klass.class_eval do
+        alias_method :__tmdbg_refreshLayer0, :refreshLayer0
+        def refreshLayer0(autotiles = false)
+          begin
+            @@__tmdbg_seen ||= {}
+            mid = ($game_map.map_id rescue -1)
+            key = "#{mid}_#{autotiles}"
+            unless @@__tmdbg_seen[key]
+              @@__tmdbg_seen[key] = true
+              ts = (@tileset rescue nil)
+              tsdesc =
+                if ts.nil? then "nil"
+                elsif (ts.disposed? rescue false) then "DISPOSTO!"
+                else "#{(ts.width rescue '?')}x#{(ts.height rescue '?')} 4444=#{(ts.native_4444? rescue '?')}"
+                end
+              lb = (@layer0.bitmap rescue nil)
+              lbdesc =
+                if lb.nil? then "nil"
+                elsif (lb.disposed? rescue false) then "DISPOSTO!"
+                else "#{(lb.width rescue '?')}x#{(lb.height rescue '?')}"
+                end
+              md = (@map_data rescue nil)
+              mddesc = md.nil? ? "nil" : "#{(md.xsize rescue '?')}x#{(md.ysize rescue '?')}x#{(md.zsize rescue '?')}"
+              MKXPDebug.log("[TMDBG] refreshLayer0 map=#{mid} auto=#{autotiles} " \
+                "@tileset=#{tsdesc} @layer0.bmp=#{lbdesc} map_data=#{mddesc} " \
+                "shouldWrap=#{(@shouldWrap rescue '?')} firsttime=#{(@firsttime rescue '?')} " \
+                "usedsprites=#{(@usedsprites rescue '?')} diffsizes=#{(@diffsizes rescue '?')}") rescue nil
+            end
+          rescue => ie
+            (MKXPDebug.log("[TMDBG] log-estado falhou: #{ie.class}: #{ie.message}") rescue nil)
+          end
+          begin
+            return __tmdbg_refreshLayer0(autotiles)
+          rescue => e
+            (MKXPDebug.log("[TMDBG] refreshLayer0 EXCECAO map=#{($game_map.map_id rescue -1)}: #{e.class}: #{e.message}") rescue nil)
+            raise
+          end
+        end
+      end
+      (MKXPDebug.log("[TMDBG] hook refreshLayer0 instalado OK") rescue nil)
+    else
+      (MKXPDebug.log("[TMDBG] refreshLayer0 ausente ou ja' hookado") rescue nil)
+    end
+  else
+    (MKXPDebug.log("[TMDBG] CustomTilemap AUSENTE — render e' outro caminho") rescue nil)
+  end
+rescue => e
+  (MKXPDebug.log("[TMDBG] instalacao do hook falhou: #{e.class}: #{e.message}") rescue nil)
+end
+
+# =============================================================================
+# [LOADMAP] TIMELINE DE CARGAS DE TILESET (responde a "o que carrega em cada momento")
+# -----------------------------------------------------------------------------
+# Embrulha pbGetTileset para registar UMA linha consolidada por carga:
+#   - que MAPA esta' a carregar (map_id)
+#   - que TILESET (nome) e dimensoes (WxH) -> ve's logo os gigantes (256x31040)
+#   - tempo de DECODE em ms -> ve's o gargalo (~2800ms nos gigantes)
+# Assim, filtrando "[LOADMAP]" no log, tens a sequencia exata: que mapa puxou que
+# tileset e quanto custou. So' logging -- chama o pbGetTileset original, nao altera
+# comportamento. (O decode real continua a ser logado pelo [BMP|PNG4444] do C++.)
+# =============================================================================
+begin
+  if Object.respond_to?(:pbGetTileset, true) && !$__mkxp_loadmap_hooked
+    $__mkxp_loadmap_hooked = true
+    $__mkxp_loadmap_seq ||= 0
+    class Object
+      alias __loadmap_orig_pbGetTileset pbGetTileset
+      def pbGetTileset(name, hue = 0)
+        st = (Time.now rescue nil)
+        r = __loadmap_orig_pbGetTileset(name, hue)
+        begin
+          dt = st ? ((Time.now - st) * 1000.0).to_i : -1
+          mid = ($game_map.map_id rescue -1)
+          w = (r.width rescue '?'); h = (r.height rescue '?')
+          $__mkxp_loadmap_seq += 1
+          giant = (h.is_a?(Integer) && h > 4096) ? " GIGANTE" : ""
+          MKXPDebug.log("[LOADMAP] ##{$__mkxp_loadmap_seq} map=#{mid} tileset='#{name}' #{w}x#{h}#{giant} decode=#{dt}ms") rescue nil
+        rescue; end
+        r
+      end
+    end
+    (MKXPDebug.log("[LOADMAP] timeline de cargas de tileset instalada") rescue nil)
+  end
+rescue => e
+  (MKXPDebug.log("[LOADMAP] instalacao falhou: #{e.class}: #{e.message}") rescue nil)
+end
+
+# =============================================================================
+#  PLAYERFIX  —  $game_player estava nil (NilClass) => jogador "congelado" (0,0)
+# -----------------------------------------------------------------------------
+#  RAIZ (provada pelo log:  "[Scene_Map] $game_player real=, class=NilClass"):
+#  SaveData.load_new_game_values falhou e $game_player ficou NIL. O port adicionou
+#  metodos a NilClass (nil.x -> 0, nil.real_x -> 0, nil.moveto -> NAO faz nada),
+#  por isso o jogador FINGE estar sempre em (0,0):
+#     - os "Transfer Player" (ex.: intro -> quarto em 22,8) NAO o movem
+#     - os "Set Move Route" (caminhada da intro) NAO funcionam
+#     - a camara fica presa em (0,0)  (display_x = real_x - centro = 0 - centro)
+#  => o QUARTO mostra o floor 0 (NPCs) em vez do floor 1, e a intro nao "anda".
+#
+#  O port JA' corrige $game_switches/$game_variables/$game_temp/$game_system da
+#  mesma maneira em Scene_Map#main, mas ESQUECEU-SE do $game_player. Aqui criamos
+#  um Game_Player REAL antes de o mapa arrancar. Com um player real, o moveto
+#  volta a funcionar e TUDO (posicao + camara + move-routes) fica correcto.
+#  (Confirma no log: deves ver "[PLAYERFIX] ... criado Game_Player REAL" e, a
+#   seguir, o [TF] deixa de mostrar plr=(0,0) — passa a mostrar a posicao real.)
+# =============================================================================
+begin
+  if defined?(Scene_Map) && Scene_Map.method_defined?(:main) && !$__playerfix_installed
+    $__playerfix_installed = true
+    class Scene_Map
+      alias_method :__playerfix_orig_main, :main
+      def main
+        begin
+          real = ($game_player && $game_player.is_a?(Game_Player)) rescue false
+          unless real
+            if Object.const_defined?(:Game_Player)
+              $game_player = Game_Player.new
+              sx = 0; sy = 0
               begin
-                BitmapWrapper.class_eval { undef_method :initialize }
-                src3 = BitmapWrapper.instance_method(:initialize).source_location rescue nil
-                Probe.log "[BW_FIX] undef_method: #{src3.nil? ? 'C-native OK' : "ainda Ruby #{src3.inspect}"}"
-              rescue => e2
-                Probe.log "[BW_FIX] undef_method tambem falhou: #{e2.message}"
-              end
-            end
-            # Verificar com instancia real
-            begin
-              _t = BitmapWrapper.new(4, 4)
-              Probe.log "[BW_FIX] BitmapWrapper.new(4,4) apos fix: #{_t.width rescue '?'}x#{_t.height rescue '?'}"
-              _s = Sprite.new rescue nil
-              if _s
-                _s.bitmap = _t
-                got = _s.bitmap rescue nil
-                Probe.log "[BW_FIX] Sprite.bitmap= apos fix: #{got.nil? ? 'nil (AINDA FALHOU)' : got.class + ' (OK!)'}"
-                _s.dispose rescue nil
-              end
-            rescue => e3
-              Probe.log "[BW_FIX] teste pos-fix falhou: #{e3.message}"
+                sx = $data_system.start_x.to_i if $data_system.respond_to?(:start_x)
+                sy = $data_system.start_y.to_i if $data_system.respond_to?(:start_y)
+              rescue; end
+              ($game_player.moveto(sx, sy) rescue nil)
+              (MKXPDebug.log("[PLAYERFIX] $game_player era nil/stub -> criado Game_Player REAL @ (#{sx},#{sy}). Transfers/move-routes/camara passam a funcionar.") rescue nil)
             end
           else
-            Probe.log "[BW_FIX] initialize ja e C-native antes do fix (OK)"
+            (MKXPDebug.log("[PLAYERFIX] $game_player ja' era real (#{$game_player.class}) -- sem accao") rescue nil)
           end
-        else
-          Probe.log "[BW_FIX] BitmapWrapper nao existe"
+        rescue => e
+          (MKXPDebug.log("[PLAYERFIX] falhou: #{e.class}: #{e.message}") rescue nil)
         end
-      rescue => e
-        Probe.log "[BW_FIX] erro geral: #{e.message}"
-      end
-
-      begin
-        step = 1; MessageTypes.loadMessageFile("Data/messages.dat") if safeExists?("Data/messages.dat")
-        step = 2; PluginManager.runPlugins
-        step = 3; Compiler.main
-        step = 4; Game.initialize
-        step = 5; Game.set_up_system
-        begin; $PokemonSystem = PokemonSystem.new unless $PokemonSystem; rescue; end
-        Probe.log "step5 OK"; Probe.dump_globals
-        step = 6; Graphics.update
-        step = 7; Graphics.freeze
-        step = 8
-        $scene = pbCallTitle
-        Probe.log "step8 OK: $scene=#{$scene.nil? ? 'nil' : $scene.class}"
-        step = 9
-        if $scene.nil?
-          Probe.log "WARNING: $scene nil antes do scene loop"
-        else
-          scene_crashes = 0
-          loop do
-            break if $scene.nil?
-            break if scene_crashes >= 30
-            prev = $scene
-            SceneProbe.run($scene)
-            scene_crashes += 1 if $scene.nil? && !prev.nil?
-          end
-          Probe.log "scene loop end (crashes=#{scene_crashes})"
-        end
-        step = 10; Graphics.transition(20)
-        Probe.log "mainFunctionDebug DONE -> 1"
-        return 1
-      rescue => e
-        Probe.log "CRASH step #{step}: #{e.class}: #{e.message}"
-        Probe.dump_bt(e)
-        Probe.dump_globals
-        raise RuntimeError, "[STEP #{step}] #{e.class}: #{e.message}"
+        __playerfix_orig_main
       end
     end
-    Probe.log "PATCH mainFunctionDebug OK"
+    (MKXPDebug.log("[PLAYERFIX] hook Scene_Map#main instalado (cria $game_player real se faltar)") rescue nil)
   else
-    Probe.log "AVISO: mainFunctionDebug nao existe ainda"
+    (MKXPDebug.log("[PLAYERFIX|AVISO] Scene_Map#main indisponivel ou ja' instalado") rescue nil)
   end
 rescue => e
-  Probe.log "PATCH mainFunctionDebug falhou: #{e.message}"
+  (MKXPDebug.log("[PLAYERFIX] instalacao falhou: #{e.class}: #{e.message}") rescue nil)
 end
 
 # =============================================================================
-# PATCH: wrap initialize das classes principais
+#  TMGUARD  —  CustomTilemap#refresh rebenta com @map_data nil durante transfer
+# -----------------------------------------------------------------------------
+#  CAUSA (provada pelo log, stack: clamp <- refresh):
+#    all_core.rb:15117  minX = minX.clamp(0, xsize - 1)
+#  Durante um transfer o tilemap novo e' criado com @map_data = nil. Como o port
+#  pos metodos no NilClass, nil.xsize devolve 0 -> clamp(0, 0-1) = clamp(0,-1)
+#  -> "min argument must be smaller than max argument" -> Spriteset_Map#update
+#  rebenta -> ecra preto. Antes (player nil) os efeitos nunca chamavam este
+#  refresh; com o player REAL (correcto), as pegadas/efeitos chamam-no enquanto
+#  o mapa ainda carrega. Saltamos o refresh enquanto @map_data nao esta pronto.
 # =============================================================================
 begin
-  [
-    "Spriteset_Map", "Spriteset_Global",
-    "Scene_Map", "Scene_DebugIntro",
-    "Sprite_Character", "Sprite_Reflection", "Sprite_SurfBase",
-  ].each do |klass_name|
-    begin
-      klass = Object.const_get(klass_name)
-      next unless klass.method_defined?(:initialize)
-      next if klass.method_defined?(:__probe_init_orig)
-      klass.class_eval do
-        alias __probe_init_orig initialize
-        def initialize(*a, &blk)
-          Probe.log "INIT #{self.class}(#{a.map{|x| Probe.fmt(x)}.join(', ')})"
-          begin
-            __probe_init_orig(*a, &blk)
-            Probe.log "INIT #{self.class} OK"
-          rescue => e
-            Probe.log "INIT #{self.class} CRASH: #{e.class}: #{e.message}"
-            Probe.dump_bt(e)
-            raise
-          end
-        end
-      end
-      Probe.log "PATCH INIT #{klass_name} OK"
-    rescue => e
-      Probe.log "PATCH INIT #{klass_name} falhou: #{e.message}"
-    end
-  end
-rescue => e
-  Probe.log "PATCH INIT blocks falhou: #{e.message}"
-end
-
-# =============================================================================
-# PATCH: at_exit summary
-# =============================================================================
-begin
-  at_exit do
-    begin
-      Probe.log "=== PROBE SUMMARY at_exit ==="
-      Probe.dump_globals
-      if $_error_order && !$_error_order.empty?
-        sorted = $_error_order.sort_by { |k| -($_seen_errors[k] || 0) }
-        Probe.log "Top 20 missing:"
-        sorted[0, 20].each { |k| Probe.log "  [x#{$_seen_errors[k] || 0}] #{k}" }
-      end
-      Probe.log "=== /PROBE SUMMARY ==="
-    rescue; end
-    begin; $_probe_file.close rescue nil; rescue; end
-  end
-  Probe.log "PATCH at_exit OK"
-rescue => e
-  Probe.log "PATCH at_exit falhou: #{e.message}"
-end
-
-Probe.log "debug_probe.rb v3 todos os patches activos"
-
-# =============================================================================
-# >>> SONDA DE RENDER DO TILEMAP (acrescentada) <<<
-# Usa o Probe.log existente (que escreve no debug_binding.log via MKXPDebug.log).
-# Instrumenta CustomTilemap para descobrir porque o mapa fica preto.
-# Procura no log por:  [PRB] TM
-# Embrulhado em begin/rescue para NUNCA partir o arranque do jogo.
-# =============================================================================
-begin
-  # amostra um bitmap numa grelha e conta pixels opacos (alpha>0)
-  def Probe.bmp_stats(bmp, label, step = 24)
-    begin
-      return "#{label}=nil" if bmp.nil?
-      w = (bmp.width  rescue 0); h = (bmp.height rescue 0)
-      return "#{label}=#{w}x#{h}(vazio)" if w <= 0 || h <= 0
-      samples = 0; opaque = 0; colored = 0; fx = -1; fy = -1
-      y = 0
-      while y < h
-        x = 0
-        while x < w
-          c = (bmp.get_pixel(x, y) rescue nil)
-          if c
-            samples += 1
-            a = (c.alpha rescue 0)
-            if a && a > 0
-              opaque += 1
-              if fx < 0; fx = x; fy = y; end
-              colored += 1 if ((c.red rescue 0).to_i + (c.green rescue 0).to_i + (c.blue rescue 0).to_i) > 0
-            end
-          end
-          x += step
-        end
-        y += step
-      end
-      pct = samples > 0 ? (opaque * 100 / samples) : 0
-      "#{label}=#{w}x#{h} amostras=#{samples} opacos=#{opaque}(#{pct}%) cor=#{colored} 1o@(#{fx},#{fy})"
-    rescue => e
-      "#{label}=ERRO(#{e.message})"
-    end
-  end
-
-  def Probe.mapdata_stats(md)
-    begin
-      return "map_data=nil" if md.nil?
-      xs = (md.xsize rescue 0); ys = (md.ysize rescue 0); zs = (md.zsize rescue 0)
-      return "map_data=#{xs}x#{ys}x#{zs}(vazio)" if xs <= 0 || ys <= 0 || zs <= 0
-      nz = 0; tot = 0; maxid = 0; ge = 0
-      z = 0
-      while z < zs
-        y = 0
-        while y < ys
-          x = 0
-          while x < xs
-            id = (md[x, y, z] rescue 0); id = 0 if id.nil?
-            tot += 1
-            if id != 0; nz += 1; maxid = id if id > maxid; ge += 1 if id >= 384; end
-            x += 1
-          end
-          y += 1
-        end
-        z += 1
-      end
-      "map_data=#{xs}x#{ys}x#{zs} nonzero=#{nz}/#{tot} tiles>=384=#{ge} maxid=#{maxid}"
-    rescue => e
-      "map_data=ERRO(#{e.message})"
-    end
-  end
-
-  def Probe.tiv(o, n); (o.instance_variable_get(n) rescue nil); end
-
-  if Object.const_defined?(:CustomTilemap)
+  if defined?(CustomTilemap) && CustomTilemap.method_defined?(:refresh) && !$__tmguard_installed
+    $__tmguard_installed = true
     class CustomTilemap
-
-      unless method_defined?(:__p_tileset_set)
-        alias_method :__p_tileset_set, :"tileset="
-        def tileset=(v)
-          Probe.log "TM tileset= IN  #{Probe.bmp_stats(v, 'IN')}"
-          r = __p_tileset_set(v)
-          Probe.log "TM tileset= OUT #{Probe.bmp_stats(Probe.tiv(self, :@tileset), '@tileset')} shouldWrap=#{Probe.fmt(Probe.tiv(self, :@shouldWrap))}"
-          r
-        end
-      end
-
-      unless method_defined?(:__p_mapdata_set)
-        alias_method :__p_mapdata_set, :"map_data="
-        def map_data=(v)
-          Probe.log "TM map_data= #{Probe.mapdata_stats(v)}"
-          __p_mapdata_set(v)
-        end
-      end
-
-      unless method_defined?(:__p_update)
-        alias_method :__p_update, :update
-        def update
-          $tm_upd = ($tm_upd || 0) + 1
-          u = $tm_upd
-          Probe.log "TM update ##{u}: tilesetChanged=#{Probe.fmt(Probe.tiv(self,:@tilesetChanged))} ox=#{Probe.fmt(Probe.tiv(self,:@ox))} oy=#{Probe.fmt(Probe.tiv(self,:@oy))} oldOx=#{Probe.fmt(Probe.tiv(self,:@oldOx))} firsttime=#{Probe.fmt(Probe.tiv(self,:@firsttime))} usedsprites=#{Probe.fmt(Probe.tiv(self,:@usedsprites))}" if u <= 4
-          r = __p_update
-          if (u >= 2 && u <= 6) || (u % 120 == 0)
-            l0 = Probe.tiv(self, :@layer0)
-            bm = l0 ? (l0.bitmap rescue nil) : nil
-            Probe.log "TM watch ##{u}: #{Probe.bmp_stats(bm, 'layer0')} layer0.visible=#{l0 ? (l0.visible rescue '?') : 'nil'}"
+      alias_method :__tmguard_orig_refresh, :refresh
+      def refresh(*a)
+        md = (@map_data rescue nil)
+        if md.nil? || (md.xsize rescue 0).to_i <= 0 || (md.ysize rescue 0).to_i <= 0
+          unless $__tmguard_logged
+            (MKXPDebug.log("[TMGUARD] refresh saltado: @map_data nil/vazio (mapa a carregar) -- evita clamp(0,-1)") rescue nil)
+            $__tmguard_logged = true
           end
-          r
+          return
         end
+        __tmguard_orig_refresh(*a)
       end
-
-      unless method_defined?(:__p_refresh)
-        alias_method :__p_refresh, :refresh
-        def refresh(autotiles = false)
-          $tm_ref = ($tm_ref || 0) + 1
-          Probe.log "TM refresh ##{$tm_ref}(autotiles=#{autotiles})" if $tm_ref <= 6
-          __p_refresh(autotiles)
-        end
-      end
-
-      unless method_defined?(:__p_rl0)
-        alias_method :__p_rl0, :refreshLayer0
-        def refreshLayer0(autotiles = false)
-          $tm_rl0 = ($tm_rl0 || 0) + 1
-          n = $tm_rl0
-          deep = (n <= 3)
-          if deep
-            Probe.log "TM ----- refreshLayer0 ##{n} (autotiles=#{autotiles}) -----"
-            Probe.log "TM   firsttime=#{Probe.fmt(Probe.tiv(self,:@firsttime))} usedsprites=#{Probe.fmt(Probe.tiv(self,:@usedsprites))} visible=#{Probe.fmt(Probe.tiv(self,:@visible))} ox=#{Probe.fmt(Probe.tiv(self,:@ox))} oy=#{Probe.fmt(Probe.tiv(self,:@oy))} oxL0=#{Probe.fmt(Probe.tiv(self,:@oxLayer0))} oyL0=#{Probe.fmt(Probe.tiv(self,:@oyLayer0))} layer0clip=#{Probe.fmt(Probe.tiv(self,:@layer0clip))}" rescue nil
-            (Probe.log "TM   shown?=#{self.shown? rescue 'ERRO'}") rescue nil
-            begin
-              vp = Probe.tiv(self, :@viewport); rc = vp ? (vp.rect rescue nil) : nil
-              Probe.log "TM   viewport.rect=#{rc ? "#{rc.width rescue '?'}x#{rc.height rescue '?'}" : 'nil'} vp.ox=#{vp ? (vp.ox rescue '?') : '?'} vp.oy=#{vp ? (vp.oy rescue '?') : '?'}"
-            rescue; end
-            (Probe.log "TM   #{Probe.mapdata_stats(Probe.tiv(self, :@map_data))}") rescue nil
-            (Probe.log "TM   priorities=#{Probe.fmt(Probe.tiv(self,:@priorities))} terrain_tags=#{Probe.fmt(Probe.tiv(self,:@terrain_tags))}") rescue nil
-            (Probe.log "TM   #{Probe.bmp_stats(Probe.tiv(self, :@tileset), '@tileset')}") rescue nil
-            begin
-              l0 = Probe.tiv(self, :@layer0)
-              bm = l0 ? (l0.bitmap rescue nil) : nil
-              sr = l0 ? (l0.src_rect rescue nil) : nil
-              Probe.log "TM   layer0: visible=#{l0 ? (l0.visible rescue '?') : 'nil'} z=#{l0 ? (l0.z rescue '?') : '?'} ox=#{l0 ? (l0.ox rescue '?') : '?'} oy=#{l0 ? (l0.oy rescue '?') : '?'} src_rect=#{sr ? "#{sr.x rescue '?'},#{sr.y rescue '?'},#{sr.width rescue '?'}x#{sr.height rescue '?'}" : 'nil'}"
-              Probe.log "TM   #{Probe.bmp_stats(bm, 'layer0.bmp ANTES')}"
-            rescue; end
-            # TESTE DE BLT: copiar 1 tile do tileset para bitmap temporario
-            begin
-              ts = Probe.tiv(self, :@tileset)
-              if ts && (ts.width rescue 0) > 0
-                tmp = Bitmap.new(32, 32)
-                tmp.blt(0, 0, ts, Rect.new(0, 0, 32, 32))
-                Probe.log "TM   BLT-TEST(tile 0,0): #{Probe.bmp_stats(tmp, 'tmp', 8)}"
-                tmp.dispose rescue nil
-              end
-            rescue => e2; Probe.log "TM   BLT-TEST ERRO #{e2.message}"; end
-          end
-          r = nil
-          begin
-            r = __p_rl0(autotiles)
-          rescue => e3
-            Probe.log "TM   refreshLayer0 ##{n} REBENTOU: #{e3.class}: #{e3.message}"
-            (e3.backtrace[0,6].each { |l| Probe.log "TM     bt: #{l}" } rescue nil)
-            raise
-          end
-          if deep
-            begin
-              l0 = Probe.tiv(self, :@layer0)
-              bm = l0 ? (l0.bitmap rescue nil) : nil
-              Probe.log "TM   -> ret=#{Probe.fmt(r)} usedsprites_depois=#{Probe.fmt(Probe.tiv(self,:@usedsprites))}"
-              Probe.log "TM   #{Probe.bmp_stats(bm, 'layer0.bmp DEPOIS')}"
-            rescue; end
-            Probe.log "TM ----- /refreshLayer0 ##{n} -----"
-          end
-          r
-        end
-      end
-
     end
-    Probe.log "TM CustomTilemap instrumentado OK"
-  else
-    Probe.log "TM AVISO: CustomTilemap nao existe"
+    (MKXPDebug.log("[TMGUARD] CustomTilemap#refresh protegido (salta se @map_data nil/vazio)") rescue nil)
   end
 rescue => e
-  begin; Probe.log "TM setup FALHOU: #{e.class}: #{e.message}"; rescue; end
+  (MKXPDebug.log("[TMGUARD] instalacao falhou: #{e.class}: #{e.message}") rescue nil)
 end
 
 # =============================================================================
-# >>> SUPER-LOG: CADEIA DA INTRO / EVENTOS AUTORUN <<<
-# Objetivo: descobrir porque o evento autorun da intro (Map001) nao corre.
-# Instrumenta Interpreter (map_interpreter) + Game_Map#update + eventos.
-# Procura no log por:  [PRB] EV
-# trigger: 0=botao 1=toque-jogador 2=toque-evento 3=AUTORUN 4=PARALELO
-# Tudo em begin/rescue; nao parte o arranque.
+#  FXGUARD  —  efeitos EBDX (pegadas/bolhas/sombras/pkmn-a-seguir) rebentam
+# -----------------------------------------------------------------------------
+#  CAUSA (provada pelo log): com o player REAL, a cadeia Sprite_Character#update
+#  (footsteps_update / water_buble_update / sh_update / __followingpkmn__update)
+#  rebenta durante createSpritesets:
+#    - ArgumentError: min argument must be smaller than max argument   (clamp)
+#    - ArgumentError: cannot set instance variable                    (mruby)
+#  Isto MATA o createSpritesets -> spriteset sem sprites -> ecra preto.
+#  IMPORTANTE: na cadeia de alias, o update BASE (desenhar o personagem) corre
+#  PRIMEIRO; os efeitos correm A SEGUIR. Por isso apanhar o erro aqui NAO perde
+#  o desenho do personagem -- so' o efeito visual (que ja' estava partido) e'
+#  ignorado. O jogo deixa de ficar preto e fica jogavel.
 # =============================================================================
 begin
-  def Probe.dump_events(tag)
-    begin
-      gm = $game_map
-      if gm.nil?; Probe.log "EV #{tag}: $game_map=nil"; return; end
-      evs = (gm.events rescue nil)
-      n = (evs.respond_to?(:size) ? evs.size : -1)
-      cei = ($game_temp.common_event_id rescue '?')
-      nr  = (gm.need_refresh rescue '?')
-      Probe.log "EV #{tag}: map_id=#{gm.map_id rescue '?'} events=#{n} need_refresh=#{nr} common_event_id=#{cei}"
-      if evs.respond_to?(:values)
-        evs.values.each do |e|
-          tr = (e.trigger rescue '?')
-          st = (e.starting rescue '?')
-          lst = (e.list rescue nil)
-          pg  = (e.instance_variable_get(:@page) rescue nil)
-          Probe.log "EV   id=#{e.id rescue '?'} name='#{e.name rescue '?'}' @(#{e.x rescue '?'},#{e.y rescue '?'}) trigger=#{tr} starting=#{st} page=#{pg ? 'ok' : 'nil'} list=#{lst ? (lst.size rescue '?') : 'nil'}"
+  if defined?(Sprite_Character) && Sprite_Character.method_defined?(:update) && !$__fxguard_installed
+    $__fxguard_installed = true
+    class Sprite_Character
+      alias_method :__fxguard_orig_update, :update
+      def update
+        __fxguard_orig_update
+      rescue => e
+        unless $__fxguard_logged
+          (MKXPDebug.log("[FXGUARD] efeito EBDX em Sprite_Character#update rebentou: #{e.class}: #{e.message} -- ignorado (personagem na' mesmo desenha)") rescue nil)
+          $__fxguard_logged = true
         end
-      end
-    rescue => e
-      Probe.log "EV #{tag} ERRO #{e.class}: #{e.message}"
-    end
-  end
-
-  # one-time: campos de inicio + interpretador
-  def Probe.dump_start
-    begin
-      Probe.log "EV START: start_map_id=#{$data_system.start_map_id rescue '?'} start_x=#{$data_system.start_x rescue '?'} start_y=#{$data_system.start_y rescue '?'} player@(#{$game_player.x rescue '?'},#{$game_player.y rescue '?'}) map=#{$game_map.map_id rescue '?'}"
-      mi = ($game_system.map_interpreter rescue nil)
-      Probe.log "EV START: map_interpreter=#{mi ? mi.class : 'nil'} running?=#{(mi.running? rescue '?')} main=#{(mi.instance_variable_get(:@main) rescue '?')}"
-      Probe.log "EV START: switches=#{($game_switches.class rescue 'nil')} variables=#{($game_variables.class rescue 'nil')} self_switches=#{($game_self_switches.class rescue 'nil')} var[1]=#{($game_variables[1] rescue '?')}"
-
-      # ===== TESTE DE POSICAO DA CAMARA =====================================
-      # Hipotese: o conteudo do Map001 esta no canto inf-direito (tiles ~13-19,
-      # 10-14, onde estao os eventos QuickStartActivate@(19,14)). O jogador esta
-      # em (0,0) (canto vazio/preto) porque start_x/start_y vieram 0. A camara
-      # segue o jogador -> mostra so a zona preta. Forcamos o jogador para perto
-      # do conteudo e centramos a camara, UMA vez, para ver se o mapa aparece.
-      # Se aparecer, confirma-se a causa (posicao inicial errada).
-      unless $p_repos_done
-        $p_repos_done = true
-        if (TEST_REPOSITION rescue true)
-          tx, ty = 15, 12
-          ($game_player.moveto(tx, ty) rescue nil)
-          # centrar a camara no jogador (Game_Map#center existe no Essentials)
-          ($game_map.center(tx, ty) rescue nil)
-          Probe.log "EV START [REPOS-TEST] jogador->(#{tx},#{ty}) cam ox=#{($game_map.display_x rescue '?')} oy=#{($game_map.display_y rescue '?')} player@(#{$game_player.x rescue '?'},#{$game_player.y rescue '?'})"
-        end
-      end
-    rescue => e
-      Probe.log "EV START ERRO #{e.class}: #{e.message}"
-    end
-  end
-
-  if Object.const_defined?(:Interpreter)
-    class Interpreter
-      # setup_starting_event: o coracao -- procura o evento autorun
-      unless method_defined?(:__p_sse)
-        alias_method :__p_sse, :setup_starting_event
-        def setup_starting_event
-          $p_sse = ($p_sse || 0) + 1
-          if $p_sse <= 4
-            Probe.dump_start if $p_sse == 1
-            Probe.dump_events("sse##{$p_sse} ANTES")
-          end
-          r = __p_sse
-          if $p_sse <= 4
-            Probe.log "EV sse##{$p_sse} DEPOIS: running?=#{(running? rescue '?')} list=#{(@list ? (@list.size rescue '?') : 'nil')} event_id=#{(@event_id rescue '?')}"
-          end
-          r
-        end
-      end
-
-      # update: confirma que o interpretador esta a ser actualizado
-      unless method_defined?(:__p_iupd)
-        alias_method :__p_iupd, :update
-        def update
-          mn = (@main rescue nil)
-          if mn
-            $p_iupd = ($p_iupd || 0) + 1
-            Probe.log "EV interp.update(main) ##{$p_iupd}: running?=#{(running? rescue '?')} list=#{(@list ? 'set' : 'nil')} msg_wait=#{(@message_waiting rescue '?')} wait=#{(@wait_count rescue '?')}" if $p_iupd <= 5 || ($p_iupd % 120 == 0)
-          end
-          __p_iupd
-        end
-      end
-
-      # execute_command: comandos + texto/parametros + transicao de evento + contador
-      if method_defined?(:execute_command) && !method_defined?(:__p_exec)
-        alias_method :__p_exec, :execute_command
-        def execute_command
-          $p_exec = ($p_exec || 0) + 1
-          begin
-            eid = (@event_id rescue '?')
-            if $p_last_eid != eid
-              Probe.log "EV >>> evento mudou: #{$p_last_eid.inspect} -> #{eid} (var[1]=#{($game_variables[1] rescue '?')})"
-              $p_last_eid = eid
-            end
-            if $p_exec <= 80
-              cmd  = (@list && @list[@index] ? @list[@index] : nil)
-              code = (cmd ? (cmd.code rescue '?') : '?')
-              extra = ''
-              if cmd && [101,401,102,103,122,111,355,655,123,121,201,117,119,118,108,408].include?(code)
-                s = ((cmd.parameters rescue nil)).inspect rescue '?'
-                s = s[0, 90] + '...' if s.length > 90
-                extra = " p=#{s}"
-              end
-              Probe.log "EV exec ##{$p_exec}: code=#{code} idx=#{@index rescue '?'} ev=#{eid}#{extra}"
-            elsif $p_exec % 300 == 0
-              Probe.log "EV exec ##{$p_exec} (a correr) code=#{(@list[@index].code rescue '?')} ev=#{eid} var[1]=#{($game_variables[1] rescue '?')}"
-            end
-          rescue => ee
-            Probe.log "EV exec ERRO #{ee.message}" if $p_exec <= 80
-          end
-          __p_exec
-        end
+        nil
       end
     end
-    Probe.log "EV Interpreter instrumentado OK"
-  else
-    Probe.log "EV AVISO: Interpreter nao existe"
+    (MKXPDebug.log("[FXGUARD] Sprite_Character#update protegido (efeitos EBDX nao matam o spriteset)") rescue nil)
   end
-
-  # Game_Map#update: os eventos sao actualizados? (deteta autorun)
-  if Object.const_defined?(:Game_Map)
-    class Game_Map
-      unless method_defined?(:__p_gmupd)
-        alias_method :__p_gmupd, :update
-        def update
-          $p_gmupd = ($p_gmupd || 0) + 1
-          Probe.log "EV game_map.update ##{$p_gmupd} (events update -> deteta autorun)" if $p_gmupd <= 3
-          __p_gmupd
-        end
-      end
-    end
-    Probe.log "EV Game_Map#update instrumentado OK"
-  end
-
-  # === INSTRUMENTACAO DA JANELA DE MENSAGEM ==================================
-  # Objectivo: ver EXACTAMENTE onde a criacao/loop da janela de mensagem vai,
-  # depois da 1a fala (code=101). Confirma se o fix do windowskin resolve, e se
-  # o loop da mensagem passa a correr (ou se fica preso a espera de input).
-
-  # NOTA: pbResolveBitmap e' (re)definido pelo binding DEPOIS do probe, por isso
-  # nao o instrumentamos aqui (seria sobreposto). Vemos o resultado via o log
-  # [WSKIN] do binding e via o hook de SpriteWindow_Base#init (windowskin DEPOIS).
-
-  # SpriteWindow_Base#initialize: a base da janela forma-se sem travar?
-  if Object.const_defined?(:SpriteWindow_Base)
-    begin
-      class SpriteWindow_Base
-        unless method_defined?(:__p_swb_init)
-          alias_method :__p_swb_init, :initialize
-          def initialize(*a)
-            $p_swb = ($p_swb || 0) + 1
-            n = $p_swb
-            Probe.log "WIN SpriteWindow_Base#init ##{n} ANTES args=#{a.inspect[0,40]}"
-            r = __p_swb_init(*a)
-            sk = (self.windowskin rescue nil)
-            Probe.log "WIN SpriteWindow_Base#init ##{n} DEPOIS windowskin=#{sk.class} (#{(sk.width rescue '?')}x#{(sk.height rescue '?')})"
-            r
-          end
-        end
-      end
-      Probe.log "WIN SpriteWindow_Base instrumentado OK"
-    rescue => e
-      Probe.log "WIN SpriteWindow_Base hook falhou: #{e.message}"
-    end
-  end
-
-  # Window_AdvancedTextPokemon#initialize: a janela de mensagem completa?
-  if Object.const_defined?(:Window_AdvancedTextPokemon)
-    begin
-      class Window_AdvancedTextPokemon
-        unless method_defined?(:__p_watp_init)
-          alias_method :__p_watp_init, :initialize
-          def initialize(*a)
-            Probe.log "WIN Window_AdvancedText#init ANTES text=#{(a[0].inspect[0,40] rescue '?')}"
-            r = __p_watp_init(*a)
-            Probe.log "WIN Window_AdvancedText#init DEPOIS OK (janela criada)"
-            r
-          end
-        end
-        # update: o loop da mensagem corre? mostrar estado interno (busy/waitcount)
-        unless method_defined?(:__p_watp_upd)
-          alias_method :__p_watp_upd, :update
-          def update(*a)
-            $p_watp_upd = ($p_watp_upd || 0) + 1
-            if $p_watp_upd <= 10 || ($p_watp_upd % 60 == 0)
-              busy = (self.busy? rescue '?')
-              wc   = (self.waitcount rescue (@waitcount rescue '?'))
-              txt  = ((@text || @display rescue nil)).to_s[0,30]
-              # leitura NAO-INVASIVA do input real (trigger? original, intacto)
-              use  = (Input.trigger?(Input::USE)  rescue '?')
-              back = (Input.trigger?(Input::BACK) rescue '?')
-              cpress = (Input.press?(Input::C) rescue '?')
-              Probe.log "WIN watp#update ##{$p_watp_upd} busy=#{busy} waitcount=#{wc} USE=#{use.inspect} BACK=#{back.inspect} C_press=#{cpress.inspect} txt=#{txt.inspect}"
-            end
-            __p_watp_upd(*a)
-          end
-        end
-      end
-      Probe.log "WIN Window_AdvancedTextPokemon instrumentado OK"
-    rescue => e
-      Probe.log "WIN Window_AdvancedText hook falhou: #{e.message}"
-    end
-  end
-
-  # INPUT: NAO instrumentamos Input.trigger? diretamente -- e' um metodo C e
-  # alias_method/define_method no singleton parte-o (todos os botoes passam a
-  # devolver 0/nil). Em vez disso, espiamos de forma NAO-INVASIVA: a cada vez
-  # que o jogo chama Input.trigger? para USE/BACK, queremos so saber se alguma
-  # vez devolve true. Fazemos isso lendo press?/trigger? a partir do nosso
-  # proprio update da janela (abaixo), sem substituir o metodo C.
-  #
-  # (bloco antigo removido: ele fazia alias :__p_trigger e partia o input.)
-
-  # pbMessage / pbMessageDisplay: o display de mensagem inicia e termina?
-  ["pbMessage", "pbMessageDisplay"].each do |mn|
-    begin
-      if Object.respond_to?(mn, true)
-        Object.class_eval do
-          alias_name = "__p_orig_#{mn}"
-          unless method_defined?(alias_name.to_sym)
-            alias_method alias_name.to_sym, mn.to_sym
-            define_method(mn.to_sym) do |*a, &b|
-              Probe.log "WIN #{mn} START"
-              r = send(alias_name.to_sym, *a, &b)
-              Probe.log "WIN #{mn} END"
-              r
-            end
-          end
-        end
-      end
-    rescue => e
-      Probe.log "WIN #{mn} hook falhou: #{e.message}"
-    end
-  end
-  Probe.log "WIN instrumentacao de mensagem completa"
-  # === /INSTRUMENTACAO DA JANELA DE MENSAGEM =================================
 rescue => e
-  begin; Probe.log "EV super-log setup FALHOU: #{e.class}: #{e.message}"; rescue; end
+  (MKXPDebug.log("[FXGUARD] instalacao falhou: #{e.class}: #{e.message}") rescue nil)
+end
+
+# =============================================================================
+#  CACHEFIX  —  RPG::Cache.clear era no-op => tilesets gigantes acumulam => OOM
+# -----------------------------------------------------------------------------
+#  RAIZ (provada pelo log e pelo codigo):
+#   * A module Cache do jogo NAO define `clear`; no port cai num stub no-op.
+#   * transfer_player chama RPG::Cache.clear (apos disposeSpritesets) MAS, sendo
+#     no-op, NAO liberta nada -> cada mapa deixa o seu tileset GIGANTE na cache:
+#        mapa 43 'Gardenia Town'  -> 256x31040 (~15MB)
+#        mapa 3  'AA's House'     -> 256x29632 (~14MB)
+#   * Ao entrar no quarto com o tileset do 43 ainda em memoria:
+#        [TEX|MEM] bytes_tex=25MB | linear_livre=593KB  -> OOM -> loop de
+#        [BMP|GC-OOM] -> TRAVA a carregar o mapa 3.
+#  Antes (player nil) o jogador nao andava, menos mapas carregavam, e cabia.
+#  Agora (player real, correcto) anda no 43, carrega vizinhos, e estoura no 3.
+#
+#  FIX: definir um RPG::Cache.clear REAL que LIBERTA os bitmaps GIGANTES da cache
+#  (so' altura>=4096 -> tilesets; mantem sprites/icones pequenos em cache para
+#  nao perder performance). Corre no transfer, ANTES de createSpritesets, por
+#  isso liberta o tileset do mapa anterior mesmo a tempo de caber o novo.
+#  Seguro: nesse ponto os sprites antigos ja' foram dispostos -> nada vivo
+#  referencia estes tilesets; o mapa novo recarrega o seu.
+# =============================================================================
+begin
+  if defined?(RPG) && defined?(RPG::Cache) && !$__cachefix_installed
+    $__cachefix_installed = true
+    module RPG
+      module Cache
+        def self.clear
+          c = (@cache rescue nil)
+          return unless c.is_a?(Hash)
+          n = 0; freedkb = 0
+          c.each do |k, b|
+            begin
+              next if b.nil? || (b.disposed? rescue true)
+              next if (b.never_dispose rescue false)         # respeitar retidos (sprite do player, etc.)
+              h = (b.height rescue 0).to_i
+              w = (b.width rescue 0).to_i
+              next if h < 4096                                 # so' tilesets GIGANTES
+              kb = (w * h * 4) / 1024
+              12.times { break if (b.disposed? rescue true); b.dispose }   # forcar refcount->0
+              if (b.disposed? rescue false); n += 1; freedkb += kb; end
+            rescue; end
+          end
+          begin; c.reject! { |k, b| b.nil? || (b.disposed? rescue true) }; rescue; end
+          (GC.start rescue nil) if n > 0
+          (MKXPDebug.log("[CACHEFIX] clear libertou #{n} tilesets gigantes (~#{freedkb}KB) -- anti-OOM") rescue nil) if n > 0
+          nil
+        end
+      end
+    end
+    (MKXPDebug.log("[CACHEFIX] RPG::Cache.clear REAL instalado (liberta tilesets gigantes no transfer; estava no-op)") rescue nil)
+  end
+rescue => e
+  (MKXPDebug.log("[CACHEFIX] instalacao falhou: #{e.class}: #{e.message}") rescue nil)
+end
+
+# =============================================================================
+#  PROBE-CONFIRM  —  confirmacao de install LEGIVEL no log (corre no 1o frame)
+# -----------------------------------------------------------------------------
+#  PORQUE: este ficheiro e' carregado pelo motor ANTES de o modulo MKXPDebug
+#  existir (o MKXPDebug e' definido nos post-scripts permanentes, que correm
+#  DEPOIS). Por isso TODAS as chamadas MKXPDebug.log feitas durante o LOAD deste
+#  probe (incl. as mensagens "[PLAYERFIX] instalado", "[TMGUARD] protegido", a
+#  etiqueta de versao "[PROBE] V4", etc.) caem no `rescue nil` e NUNCA aparecem
+#  no log -- AINDA QUE os hooks tenham sido instalados (alias_method nao precisa
+#  do MKXPDebug). Resultado: o log parecia nao ter os fixes, mas eles ESTAO la'.
+#  Este bloco corre no PRIMEIRO frame de Scene_Map (altura em que o MKXPDebug ja'
+#  existe) e regista, UMA vez, quais dos 4 fixes ficaram instalados -- dando-te
+#  prova real no debug_binding.log. Se vires esta linha, estas a correr ESTE
+#  probe (o atualizado).
+# =============================================================================
+begin
+  if defined?(Scene_Map) && Scene_Map.method_defined?(:update) && !$__probe_confirm_installed
+    $__probe_confirm_installed = true
+    class Scene_Map
+      alias_method :__probe_confirm_orig_update, :update
+      def update(*a)
+        unless $__probe_confirmed
+          $__probe_confirmed = true
+          begin
+            MKXPDebug.log("[PROBE-CONFIRM] ===== debug_probe ATUALIZADO a correr (confirmado no 1o frame) =====")
+            MKXPDebug.log("[PROBE-CONFIRM] PLAYERFIX=#{!!$__playerfix_installed} " \
+                          "TMGUARD=#{!!$__tmguard_installed} " \
+                          "FXGUARD=#{!!$__fxguard_installed} " \
+                          "CACHEFIX=#{!!$__cachefix_installed}")
+            MKXPDebug.log("[PROBE-CONFIRM] (se algum estiver false, o hook respetivo nao instalou -- avisa-me)")
+          rescue => e
+            (MKXPDebug.log("[PROBE-CONFIRM] log falhou: #{e.class}: #{e.message}") rescue nil)
+          end
+        end
+        __probe_confirm_orig_update(*a)
+      end
+    end
+  end
+rescue => e
+  (MKXPDebug.log("[PROBE-CONFIRM] instalacao falhou: #{e.class}: #{e.message}") rescue nil)
 end
