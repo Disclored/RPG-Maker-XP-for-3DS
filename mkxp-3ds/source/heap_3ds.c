@@ -48,13 +48,41 @@
  *   Valor ajustável: se o log voltar a mostrar falhas_tex>0 (linear apertado),
  *   subir LINEAR_HEAP_MB; se voltar a haver OOM de malloc, baixá-lo.
  *
+ *   ATUALIZAÇÃO (pool do mruby DESLIGADO): com USE_POOL_ALLOCATOR=0 o pool
+ *   deixou de existir e libertou ~28 MB ao heap malloc (era o pool que enchia o
+ *   malloc e causava o OOM acima). Por isso o equilíbrio mudou: o malloc passou
+ *   a ter folga ampla e os tilesets GIGANTES (ex.: 'Gen4 Outside Route'
+ *   256x29632 = 14,8 MB em 4444) é que deixaram de caber — o buffer 4444 tenta
+ *   malloc e depois linearAlloc (bitmap_binding: ambos + GC) e falhava com só
+ *   ~10 MB de linear livre. Subimos o linear 24 -> 32 MB: nas cenas de jogo as
+ *   texturas usam ~7-14 MB, deixando ~18-25 MB livres no linear -> o buffer de
+ *   14,8 MB passa a caber no fallback linear. O malloc perde 8 MB mas, com os
+ *   ~28 MB libertados pelo pool, fica ainda com ~+20 MB de margem sobre o antigo
+ *   ponto de OOM. Reversível: se o log mostrar OOM de malloc, voltar a 24.
+ *
  *   Genérico e bom para hardware 3DS real (FCRAM pequena): prioriza dar ao
  *   malloc — onde vive o interpretador Ruby — a maior fatia possível.
  * ============================================================================ */
 #include <3ds.h>
 
-/* Reserva fixa para o heap linear (texturas GPU). Resto -> heap malloc. */
-#define LINEAR_HEAP_MB 24u
+/* Reserva fixa para o heap linear (texturas GPU + buffers de decode de bitmaps
+ * gigantes 4444). Resto -> heap malloc. Subido de 24 p/ 32 porque o pool do
+ * mruby foi desligado (libertou ~28 MB ao malloc), permitindo dar mais ao linear
+ * sem reintroduzir o OOM de malloc.
+ *
+ * ATUALIZAÇÃO 2 (magenta em mapas com vizinho): mapas como 'Gardenia Town' teem
+ * um mapa LIGADO (connected) cujo spriteset carrega o SEU proprio tileset gigante
+ * (ex.: 'Gen4 Outside Route' 256x29632 = 15,1 MB) ao mesmo tempo que o do mapa
+ * principal ('Gen4 Outside Town' 256x31040 = 15,9 MB). Os DOIS juntos = ~31 MB
+ * NAO cabiam nos 32 MB -> expulsavam-se mutuamente -> re-decode do .png falhava
+ * por FRAGMENTACAO (log: "need=15520KB linear_livre=16045KB" = ha' espaco total
+ * mas nao contiguo) -> tiles magenta. Subir 32 -> 44 deixa os DOIS tilesets
+ * gigantes residentes em simultaneo (sem eviccao -> sem re-decode -> sem magenta),
+ * com ~9 MB de folga para o resto (sprites + @layer0). O malloc perde 12 MB mas,
+ * com os ~28 MB libertados pelo pool, mantem margem sobre o ponto de OOM.
+ * Reversível: se o log mostrar OOM de malloc (falha num malloc pequeno), baixar
+ * para 40 ou 36. */
+#define LINEAR_HEAP_MB 44u
 
 /* Símbolo "weak" do libctru: ao definir um valor forte aqui, o libctru reserva
  * exatamente este tamanho para o heap linear e dá todo o restante ao malloc. */

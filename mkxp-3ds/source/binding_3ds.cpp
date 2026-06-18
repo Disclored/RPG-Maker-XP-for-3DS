@@ -68,12 +68,18 @@ extern FILE *g_dbglog;
 /* ─────────────────────────────────────────────────────────────────────────────
  * INTERRUPTOR DO POOL ALLOCATOR
  * ----------------------------------------------------------------------------
- * 1 = usar o pool (mrb_open_allocf) -- rapido, mas em diagnostico no 3DS.
- * 0 = usar mrb_open() normal -- mais lento no boot (malloc O(n) do sistema),
- *     mas serve para ISOLAR: se com 0 o jogo arranca e com 1 trava, o problema
- *     esta' confirmadamente no pool. Mudar so' este valor e recompilar.
+ * 1 = usar o pool (mrb_open_allocf). NECESSARIO no HARDWARE 3DS real: o malloc
+ *     do 3DS e' O(n) e sem o pool o boot demora minutos / fragmenta. PARA O
+ *     BUILD DE HARDWARE, POR ISTO A 1.
+ * 0 = mrb_open() normal (malloc do sistema). NO AZAHAR (emulador em PC) o malloc
+ *     e' o do PC -- rapido (O(1) amortizado), por isso a pool NAO da' beneficio
+ *     nenhum e so' DESPERDICA ~28MB. Com 0, esses ~28MB ficam livres p/ assets
+ *     (tilesets, introPictures, outfits) -> deixam de dar magenta por falta de
+ *     RAM. ALEM disso, o GC liberta memoria de volta ao malloc (a pool nao),
+ *     por isso tilesets orfaos do mapa anterior libertam-se de facto.
+ *     >>> USAR 0 PARA TESTAR NO AZAHAR. Voltar a 1 para o hardware. <<<
  * ─────────────────────────────────────────────────────────────────────────── */
-#define USE_POOL_ALLOCATOR 1
+#define USE_POOL_ALLOCATOR 0
 
 
 /* ============================================================================
@@ -256,7 +262,7 @@ namespace mkxp_pool {
          * OK, contadores sobem). Reduzido para cada 50000 chamadas (era 2000) --
          * o suficiente para ver se trava, sem encher o log nem abrandar. */
         if (::g_dbglog) {
-            bool show = (s_allocf_calls <= 3) || ((s_allocf_calls % 50000) == 0);
+            bool show = (s_allocf_calls <= 3) || ((s_allocf_calls % 500000) == 0);
             if (show) {
                 fprintf(::g_dbglog, "[POOL|DIAG] allocf #%ld (pool=%ld sys=%ld)\n",
                         s_allocf_calls, s_pool_alloc, s_sys_alloc);
@@ -272,7 +278,67 @@ namespace mkxp_pool {
         g_prof_objs_created++;       /* PROFILING: nova alocacao (objeto/buffer) */
         return alloc(size);
     }
+
+    /* ===== DEBUG LOG CERTEIRO (read-only, 0 risco) ============================
+     * Decide o fix CEGO C (release de chunks vazios do pool). So' CONTA, nunca
+     * liberta. Reporta, por classe: chunks vivos, slots usados/livres, e quantos
+     * KB estao presos em slots LIVRES -- que e' EXATAMENTE o que um release-de-
+     * chunks devolveria ao malloc. Se o total "libertavel" for grande e a sonda
+     * de malloc abaixo mostrar um bloco maximo < 12MB, entao o release vale o
+     * risco; se for pequeno, o pool esta' cheio de objetos VIVOS e a unica saida
+     * e' pre-escalar as imagens (fix B). */
+    static void pool_diag_full(const char *quando) {
+        if (!::g_dbglog) return;
+        long total_bytes = 0, free_bytes = 0, used_bytes = 0;
+        for (int i = 0; i < kNumClasses; i++) {
+            Pool *p = &s_pools[i];
+            long total_slots = (long)p->chunk_count * (long)kChunkObjs;
+            long free_slots = 0;
+            for (FreeNode *n = p->free_list; n; n = n->next) free_slots++;
+            long used_slots = total_slots - free_slots;
+            long cls_bytes = total_slots * (long)p->obj_size;
+            long cls_free  = free_slots  * (long)p->obj_size;
+            long cls_used  = used_slots  * (long)p->obj_size;
+            total_bytes += cls_bytes; free_bytes += cls_free; used_bytes += cls_used;
+            fprintf(::g_dbglog,
+                "[POOL|FULL] %s cls%d(%uB) chunks=%d slots=%ld usados=%ld livres=%ld "
+                "-> %ldKB total / %ldKB livres-presos\n",
+                quando ? quando : "?", i, (unsigned)p->obj_size,
+                p->chunk_count, total_slots, used_slots, free_slots,
+                cls_bytes/1024, cls_free/1024);
+        }
+        fprintf(::g_dbglog,
+            "[POOL|FULL] %s === pool TOTAL=%ldKB (~%ldMB) | VIVOS=%ldKB | "
+            "LIVRES-PRESOS=%ldKB (~%ldMB) <- isto e' o que o release devolveria ===\n",
+            quando ? quando : "?", total_bytes/1024, total_bytes/(1024*1024),
+            used_bytes/1024, free_bytes/1024, free_bytes/(1024*1024));
+        fflush(::g_dbglog);
+    }
+
+    /* SONDA DE MALLOC: maior bloco contiguo alocavel AGORA (= o que o decode do
+     * stb consegue obter). Tenta tamanhos decrescentes e liberta logo. Diz-nos
+     * o quao perto/longe estamos dos ~12MB que a intro picture precisa. */
+    static void malloc_probe(const char *quando) {
+        if (!::g_dbglog) return;
+        static const size_t sizes[] = {
+            24u*1024*1024, 20u*1024*1024, 16u*1024*1024, 12u*1024*1024,
+            10u*1024*1024,  8u*1024*1024,  6u*1024*1024,  4u*1024*1024,
+             2u*1024*1024,  1u*1024*1024,  512u*1024,     256u*1024 };
+        size_t maior = 0;
+        for (size_t i = 0; i < sizeof(sizes)/sizeof(sizes[0]); i++) {
+            void *q = malloc(sizes[i]);
+            if (q) { free(q); maior = sizes[i]; break; }
+        }
+        fprintf(::g_dbglog, "[MALLOC|PROBE] %s maior bloco alocavel ~%zuKB (~%zuMB) "
+                "[decode da intro precisa ~12MB]\n",
+                quando ? quando : "?", maior/1024, maior/(1024u*1024u));
+        fflush(::g_dbglog);
+    }
 }
+
+/* Wrappers globais (chamaveis de outros .cpp, ex. bitmap_binding no OOM). */
+void mkxp_pool_diag_full(const char *q) { mkxp_pool::pool_diag_full(q); }
+void mkxp_malloc_probe(const char *q)   { mkxp_pool::malloc_probe(q); }
 
 /* =========================================================
  * SUPER DEBUG HELPERS
@@ -280,6 +346,13 @@ namespace mkxp_pool {
 
 /* Ficheiro de log global para dump detalhado */
 FILE *g_dbglog = NULL;
+/* Ponteiro global para o mrb_state principal. Exposto para o bitmap loader
+ * (bitmap_binding_3ds.cpp) poder forcar um mrb_full_gc no PONTO EXATO em que um
+ * tileset/imagem grande nao cabe na memoria -- isso liberta bitmaps ORFAOS (ex:
+ * o tileset do mapa anterior que ficou desreferenciado mas nao disposto, a
+ * ocupar malloc) e permite RETENTAR a alocacao. So' e' usado nesse caminho de
+ * falha (asset grande), nunca no fluxo normal. */
+mrb_state *g_mkxp_mrb = NULL;
 /* Contador global de escritas para flush periodico do log (otimizacao 3DS:
  * evita fflush sincrono ao SD a cada escrita). Partilhado pelos macros de log
  * nos varios ficheiros via 'extern int g_dbglog_flushc'. */
@@ -1696,6 +1769,91 @@ begin
     module_function :pbDayNightTint
   end
 rescue; end
+
+# -- pbGetTileBitmap: cache do TILESET de extracao (pos-scripts) ----------------
+# RAIZ PROVADA do lag de ~7s ao entrar numa sala (e provavel causa do quarto
+# preto). Eventos com grafico de TILE (tile_id>=384, ex: moveis) fazem
+# Sprite_Character -> pbGetTileBitmap -> RPG::Cache.tileEx, que para CADA tile_id
+# diferente executa o bloco { AnimatedBitmap.new(tileset).deanimate } e a seguir
+# faz `tileset.dispose`. Ou seja: cada movel recarrega o tileset INTEIRO (Gen4
+# Interior 256x17024 = 8.3MB, ~1.4s) e descarta-o -> 5 moveis = 5 cargas = ~7s +
+# 41MB de churn de memoria + varios GC-on-OOM no meio (que podem fragmentar/varrer
+# a camada de tiles -> preto).
+# FIX: cachear o tileset COMPLETO por nome e marca-lo never_dispose=true. Assim o
+# `tileset.dispose` do tileEx vira no-op (BitmapWrapper#dispose so' liberta se
+# refcount<=0 E !never_dispose) e os N moveis partilham UMA so' carga. Na mudanca
+# de mapa, forca-se o dispose e limpa-se (senao seria fuga: 8.3MB por mapa).
+# Seguro: este tileset e' SO' fonte de extracao (nunca e' o @tilemap.tileset), e
+# os tiles extraidos sao copias independentes (blt) que nao o referenciam.
+begin
+  $__mkxp_tilebmp_ts  ||= {}
+  $__mkxp_tilebmp_map ||= -999
+  unless $__mkxp_tilebmp_patched
+    $__mkxp_tilebmp_patched = true
+    class Object
+      def pbGetTileBitmap(filename, tile_id, hue, width = 1, height = 1)
+        mid = ($game_map.map_id rescue 0)
+        if mid != $__mkxp_tilebmp_map
+          # mapa mudou -> dispor mesmo (anular never_dispose) e esvaziar o cache
+          begin
+            $__mkxp_tilebmp_ts.each_value do |b|
+              begin
+                b.never_dispose = false
+                b.dispose
+              rescue; end
+            end
+          rescue; end
+          $__mkxp_tilebmp_ts = {}
+          $__mkxp_tilebmp_map = mid
+        end
+        return RPG::Cache.tileEx(filename, tile_id, hue, width, height) { |f|
+          ts = $__mkxp_tilebmp_ts[filename]
+          if ts.nil? || (ts.disposed? rescue true)
+            ts = AnimatedBitmap.new("Graphics/Tilesets/" + filename).deanimate
+            (ts.never_dispose = true) rescue nil   # tileEx vai chamar dispose -> no-op
+            $__mkxp_tilebmp_ts[filename] = ts
+          end
+          ts
+        }
+      end
+    end
+    (MKXPDebug.log("[TILEBMP] pbGetTileBitmap com cache de tileset (anti-lag 5x + anti-churn)") rescue nil)
+  end
+rescue => e
+  (MKXPDebug.log("[TILEBMP] patch falhou: #{e.class}: #{e.message}") rescue nil)
+end
+
+# -- TileWrap: blt SEMPRE direto (tileset un-wrapped) --------------------------
+# BUG RAIZ do quarto/vila PRETO (confirmado por [TMDBG]: @tileset valido 4444,
+# layer valida, refresh corre, SEM excecao -> logo o erro esta' no proprio blt).
+# Com mega?=false (ver bmp_max_size=1024) o tileset fica UN-wrapped: 256 x
+# altura_total (ex: 256x17024). Mas o TileWrap::blitWrappedPixels ORIGINAL, para
+# qualquer tile com srcrect.y >= MAX_TEX_SIZE (=1024), aplica getWrappedRect, que
+# mapeia o x para col*256 (col = y/1024 -> 4096, 8192, ...) -- FORA dos 256px de
+# largura do tileset un-wrapped. O bmp_blt le fora dos limites (sxx>=src->width ->
+# salta) -> a tile sai PRETA. So' as tiles das primeiras ~32 linhas (y<1024)
+# desenhavam (e' a faixa que se ve' no canto). O quarto usa tiles por todo o
+# tileset de 532 linhas -> quase tudo preto.
+# Como NENHUM tileset e' wrapped aqui (shouldWrap=false sempre), o blt correto e'
+# SEMPRE o direto: o bmp_blt nativo recorta o tile 32x32 a QUALQUER y (ate' 31040)
+# sem precisar de wrapping. Sobrepomos os dois metodos para nunca aplicar o wrap.
+begin
+  if Object.const_defined?(:TileWrap)
+    module TileWrap
+      def self.blitWrappedPixels(destX, destY, dest, src, srcrect)
+        dest.blt(destX, destY, src, srcrect)
+      end
+      def self.stretchBlitWrappedPixels(destrect, dest, src, srcrect)
+        dest.stretch_blt(destrect, src, srcrect)
+      end
+    end
+    (MKXPDebug.log("[TILEWRAP] blt direto (un-wrapped) instalado -- corrige quarto/vila preto") rescue nil)
+  else
+    (MKXPDebug.log("[TILEWRAP] TileWrap ausente -- override NAO aplicado") rescue nil)
+  end
+rescue => e
+  (MKXPDebug.log("[TILEWRAP] override falhou: #{e.class}: #{e.message}") rescue nil)
+end
 
 module PluginManager
   def self.register(hash); end
@@ -3151,7 +3309,7 @@ begin
               (bk.ox = 0 rescue nil); (bk.oy = 0 rescue nil)
               (bk.x = (wx - vx) rescue nil)
               (bk.y = (wy - vy) rescue nil)
-              dbg "[CFIX] #{self.class} back FULL #{iw}x#{ih} (bmp #{bw}x#{bh} fill=#{fillc.red rescue '?'},#{fillc.green rescue '?'},#{fillc.blue rescue '?'},a#{fillc.alpha rescue '?'})"
+              dbg "[CFIX] #{self.class} back FULL #{iw}x#{ih} (bmp #{bw}x#{bh} fill=#{fillc.red rescue '?'},#{fillc.green rescue '?'},#{fillc.blue rescue '?'},a#{fillc.alpha rescue '?'})" if ($__cfix_logn ||= 0) < 24 && ($__cfix_logn += 1)
             end
           end
         end
@@ -3178,9 +3336,9 @@ begin
             # garantir que desenha o bitmap todo (sem src_rect a cortar)
             (ss.src_rect = Rect.new(0, 0, sbw, sbh) rescue nil)
           end
-          dbg "[CFIX] #{self.class} sides preenchidas (fill=#{fillc.red rescue '?'},#{fillc.green rescue '?'},#{fillc.blue rescue '?'},a#{fillc.alpha rescue '?'})"
+          dbg "[CFIX] #{self.class} sides preenchidas (fill=#{fillc.red rescue '?'},#{fillc.green rescue '?'},#{fillc.blue rescue '?'},a#{fillc.alpha rescue '?'})" if ($__cfix_logn ||= 0) < 24 && ($__cfix_logn += 1)
         end
-        dbg "[CFIX] #{self.class} #{nfx} cantos recortados (skin #{skw}x#{skh})" if nfx > 0
+        dbg "[CFIX] #{self.class} #{nfx} cantos recortados (skin #{skw}x#{skh})" if nfx > 0 && ($__cfix_logn ||= 0) < 24 && ($__cfix_logn += 1)
       end
       unless method_defined?(:__mkxp_cfix_init)
         alias_method :__mkxp_cfix_init, :initialize
@@ -5219,7 +5377,7 @@ end
             "              __nfx += 1\n"
             "            end\n"
             "            end\n"
-            "            MKXPDebug.log(\"[CORNERFIX] #{__nfx} pecas recortadas skinfmt1 (L=#{__lW} R=#{__rW} T=#{__tH} B=#{__bH} skin=#{__skw}x#{__skh})\") if __nfx > 0\n"
+            "            MKXPDebug.log(\"[CORNERFIX] #{__nfx} pecas recortadas skinfmt1 (L=#{__lW} R=#{__rW} T=#{__tH} B=#{__bH} skin=#{__skw}x#{__skh})\") if __nfx > 0 && ($__cbf_logn ||= 0) < 24 && ($__cbf_logn += 1)\n"
             "            __fillc = (__csk.get_pixel(__skw/2, __skh/2) rescue nil)\n"
             "            __fillc = Color.new(8,8,8,255) if __fillc.nil?\n"
             "            __fillc = Color.new(8,8,8,224) if (__fillc.alpha rescue 0) < 8\n"
@@ -5249,7 +5407,7 @@ end
             "                end\n"
             "              end\n"
             "            end\n"
-            "            MKXPDebug.log(\"[BACKFILL] back pint+esticado (#{__fillc.red rescue '?'},#{__fillc.green rescue '?'},#{__fillc.blue rescue '?'},a#{__fillc.alpha rescue '?'})\") if __filled > 0\n"
+            "            MKXPDebug.log(\"[BACKFILL] back pint+esticado (#{__fillc.red rescue '?'},#{__fillc.green rescue '?'},#{__fillc.blue rescue '?'},a#{__fillc.alpha rescue '?'})\") if __filled > 0 && ($__cbf_logn ||= 0) < 24 && ($__cbf_logn += 1)\n"
             "            # PREENCHER AS 4 SIDE (faixas entre cantos e miolo). No formato\n"
             "            # skinformat=1 as side tem bitmap PROPRIO transparente -> faixas\n"
             "            # vazias. Pintar cada uma opaca com a cor central. So' skinfmt1.\n"
@@ -5441,11 +5599,45 @@ begin
         end
         newname = "Player" if !(newname.is_a?(String) && newname.length > 0)
       end
+      outfit_val = (args[1].is_a?(Integer) ? args[1] : 0)
+      # CORRECAO: neste port o setup de novo-jogo nao chegou a criar $Trainer
+      # (SaveData.load_new_game_values / bloco :player nao correu), por isso o
+      # nome nao tinha onde ser guardado e o menu/Trainer Card/save ficam sem
+      # treinador ("The player trainer was not defined"). Criamos aqui o
+      # $Trainer espelhando o new_game_value do Essentials (Player.new("Unnamed",
+      # primeiro trainer_type)), damos-lhe identidade/sprite com pbChangePlayer(0)
+      # e marcamos begunNewGame. Generico p/ qualquer jogo RMXP/Essentials.
       begin
-        if defined?($player) && $player && $player.respond_to?(:name=)
-          $player.name = newname
-        elsif defined?($Trainer) && $Trainer && $Trainer.respond_to?(:name=)
-          $Trainer.name = newname
+        if !((defined?($Trainer) && $Trainer) || (defined?($player) && $player)) && defined?(Player)
+          tt = nil
+          (GameData::TrainerType.each { |t| tt = t.id; break }) rescue nil
+          tr = (Player.new("Unnamed", tt) rescue (Player.new("Unnamed", 0) rescue nil))
+          if tr
+            $Trainer = tr
+            $player  = tr
+            MKXPDebug.log("[NAMEIN] $Trainer CRIADO (estava nil) ttype=#{tt.inspect}") rescue nil
+            begin
+              pbChangePlayer(0) if (respond_to?(:pbChangePlayer, true) rescue false) && tr.respond_to?(:character_ID) && tr.character_ID < 0
+              MKXPDebug.log("[NAMEIN] pbChangePlayer(0) char_ID=#{(tr.character_ID rescue '?')}") rescue nil
+            rescue => e3
+              MKXPDebug.log("[NAMEIN] pbChangePlayer falhou: #{e3.class}: #{e3.message}") rescue nil
+            end
+          else
+            MKXPDebug.log("[NAMEIN] Player.new falhou (tt=#{tt.inspect}) - $Trainer continua nil") rescue nil
+          end
+        end
+      rescue => e
+        MKXPDebug.log("[NAMEIN] criar $Trainer falhou: #{e.class}: #{e.message}") rescue nil
+      end
+      begin
+        tgt = ((defined?($player) && $player) || (defined?($Trainer) && $Trainer) || nil)
+        if tgt && tgt.respond_to?(:name=)
+          tgt.name = newname
+          tgt.outfit = outfit_val if tgt.respond_to?(:outfit=)
+          $PokemonTemp.begunNewGame = true if defined?($PokemonTemp) && $PokemonTemp && $PokemonTemp.respond_to?(:begunNewGame=)
+          MKXPDebug.log("[NAMEIN] nome aplicado a #{tgt.class}: #{newname.inspect} outfit=#{outfit_val}") rescue nil
+        else
+          MKXPDebug.log("[NAMEIN] AVISO: sem $Trainer/$player para aplicar nome") rescue nil
         end
       rescue => e
         MKXPDebug.log("[NAMEIN] aplicar nome falhou: #{e.class}: #{e.message}") rescue nil
@@ -6812,23 +7004,14 @@ int binding_3ds_run(const char *game_path) {
         DBGLOG("[BOOT] passo 2/4 OK (mruby criado com pool, allocf chamado %ld vezes)\n",
                mkxp_pool::s_allocf_calls);
     }
+    g_mkxp_mrb = mrb;   /* expor o mrb ao bitmap loader (GC-on-OOM dos tilesets) */
 
     /* O marshal tem um cache de resolucao de classe (nome -> RClass*) que acelera
      * o load de TODOS os ficheiros .rxdata/.dat em ~150x. Esses ponteiros so' sao
      * validos para ESTA sessao mruby; limpar o cache agora garante que uma nova
      * sessao (reiniciar/trocar de jogo) nunca reutiliza ponteiros antigos. */
-    marshal_class_cache_reset();   /* limpa o cache de classes (ver declaracao no topo) */
-
-    /* Expor o caminho base do jogo ao Ruby como $__mkxp_game_base. O pbResolveBitmap
-     * do Essentials usa FileTest.exist? com caminhos RELATIVOS, que falham no 3DS
-     * (o CWD nao e' a pasta do jogo) -> nenhum windowskin/imagem resolve -> caixa
-     * de texto invisivel. Com esta global, __mkxp_try_bitmap pode testar o caminho
-     * COMPLETO (g_game_base + "/" + rel), tal como o loader C++ ja' faz. */
-    {
-        mrb_value gb = mrb_str_new_cstr(mrb, g_game_base);
-        mrb_gv_set(mrb, mrb_intern_lit(mrb, "$__mkxp_game_base"), gb);
-        DBGLOG("[WSKIN] $__mkxp_game_base = '%s' (p/ resolver imagens por caminho completo)\n", g_game_base);
-    }
+    /* (marshal_class_cache_reset + $__mkxp_game_base movidos para DEPOIS do #endif,
+     *  para correrem em AMBOS os caminhos -- pool on/off.) */
     DBGLOG("[POOL] allocator de pools ativo (alloc O(1), evita malloc O(n) do 3DS)\n");
 #else
     /* TESTE DE ISOLAMENTO: mrb_open() normal, SEM o pool. Se o jogo arrancar
@@ -6841,6 +7024,18 @@ int binding_3ds_run(const char *game_path) {
     DBGLOG("[BOOT] passo 2/4 OK (mruby criado SEM pool -- boot mais lento mas estavel)\n");
     DBGLOG("[POOL] DESLIGADO (USE_POOL_ALLOCATOR=0) -- a usar malloc do sistema\n");
 #endif
+    g_mkxp_mrb = mrb;   /* garantir o global em ambos os caminhos (pool on/off) */
+
+    /* ── SETUP COMUM A AMBOS OS CAMINHOS (pool on/off) ─────────────────────────
+     * ANTES isto estava SO' no ramo da pool. Com USE_POOL_ALLOCATOR=0 (pool
+     * desligada p/ Azahar -- liberta ~28MB) o $__mkxp_game_base ficava por
+     * definir e NENHUMA imagem/windowskin resolvia. Agora corre sempre. */
+    marshal_class_cache_reset();   /* cache de classes do marshal (load .rxdata ~150x) */
+    {
+        mrb_value gb = mrb_str_new_cstr(mrb, g_game_base);
+        mrb_gv_set(mrb, mrb_intern_lit(mrb, "$__mkxp_game_base"), gb);
+        DBGLOG("[WSKIN] $__mkxp_game_base = '%s' (p/ resolver imagens por caminho completo)\n", g_game_base);
+    }
 
 
     /* ── CHECK DE RECURSOS CRITICOS (diagnostico/prevencao) ────────────────────
@@ -7078,6 +7273,34 @@ end
         [](mrb_state *mrb2, mrb_value) -> mrb_value {
             (void)mrb2;
             return mrb_float_value(mrb2, tick_to_ms(svcGetSystemTick()));
+        },
+        MRB_ARGS_NONE());
+
+    /* DEBUG LOG CERTEIRO: contador CUMULATIVO de objetos/buffers NOVOS alocados
+     * pelo allocator do mruby (= o "objs_criados" do PROFILE). Os patches Ruby
+     * leem isto antes/depois de uma operacao para saber QUANTOS objetos ela
+     * alocou -- e assim atribuir o pico de +125K do dialogo a' carga do mapa vs
+     * ao render da mensagem (em vez de adivinhar). Float p/ nao haver overflow. */
+    mrb_define_method(mrb, mrb->kernel_module,
+        "__mkxp_objs",
+        [](mrb_state *mrb2, mrb_value) -> mrb_value {
+            /* g_prof_objs_created ja' esta' em scope (mesmo header que a linha do
+             * g_prof_objs_created++ no allocator). Nao re-declarar -> sem risco de
+             * conflito de tipo; o cast p/ mrb_float aceita qualquer tipo inteiro. */
+            return mrb_float_value(mrb2, (mrb_float)g_prof_objs_created);
+        },
+        MRB_ARGS_NONE());
+
+    /* DEBUG LOG CERTEIRO: contador CUMULATIVO de chamadas aos setters C++ de
+     * Sprite (x=/y=/z=/bitmap=/src_rect=/opacity=/...). Decide o fix CEGO D
+     * (batch-setter): se forem ~90/frame (15 x 6 sprites), um setter em lote
+     * corta ~85 dispatches/frame; se forem poucas, o custo esta' no CORPO do
+     * update Ruby, nao no dispatch, e o batch-setter nao ajudaria. */
+    mrb_define_method(mrb, mrb->kernel_module,
+        "__mkxp_setters",
+        [](mrb_state *mrb2, mrb_value) -> mrb_value {
+            extern unsigned long long g_spr_setter_calls;
+            return mrb_float_value(mrb2, (mrb_float)g_spr_setter_calls);
         },
         MRB_ARGS_NONE());
 

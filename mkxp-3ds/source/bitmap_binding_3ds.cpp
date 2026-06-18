@@ -9,6 +9,7 @@
 #include <mruby/value.h>
 #include <mruby/string.h>
 #include <mruby/variable.h>
+#include <mruby/gc.h>   /* mrb_full_gc: reciclar bitmaps orfaos quando um asset grande nao cabe */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -19,6 +20,313 @@
 #define STBI_NO_PIC
 #define STBI_NO_PNM
 #include "stb_image.h"
+#include <png.h>   /* libpng: decoder robusto p/ PNGs que o stb falha no ARM 32-bit */
+
+/* ===== DECODER LIBPNG (a obra: resolve o "outofmem" do stb no ARM) ============
+ * O [DECODE|PROBE] PROVOU que a intro picture NAO falha por memoria (os 2 blocos
+ * de ~4.6MB cabiam) -- e' um bug do stb_image compilado para ARM 32-bit (o malloc
+ * interno do stb devolve NULL com memoria disponivel). O mkxp-z (o emulador de
+ * RPGXP para iOS/Android) usa libpng via SDL_image e descodifica estas mesmas
+ * imagens sem problema. Portamos a mesma solucao: libpng (API png_image 1.6+,
+ * simples e robusta). Validado no host com as 5 introPictures reais (todas OK).
+ * Devolve buffer RGBA (4 bytes/px) via malloc (adotado por bmp_alloc_adopt), ou
+ * NULL se nao for PNG valido (cai no stb, como antes). */
+/* Toggle do decode 4444 p/ tilesets gigantes. true (default) = tilesets >16MB
+ * (em 8888) sao decodificados direto p/ RGBA4444 (metade da RAM) e usados sem
+ * embrulho. Por p/ false reverte ao comportamento antigo (magenta nos gigantes).
+ * Mantido como flag p/ poder desligar sem recompilar a logica toda. */
+static bool g_tileset_4444 = true;
+
+/* mrb_state global (definido em binding_3ds.cpp). Usado APENAS no caminho de
+ * falha de alocacao de assets grandes: forca um mrb_full_gc para libertar
+ * bitmaps ORFAOS (tileset do mapa anterior desreferenciado mas nao disposto) e
+ * abrir espaco em malloc. Helper devolve true se, apos o GC, houver de novo
+ * espaco -- o chamador deve RETENTAR a alocacao. Seguro: nunca corre no fluxo
+ * normal (so' quando malloc+linear ja' falharam), e a cutscene usa um tileset
+ * pequeno que nunca falha, por isso o GC nunca dispara la'. */
+extern mrb_state *g_mkxp_mrb;
+static int g_gc_oom_calls = 0;
+static bool gc_reclaim_on_oom(const char *who) {
+    if (!g_mkxp_mrb) return false;
+    int live_before = (int)g_mkxp_mrb->gc.live;
+    mrb_full_gc(g_mkxp_mrb);
+    int live_after = (int)g_mkxp_mrb->gc.live;
+    g_gc_oom_calls++;
+    if (g_dbglog) {
+        fprintf(g_dbglog, "[BMP|GC-OOM] #%d (%s): full_gc live %d->%d (libertou %d objs orfaos) -> retry\n",
+                g_gc_oom_calls, who ? who : "?", live_before, live_after, live_before - live_after);
+        fflush(g_dbglog);
+    }
+    return (live_after < live_before);   /* houve algo a libertar -> vale a pena retentar */
+}
+
+/* Leitor de PNG a partir de memoria, p/ a API de baixo nivel do libpng (row a
+ * row). png_set_read_fn chama isto; o io_ptr aponta p/ este struct. */
+struct PngMemRdr { const unsigned char* buf; size_t len; size_t pos; };
+static void png_mem_read_cb(png_structp png, png_bytep out, png_size_t n) {
+    PngMemRdr* m = (PngMemRdr*)png_get_io_ptr(png);
+    if (!m || m->pos + n > m->len) { png_error(png, "read past end"); return; }
+    memcpy(out, m->buf + m->pos, (size_t)n);
+    m->pos += (size_t)n;
+}
+
+static unsigned char* decode_png_libpng(const unsigned char* buf, size_t len,
+                                        int* out_w, int* out_h, bool* out_islinear) {
+    /* ── FALLBACK PARA LINEAR (descoberto pelo log) ─────────────────────────
+     * O [BMP|LIBPNG-ERR] provou que NEM o malloc grande PRE-libpng cabe: um
+     * malloc de 5.7MB falha com 17MB de LINEAR livre. Ou seja o heap de malloc
+     * esta' esgotado pela pool do mruby (~28MB que nunca devolve), mas o heap
+     * LINEAR tem espaco. A memoria de linearAlloc serve igual como b->pixels
+     * (e' CPU-legivel; o blt e o upload de textura funcionam na mesma), por isso
+     * fazemos malloc PRIMEIRO e, se falhar, linearAlloc. out_islinear diz ao
+     * caller para o bitmap_free usar linearFree. As dimensoes vem do IHDR
+     * (offsets 16=largura, 20=altura, big-endian); PNG_FORMAT_RGBA => w*h*4. */
+    if (out_islinear) *out_islinear = false;
+    if (len < 29) return nullptr;   /* sem IHDR completo nao ha' dimensoes */
+    unsigned int iw = ((unsigned)buf[16] << 24) | ((unsigned)buf[17] << 16) |
+                      ((unsigned)buf[18] << 8)  |  (unsigned)buf[19];
+    unsigned int ih = ((unsigned)buf[20] << 24) | ((unsigned)buf[21] << 16) |
+                      ((unsigned)buf[22] << 8)  |  (unsigned)buf[23];
+    unsigned char bitdepth = buf[24], colortype = buf[25], interlace = buf[28];
+    if (iw == 0 || ih == 0 || iw > 65535 || ih > 65535) return nullptr;
+    size_t need = (size_t)iw * (size_t)ih * 4u;
+
+    /* malloc primeiro; se o heap de malloc nao tem bloco, cai p/ linearAlloc */
+    bool used_linear = false;
+    unsigned char* out = (unsigned char*)malloc(need);
+    if (!out) {
+        out = (unsigned char*)linearAlloc(need);
+        used_linear = (out != nullptr);
+        if (g_dbglog) {
+            fprintf(g_dbglog, "[BMP|LIBPNG-%s] need=%zuKB (%ux%u bd=%u ct=%u il=%u) "
+                    "malloc esgotado -> linearAlloc %s (linear_livre=%.0fKB)\n",
+                    used_linear ? "LINEAR" : "ERR", need / 1024, iw, ih, bitdepth,
+                    colortype, interlace, used_linear ? "OK" : "TAMBEM FALHOU",
+                    linearSpaceFree() / 1024.0);
+            fflush(g_dbglog);
+        }
+        if (!out) {
+            /* malloc+linear cheios (ex: introPictures 5.6MB com o tileset da vila
+             * a ocupar malloc). Reciclar orfaos via GC e RETENTAR antes do magenta. */
+            if (gc_reclaim_on_oom("8888")) {
+                out = (unsigned char*)malloc(need);
+                used_linear = false;
+                if (!out) { out = (unsigned char*)linearAlloc(need); used_linear = (out != nullptr); }
+            }
+            if (!out) return nullptr;
+        }
+    }
+    #define DPL_FREE() do { if (used_linear) linearFree(out); else free(out); } while (0)
+
+    png_image image;
+    memset(&image, 0, sizeof(image));
+    image.version = PNG_IMAGE_VERSION;
+    if (!png_image_begin_read_from_memory(&image, buf, len)) {
+        /* image.message tem o texto real; woe: bit1=warning bit2=error. */
+        if (g_dbglog) {
+            fprintf(g_dbglog, "[BMP|LIBPNG-ERR] begin_read FALHOU woe=%u msg='%s' "
+                    "(%ux%u bd=%u ct=%u il=%u) len=%zu\n",
+                    (unsigned)image.warning_or_error, image.message,
+                    iw, ih, bitdepth, colortype, interlace, len);
+            fflush(g_dbglog);
+        }
+        DPL_FREE();
+        return nullptr;
+    }
+    image.format = PNG_FORMAT_RGBA;
+    if (PNG_IMAGE_SIZE(image) != need) {
+        /* IHDR e libpng discordam no tamanho RGBA -> nao arrisco; cai no antigo. */
+        if (g_dbglog) {
+            fprintf(g_dbglog, "[BMP|LIBPNG-ERR] tamanho IHDR(%zuKB) != libpng(%zuKB) "
+                    "-- abortado sem risco\n", need / 1024,
+                    (size_t)PNG_IMAGE_SIZE(image) / 1024);
+            fflush(g_dbglog);
+        }
+        png_image_free(&image);
+        DPL_FREE();
+        return nullptr;
+    }
+    if (!png_image_finish_read(&image, nullptr, out, 0, nullptr)) {
+        /* Buffer JA' alocado com sucesso -> falha aqui e' do decode em si
+         * (estado/zlib interno do libpng), nao do buffer principal. */
+        if (g_dbglog) {
+            fprintf(g_dbglog, "[BMP|LIBPNG-ERR] finish_read FALHOU woe=%u msg='%s' "
+                    "(%ux%u bd=%u ct=%u il=%u) need=%zuKB linear_livre=%.0fKB\n",
+                    (unsigned)image.warning_or_error, image.message,
+                    iw, ih, bitdepth, colortype, interlace, need / 1024,
+                    linearSpaceFree() / 1024.0);
+            fflush(g_dbglog);
+        }
+        DPL_FREE();
+        return nullptr;   /* png_image liberta-se sozinho no finish_read */
+    }
+    #undef DPL_FREE
+    if (g_dbglog) {
+        fprintf(g_dbglog, "[BMP|LIBPNG-IHDR] '%ux%u' bd=%u ct=%u il=%u OK heap=%s\n",
+                iw, ih, bitdepth, colortype, interlace, used_linear ? "LINEAR" : "malloc");
+        fflush(g_dbglog);
+    }
+    if (out_islinear) *out_islinear = used_linear;
+    *out_w = (int)image.width;
+    *out_h = (int)image.height;
+    return out;
+}
+
+/* ── DECODE DIRETO PARA RGBA4444 (tilesets gigantes) ────────────────────────
+ * O 8888 de um tileset 256x31040 = 30MB nao cabe (heap de malloc esgotado pela
+ * pool; linear so' tem ~16MB). Em 4444 = 15MB, cabe. Aqui usamos a API de BAIXO
+ * NIVEL do libpng (png_read_row) p/ decodificar LINHA A LINHA, empacotando cada
+ * linha 8888->4444 num buffer de 15MB. O scratch e' UMA linha 8888 (~1KB), nunca
+ * os 30MB inteiros. Devolve buffer 4444 (u16/px) via malloc, ou linearAlloc se o
+ * malloc esgotou (out_islinear marca-o p/ bitmap_free usar linearFree).
+ * REQUER il=0 (sem entrelacamento): o entrelacado precisaria da imagem toda em
+ * RAM, o que anula o ganho; estes tilesets sao il=0 (confirmado no log). Em
+ * QUALQUER falha devolve NULL -> o chamador cai no decode 8888 antigo (magenta),
+ * zero regressao. As variaveis libertadas no handler de erro sao 'volatile'
+ * (exigencia do setjmp/longjmp p/ sobreviverem ao salto). */
+static unsigned char* decode_png_to_4444(const unsigned char* buf, size_t len,
+                                         int* out_w, int* out_h, bool* out_islinear) {
+    if (out_islinear) *out_islinear = false;
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!png) return nullptr;
+    png_infop info = png_create_info_struct(png);
+    if (!info) { png_destroy_read_struct(&png, nullptr, nullptr); return nullptr; }
+
+    unsigned char* volatile out = nullptr;
+    bool volatile used_linear = false;
+    png_bytep volatile rowbuf = nullptr;
+    png_bytep volatile full = nullptr;       /* buffer RGBA completo p/ PNG entrelaçado */
+    png_bytep* volatile rows = nullptr;      /* ponteiros de linha p/ entrelaçado */
+    bool volatile full_linear = false;
+    if (setjmp(png_jmpbuf(png))) {                 /* erro do libpng -> limpa+falha */
+        if (rowbuf) free((void*)rowbuf);
+        if (rows) free((void*)rows);
+        if (full) { if (full_linear) linearFree((void*)full); else free((void*)full); }
+        if (out) { if (used_linear) linearFree((void*)out); else free((void*)out); }
+        png_destroy_read_struct(&png, &info, nullptr);
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] libpng longjmp (decode)\n"); fflush(g_dbglog); }
+        return nullptr;
+    }
+
+    PngMemRdr rdr = { buf, len, 0 };
+    png_set_read_fn(png, &rdr, png_mem_read_cb);
+    png_read_info(png, info);
+
+    png_uint_32 w = 0, h = 0; int bitd = 0, colort = 0, interl = 0;
+    png_get_IHDR(png, info, &w, &h, &bitd, &colort, &interl, nullptr, nullptr);
+    if (w == 0 || h == 0) {
+        png_destroy_read_struct(&png, &info, nullptr);
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] dims invalidas %ux%u (il=%d)\n", (unsigned)w, (unsigned)h, interl); fflush(g_dbglog); }
+        return nullptr;
+    }
+    /* normalizar tudo p/ RGBA 8-bit por linha (estes sao ct=6 bd=8 -> sem-op) */
+    if (colort == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+    if (colort == PNG_COLOR_TYPE_GRAY && bitd < 8) png_set_expand_gray_1_2_4_to_8(png);
+    if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
+    if (bitd == 16) png_set_strip_16(png);
+    if (colort == PNG_COLOR_TYPE_GRAY || colort == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png);
+    if (colort == PNG_COLOR_TYPE_RGB || colort == PNG_COLOR_TYPE_GRAY ||
+        colort == PNG_COLOR_TYPE_PALETTE)
+        png_set_add_alpha(png, 0xFF, PNG_FILLER_AFTER);
+    /* PNG entrelaçado (Adam7) tem de ser lido com TODOS os passes; isto activa o
+       tratamento e devolve o nr de passes (1 = nao-entrelaçado, 7 = entrelaçado). */
+    int n_passes = png_set_interlace_handling(png);
+    png_read_update_info(png, info);
+
+    size_t need4444 = (size_t)w * (size_t)h * 2u;     /* u16 por pixel */
+    out = (unsigned char*)malloc(need4444);
+    if (!out) { out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr); }
+    if (!out) {
+        /* malloc+linear cheios. Antes de desistir (magenta), reciclar bitmaps
+         * ORFAOS via GC e RETENTAR. E' isto que liberta o tileset do mapa
+         * anterior (ex: vila 15.5MB) que ficou desreferenciado mas nao disposto
+         * -> o tileset do mapa novo (ex: quarto 8.5MB) passa a caber. */
+        if (gc_reclaim_on_oom("4444")) {
+            out = (unsigned char*)malloc(need4444);
+            if (!out) { out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr); }
+        }
+    }
+    if (!out) {
+        png_destroy_read_struct(&png, &info, nullptr);
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] alloc 4444 FALHOU (mesmo apos GC) need=%zuKB linear_livre=%.0fKB\n", need4444 / 1024, linearSpaceFree() / 1024.0); fflush(g_dbglog); }
+        return nullptr;
+    }
+    rowbuf = (png_bytep)malloc((size_t)w * 4u);
+    if (!rowbuf) {
+        if (used_linear) linearFree((void*)out); else free((void*)out);
+        png_destroy_read_struct(&png, &info, nullptr);
+        return nullptr;
+    }
+    unsigned short* o16 = (unsigned short*)out;
+    png_bytep rb = (png_bytep)rowbuf;
+    if (n_passes <= 1) {
+        /* nao-entrelaçado: linha-a-linha (eficiente em memoria) */
+        for (png_uint_32 y = 0; y < h; y++) {
+            png_read_row(png, rb, nullptr);
+            size_t base = (size_t)y * (size_t)w;
+            for (png_uint_32 x = 0; x < w; x++) {
+                unsigned char r = rb[x * 4 + 0], g = rb[x * 4 + 1],
+                              b = rb[x * 4 + 2], a = rb[x * 4 + 3];
+                o16[base + x] = (unsigned short)(((r >> 4) << 12) | ((g >> 4) << 8) |
+                                                 ((b >> 4) << 4) | (a >> 4));
+            }
+        }
+    } else {
+        /* ENTRELAÇADO (Adam7): os passes interleavam-se, nao da' p/ ler linha-a-linha.
+           Aloca um RGBA completo temporario, le a imagem toda, depois converte p/ 4444.
+           (Ex: introPictures3.png 1696x864 -> ~5.7MB temporario.) */
+        size_t fullsz = (size_t)w * (size_t)h * 4u;
+        full = (png_bytep)malloc(fullsz);
+        if (!full) { full = (png_bytep)linearAlloc(fullsz); full_linear = (full != nullptr); }
+        if (!full && gc_reclaim_on_oom("il4444")) {
+            full = (png_bytep)malloc(fullsz);
+            if (!full) { full = (png_bytep)linearAlloc(fullsz); full_linear = (full != nullptr); }
+        }
+        if (!full) {
+            free((void*)rowbuf); rowbuf = nullptr;
+            if (used_linear) linearFree((void*)out); else free((void*)out);
+            png_destroy_read_struct(&png, &info, nullptr);
+            if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] alloc RGBA p/ entrelacado FALHOU %ux%u (%zuKB)\n", (unsigned)w, (unsigned)h, fullsz / 1024); fflush(g_dbglog); }
+            return nullptr;
+        }
+        rows = (png_bytep*)malloc((size_t)h * sizeof(png_bytep));
+        if (!rows) {
+            if (full_linear) linearFree((void*)full); else free((void*)full); full = nullptr;
+            free((void*)rowbuf); rowbuf = nullptr;
+            if (used_linear) linearFree((void*)out); else free((void*)out);
+            png_destroy_read_struct(&png, &info, nullptr);
+            return nullptr;
+        }
+        for (png_uint_32 y = 0; y < h; y++) ((png_bytep*)rows)[y] = (png_bytep)full + (size_t)y * (size_t)w * 4u;
+        png_read_image(png, (png_bytep*)rows);   /* le todos os passes de uma vez */
+        for (png_uint_32 y = 0; y < h; y++) {
+            png_bytep src = ((png_bytep*)rows)[y];
+            size_t base = (size_t)y * (size_t)w;
+            for (png_uint_32 x = 0; x < w; x++) {
+                unsigned char r = src[x * 4 + 0], g = src[x * 4 + 1],
+                              b = src[x * 4 + 2], a = src[x * 4 + 3];
+                o16[base + x] = (unsigned short)(((r >> 4) << 12) | ((g >> 4) << 8) |
+                                                 ((b >> 4) << 4) | (a >> 4));
+            }
+        }
+        free((void*)rows); rows = nullptr;
+        if (full_linear) linearFree((void*)full); else free((void*)full); full = nullptr;
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444] entrelacado %ux%u OK (%d passes)\n", (unsigned)w, (unsigned)h, n_passes); fflush(g_dbglog); }
+    }
+    png_read_end(png, nullptr);
+    free((void*)rowbuf); rowbuf = nullptr;
+    png_destroy_read_struct(&png, &info, nullptr);
+    if (g_dbglog) {
+        fprintf(g_dbglog, "[BMP|PNG4444] '%ux%u' bd=%d ct=%d -> RGBA4444 %zuKB heap=%s OK\n",
+                (unsigned)w, (unsigned)h, bitd, colort, need4444 / 1024,
+                used_linear ? "LINEAR" : "malloc");
+        fflush(g_dbglog);
+    }
+    if (out_islinear) *out_islinear = (bool)used_linear;
+    *out_w = (int)w;
+    *out_h = (int)h;
+    return (unsigned char*)out;
+}
 
 /* ── FIX CRÍTICO: usar mrb_get_argc em vez de mrb_get_args("*") ──────────────
  * Em mruby 3.2, chamar mrb_get_args(mrb, "*", &argv, &argc) pode "consumir"
@@ -74,7 +382,10 @@ static bool extract_color(mrb_state *mrb, mrb_value obj, float *r, float *g, flo
 static void bitmap_free(mrb_state*, void *p) {
     Bitmap3DS *b = (Bitmap3DS*)p;
     if (!b) return;
-    if (b->pixels) free(b->pixels);
+    if (b->pixels) {
+        if (b->pixels_linear) linearFree(b->pixels);  /* veio de linearAlloc */
+        else                  free(b->pixels);
+    }
     if (b->tex)    display_3ds_free_texture(b->tex);
     free(b);
 }
@@ -101,13 +412,15 @@ static Bitmap3DS *bmp_alloc(int w, int h) {
  * ja' alocou (mesmo allocator: stb usa malloc/free, e bitmap_free usa free), em
  * vez de alocar um segundo buffer e copiar. Resultado: pico cai de 60MB p/ 30MB
  * (so' o buffer do stbi), sem memcpy. Generico: qualquer imagem grande beneficia. */
-static Bitmap3DS *bmp_alloc_adopt(int w, int h, unsigned char *owned_pixels) {
+static Bitmap3DS *bmp_alloc_adopt(int w, int h, unsigned char *owned_pixels,
+                                  bool is_linear = false) {
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     Bitmap3DS *b  = (Bitmap3DS*)calloc(1, sizeof(Bitmap3DS));
     b->width      = w;
     b->height     = h;
-    b->pixels     = owned_pixels;   /* adota -- libertado por bitmap_free (free) */
+    b->pixels     = owned_pixels;   /* adota -- libertado por bitmap_free */
+    b->pixels_linear = is_linear;   /* true -> bitmap_free usa linearFree */
     b->tex_dirty  = true;
     b->tex        = nullptr;
     return b;
@@ -115,6 +428,11 @@ static Bitmap3DS *bmp_alloc_adopt(int w, int h, unsigned char *owned_pixels) {
 
 void __attribute__((used)) bmp_flush(Bitmap3DS *b) {
     if (!b || !b->tex_dirty || b->disposed) return;
+    /* Um bitmap RGBA4444 e' SO' fonte de blt (tileset gigante) -> nunca textura.
+     * (Os 4444 sao sempre >1024 pela regra dos 16MB, logo cairiam no tex_failed
+     * abaixo de qualquer forma; este guard explicita e evita ler 4444 como 8888
+     * em display_3ds_create_texture caso a regra mude.) */
+    if (b->pixels_4444) { b->tex_failed = true; b->tex_dirty = false; return; }
     /* FIX RAIZ (tilesets gigantes a falhar + magenta + 2.2 fps): o PICA200 so'
      * suporta texturas ate' 1024x1024. Tilesets do Essentials sao 256x31040 (!),
      * impossiveis de meter numa textura. MAS esses bitmaps gigantes NUNCA sao
@@ -216,8 +534,75 @@ static mrb_value bmp_native_exist(mrb_state *mrb, mrb_value) {
     return mkxp_native_file_exists(buf) ? mrb_true_value() : mrb_false_value();
 }
 
+/* true se este Bitmap esta' guardado em RGBA4444 (tileset gigante). O Ruby
+ * (CustomTilemap) usa isto p/ NAO embrulhar (o 4444 e' usado direto como fonte). */
+static mrb_value bmp_native_4444(mrb_state *mrb, mrb_value self) {
+    Bitmap3DS *b = (Bitmap3DS*)DATA_PTR(self);
+    (void)mrb;
+    return (b && b->pixels_4444) ? mrb_true_value() : mrb_false_value();
+}
+
 static void str_tolower(char *s) {
     for (; *s; s++) if (*s >= 'A' && *s <= 'Z') *s += 32;
+}
+
+/* ── Cache NEGATIVA de loads falhados ───────────────────────────────────────
+ * O log mostrou o MESMO tileset (ex: 'Gen4 Interior' 16.6MB) pedido e a FALHAR
+ * 24x: cada tentativa lia 232KB do SD + tentava alocar (4444 + linear) + stb,
+ * tudo a falhar, TODOS os frames -> desperdicio enorme + spam no log. Isto
+ * regista os caminhos ja' falhados e devolve o fallback IMEDIATAMENTE (sem IO
+ * nem decode) nos pedidos seguintes. Limpa-se em mudanca de mapa (via
+ * Bitmap._clear_failed_loads, chamado no CustomTilemap#tileset=), p/ um mapa
+ * novo voltar a tentar os seus tilesets de raiz. */
+static unsigned int s_failed_hash[32];
+static int          s_failed_n = 0;
+static unsigned int dy_djb2(const char* s) {
+    unsigned int h = 5381; for (; *s; ++s) h = ((h << 5) + h) ^ (unsigned char)*s; return h;
+}
+static bool path_failed_before(const char* path) {
+    unsigned int h = dy_djb2(path);
+    for (int i = 0; i < s_failed_n; i++) if (s_failed_hash[i] == h) return true;
+    return false;
+}
+static void mark_path_failed(const char* path) {
+    unsigned int h = dy_djb2(path);
+    for (int i = 0; i < s_failed_n; i++) if (s_failed_hash[i] == h) return;  /* ja' marcado */
+    if (s_failed_n < (int)(sizeof(s_failed_hash)/sizeof(s_failed_hash[0])))
+        s_failed_hash[s_failed_n++] = h;   /* cheio (>32 falhas/mapa, improvavel): para de somar */
+    /* Marca de CONFIRMACAO: dispara UMA vez por caminho falhado. Se isto aparece
+     * no log, a cache negativa esta' ativa neste build (e os pedidos seguintes
+     * deste caminho ja' nao re-tentam). Uma linha por tileset, nao e' spam. */
+    extern FILE *g_dbglog;
+    if (g_dbglog) {
+        fprintf(g_dbglog, "[BMP|NCACHE] '%s' marcado falhado -> proximos pedidos = fallback imediato (cache ON)\n", path);
+        fflush(g_dbglog);
+    }
+}
+/* Nao-static p/ ser chamavel pelo wrapper Ruby (bmp_clear_failed_loads). */
+void mkxp_bmp_clear_failed_loads() { s_failed_n = 0; }
+
+/* Constroi o bitmap 32x32 de fallback: TRANSPARENTE p/ Pictures (decorativo,
+ * invisivel como no PC), MAGENTA p/ o resto (asset em falta = erro visivel). */
+static Bitmap3DS *make_fallback_bitmap(const char *path) {
+    bool is_picture = false;
+    if (path) {
+        for (const char *p = path; *p; p++) {
+            if ((p[0]=='P'||p[0]=='p') &&
+                (strncmp(p, "Pictures/", 9) == 0 || strncmp(p, "pictures/", 9) == 0)) {
+                is_picture = true; break;
+            }
+        }
+    }
+    Bitmap3DS *b = bmp_alloc(32, 32);
+    unsigned char rc = is_picture ? 0 : 255;   /* R e B; G=0 sempre */
+    unsigned char ac = is_picture ? 0 : 255;   /* alpha */
+    for (int i = 0; i < 32 * 32; i++) {
+        b->pixels[i*4+0] = rc; b->pixels[i*4+1] = 0;
+        b->pixels[i*4+2] = rc; b->pixels[i*4+3] = ac;
+    }
+    b->tex_dirty = true;
+    bmp_flush(b);
+    return b;
 }
 
 static Bitmap3DS *bmp_load_file(const char *path) {
@@ -236,6 +621,9 @@ static Bitmap3DS *bmp_load_file(const char *path) {
         return b;
     }
 
+    /* CACHE NEGATIVA: se este caminho ja' falhou neste mapa, devolve o fallback
+     * sem reler o ficheiro nem re-tentar o decode (mata o storm de 24x/frame). */
+    if (path_failed_before(path)) return make_fallback_bitmap(path);
     /* FIX/PREVENCAO imagens que nao carregam: a lista de extensoes tinha de
      * cobrir TODAS as que o Essentials usa. Faltava .gif (usado em varias
      * imagens; o pbResolveBitmap tenta .png E .gif). Sem .gif aqui, uma imagem
@@ -271,20 +659,55 @@ static Bitmap3DS *bmp_load_file(const char *path) {
              * Limite 24MB: apanha os Gen4 (28-30MB) e nada mais (um tileset de
              * 8-16MB ainda e' tentado, pode carregar via adopt+blt-de-RAM). */
             {
-                static const long M1_MAX_DECODE_BYTES = 24L * 1024 * 1024; /* 24 MB */
+                extern bool g_mkxp_is_new3ds;   /* definido em main.cpp */
+                /* No New 3DS ha' RAM estendida: permitimos tilesets ate' 48MB
+                 * (apanha os Gen4 de 28-30MB). No Old 3DS mantemos 24MB -- acima
+                 * disso o malloc nunca tem espaco e o decode so' gasta ~768ms p/
+                 * falhar na mesma. */
+                const long M1_MAX_DECODE_BYTES =
+                    (g_mkxp_is_new3ds ? 48L : 24L) * 1024 * 1024;
                 int iw = 0, ih = 0, ic = 0;
                 if (stbi_info(full, &iw, &ih, &ic)) {
                     long need = (long)iw * ih * 4;
                     if (need > M1_MAX_DECODE_BYTES) {
                         printf("[BMP|SKIP-BIG] '%s' info=%dx%d (%.1fMB) > limite %ldMB "
-                               "-- decode SALTADO [M1], poupa ~stbi_load fútil; fallback magenta\n",
+                               "-- decode SALTADO [M1]%s; fallback magenta\n",
                                full, iw, ih, need / 1048576.0,
-                               M1_MAX_DECODE_BYTES / (1024 * 1024));
+                               M1_MAX_DECODE_BYTES / (1024 * 1024),
+                               g_mkxp_is_new3ds ? " (New 3DS)" : "");
                         if (g_dbglog)
                             fprintf(g_dbglog, "[BMP|SKIP-BIG] '%s' info=%dx%d (%.1fMB) "
-                                    "decode saltado [M1]\n", full, iw, ih, need / 1048576.0);
+                                    "decode saltado [M1] limite=%ldMB new3ds=%d\n",
+                                    full, iw, ih, need / 1048576.0,
+                                    M1_MAX_DECODE_BYTES / (1024 * 1024),
+                                    (int)g_mkxp_is_new3ds);
                         fflush(stdout);
                         continue;   /* nao decodifica; tenta proxima ext/raiz -> fallback */
+                    }
+                    /* New 3DS + tileset grande (acima do antigo limite de 24MB):
+                     * ANTES do decode caro, confirmamos que a RAM estendida esta'
+                     * mesmo disponivel com um probe-malloc. Se nao couber (ex:
+                     * launcher sem memoria estendida), saltamos para magenta SEM
+                     * gastar os ~768ms do stbi_load -- nunca crasha. */
+                    if (g_mkxp_is_new3ds && need > 24L * 1024 * 1024) {
+                        void *probe = malloc((size_t)need);
+                        if (!probe) {
+                            printf("[BMP|N3DS-NOFIT] '%s' %dx%d (%.1fMB) nao cabe no "
+                                   "malloc (sem RAM estendida?) -- magenta sem decode\n",
+                                   full, iw, ih, need / 1048576.0);
+                            if (g_dbglog)
+                                fprintf(g_dbglog, "[BMP|N3DS-NOFIT] '%s' %.1fMB nao "
+                                        "coube -- magenta\n", full, need / 1048576.0);
+                            fflush(stdout);
+                            continue;
+                        }
+                        free(probe);
+                        printf("[BMP|N3DS-FIT] '%s' %dx%d (%.1fMB) cabe -> a decodificar "
+                               "(RAM estendida do New 3DS)\n", full, iw, ih, need / 1048576.0);
+                        if (g_dbglog)
+                            fprintf(g_dbglog, "[BMP|N3DS-FIT] '%s' %.1fMB a decodificar\n",
+                                    full, need / 1048576.0);
+                        fflush(stdout);
                     }
                 }
             }
@@ -306,6 +729,184 @@ static Bitmap3DS *bmp_load_file(const char *path) {
                 b->tex_dirty = true;
                 bmp_flush(b);
                 return b;
+            }
+
+            /* ── FALLBACK [M2]: leitura MANUAL + decode-de-MEMORIA ───────────────
+             * O stbi_load(ficheiro) acima devolveu NULL. Antes de desistir, lemos o
+             * ficheiro INTEIRO para um buffer (fopen+fread) e decodificamos com
+             * stbi_load_from_memory -- evitando o IO interno do stb (fseek/fread em
+             * stream), suspeito de falhar em ficheiros grandes no SD do 3DS: as
+             * introPictures* (~3-5MB) davam 'no SOI' APESAR de stbi_info ler o
+             * tamanho, o que so' faz sentido se a deteccao de formato visse dados
+             * truncados/lixo. Este caminho ISOLA a causa no log (le' o ficheiro
+             * todo? assinatura PNG? decode?) e PODE corrigir. So' corre DEPOIS de o
+             * stbi_load normal ter falhado -> zero regressao para o que ja' carrega.
+             * Em FAT32 (SD do 3DS) o fopen e' case-insensitive, logo 'full' resolve
+             * tanto .PNG como .png. */
+            if (!px) {
+                FILE *mf = fopen(full, "rb");
+                if (mf) {
+                    fseek(mf, 0, SEEK_END);
+                    long fsz = ftell(mf);
+                    fseek(mf, 0, SEEK_SET);
+                    unsigned char *fbuf = (fsz > 0 && fsz < 64L * 1024 * 1024)
+                                          ? (unsigned char *)malloc((size_t)fsz) : nullptr;
+                    size_t rd = fbuf ? fread(fbuf, 1, (size_t)fsz, mf) : 0;
+                    fclose(mf);
+                    int sig_png = (rd >= 8 && fbuf && fbuf[0] == 0x89 &&
+                                   fbuf[1] == 'P' && fbuf[2] == 'N' && fbuf[3] == 'G');
+                    if (g_dbglog)
+                        fprintf(g_dbglog, "[BMP|M2READ] '%s' fsz=%ld lido=%zu sig_png=%d "
+                                "linear_livre=%.0fKB buf=%s\n", full, fsz, rd, sig_png,
+                                linearSpaceFree() / 1024.0, fbuf ? "ok" : "NULL");
+                    if (fbuf && fsz > 0 && rd == (size_t)fsz) {
+                        int mw = 0, mh = 0, mch = 0;
+                        /* ===== LIBPNG PRIMEIRO (a correcao) =====================
+                         * Para PNGs, tenta libpng antes do stb. O stb falha
+                         * "outofmem" em PNGs grandes no ARM (bug do stb, NAO
+                         * memoria -- ver [DECODE|PROBE]). libpng descodifica-os
+                         * bem. Se libpng der, adota e devolve; senao, cai no
+                         * probe + stb por baixo (que ficam como diagnostico). */
+                        if (sig_png) {
+                            /* TILESET GIGANTE: se o 8888 passaria de 16MB (so' os
+                             * tilesets 256xN chegam la'), decodifica direto p/ RGBA4444
+                             * (metade da RAM) -> o decode de 15MB cabe onde o de 30MB
+                             * falhava. Usado SEM embrulho (o Ruby deteta native_4444?).
+                             * Se falhar, cai no decode 8888 normal (magenta, como antes). */
+                            if (g_tileset_4444 && fsz >= 29) {
+                                unsigned int gw = ((unsigned)fbuf[16] << 24) | ((unsigned)fbuf[17] << 16) |
+                                                  ((unsigned)fbuf[18] << 8)  |  (unsigned)fbuf[19];
+                                unsigned int gh = ((unsigned)fbuf[20] << 24) | ((unsigned)fbuf[21] << 16) |
+                                                  ((unsigned)fbuf[22] << 8)  |  (unsigned)fbuf[23];
+                                if ((size_t)gw * (size_t)gh * 4u > (size_t)16 * 1024 * 1024) {
+                                    int qw = 0, qh = 0; bool q_linear = false;
+                                    unsigned char* qpx = decode_png_to_4444(fbuf, (size_t)fsz, &qw, &qh, &q_linear);
+                                    if (qpx) {
+                                        free(fbuf);
+                                        Bitmap3DS *b = bmp_alloc_adopt(qw, qh, qpx, q_linear);
+                                        b->pixels_4444 = true;
+                                        b->tex_dirty   = true;
+                                        bmp_flush(b);  /* >1024 -> tex_failed; 4444 nunca vira textura */
+                                        if (g_dbglog) {
+                                            fprintf(g_dbglog, "[BMP|PNG4444] '%s' adotado RGBA4444 %dx%d "
+                                                    "heap=%s (era 8888=%.1fMB -> 4444=%.1fMB)\n", full, qw, qh,
+                                                    q_linear ? "LINEAR" : "malloc",
+                                                    (double)gw * gh * 4 / 1048576.0,
+                                                    (double)gw * gh * 2 / 1048576.0);
+                                            fflush(g_dbglog);
+                                        }
+                                        return b;
+                                    }
+                                    /* 4444 falhou -> segue p/ 8888 normal (magenta) */
+                                }
+                            }
+                            int lw = 0, lh = 0; bool l_linear = false;
+                            unsigned char* lpx = decode_png_libpng(fbuf, (size_t)fsz, &lw, &lh, &l_linear);
+                            if (lpx) {
+                                free(fbuf);
+                                if (g_dbglog) {
+                                    fprintf(g_dbglog, "[BMP|LIBPNG] '%s' %dx%d OK via "
+                                            "libpng heap=%s\n", full, lw, lh,
+                                            l_linear ? "LINEAR" : "malloc");
+                                    fflush(g_dbglog);
+                                }
+                                Bitmap3DS *b = bmp_alloc_adopt(lw, lh, lpx, l_linear);
+                                b->tex_dirty = true;
+                                bmp_flush(b);
+                                return b;
+                            }
+                            if (g_dbglog) {
+                                fprintf(g_dbglog, "[BMP|LIBPNG] '%s' libpng FALHOU -> "
+                                        "cai no stb (diagnostico abaixo)\n", full);
+                                fflush(g_dbglog);
+                            }
+                        }
+                        /* DEBUG CERTEIRO (cracker da contradicao 24MB-livres-mas-falha):
+                         * o stb segura DOIS blocos grandes ao mesmo tempo no decode
+                         * (out + expanded ~= 2 x w*h*4). O probe de 1 bloco dava 24MB,
+                         * mas o decode falha "outofmem". Aqui testo o PADRAO REAL: 1
+                         * bloco de w*h*4, depois 2 em simultaneo. 3 resultados possiveis:
+                         *  - 2 blocos CABEM            -> nao e' memoria; e' bug interno
+                         *    do stb no ARM ou heap corrompida (proximo passo: outro angulo)
+                         *  - 1 cabe mas 2 nao          -> fragmentacao: ha' espaco total
+                         *    mas nao 2 blocos contiguos (fix: arena de decode pre-alocada)
+                         *  - nem 1 cabe                -> falta memoria mesmo (o probe de
+                         *    1x24MB engana; fix: libertar heap antes do decode) */
+                        /* THROTTLE: o DECODE|PROBE aloca 2x w*h*4. Em cutscenes com
+                         * retry (a mesma imagem falha varias vezes) isto corria a
+                         * cada falha e inflava o tempo. Ja' provou o que tinha a
+                         * provar (CABE-2). Corre so' as primeiras vezes; o resultado
+                         * one-liner [BMP|M2OK/M2FAIL] continua sempre. */
+                        static int s_probe_budget = 4;
+                        if (g_dbglog && s_probe_budget > 0) {
+                            s_probe_budget--;
+                            int iw = 0, ih = 0, ic = 0;
+                            if (stbi_info_from_memory(fbuf, (int)fsz, &iw, &ih, &ic)) {
+                                size_t need = (size_t)iw * (size_t)ih * 4u;
+                                void *p1 = malloc(need);
+                                void *p2 = malloc(need);   /* 2o em simultaneo com o 1o */
+                                fprintf(g_dbglog,
+                                    "[DECODE|PROBE] '%s' %dx%d need=%zuKB/bloco | 1bloco=%s "
+                                    "2blocos=%s | linear_livre=%.0fKB => %s\n",
+                                    full, iw, ih, need/1024,
+                                    p1 ? "OK" : "FALHOU",
+                                    (p1 && p2) ? "OK" : "FALHOU",
+                                    linearSpaceFree() / 1024.0,
+                                    (p1 && p2) ? "CABE-2 (nao e' memoria: stb/heap)"
+                                               : p1 ? "SO-1 (fragmentacao)"
+                                                    : "NEM-1 (falta memoria mesmo)");
+                                if (p1) free(p1);
+                                if (p2) free(p2);
+                                fflush(g_dbglog);
+                            }
+                        }
+                        unsigned char *mpx = stbi_load_from_memory(fbuf, (int)fsz,
+                                                                   &mw, &mh, &mch, 4);
+                        free(fbuf);
+                        if (mpx) {
+                            if (g_dbglog) {
+                                fprintf(g_dbglog, "[BMP|M2OK] '%s' %dx%d decodificado de "
+                                        "MEMORIA (o IO em stream do stb e' que falhava)\n",
+                                        full, mw, mh);
+                                fflush(g_dbglog);
+                            }
+                            Bitmap3DS *b = bmp_alloc_adopt(mw, mh, mpx);
+                            b->tex_dirty = true;
+                            bmp_flush(b);
+                            return b;
+                        } else if (g_dbglog) {
+                            fprintf(g_dbglog, "[BMP|M2FAIL] '%s' decode-de-memoria TAMBEM "
+                                    "falhou (stbi:%s) sig_png=%d -> e' DECODE/MEMORIA, nao IO\n",
+                                    full, stbi_failure_reason(), sig_png);
+                            /* DEBUG LOG CERTEIRO: este e' o INSTANTE do OOM. Despejamos
+                             * (a) o estado completo do pool do mruby -- quanto esta'
+                             * preso em slots LIVRES (= o que um release-de-chunks daria
+                             * de volta) -- e (b) a sonda do maior bloco de malloc
+                             * disponivel. Juntos decidem o fix CEGO C: se ha' muitos MB
+                             * presos no pool e o maior bloco e' <12MB, o release vale o
+                             * risco; senao, a unica saida e' pre-escalar a imagem (B). */
+                            extern void mkxp_pool_diag_full(const char*);
+                            extern void mkxp_malloc_probe(const char*);
+                            /* THROTTLE: estes dois sao CAROS (pool_diag percorre os
+                             * ~28MB do pool inteiro; malloc_probe tenta 24MB). Numa
+                             * cutscene com retry corriam a cada falha -> 180 varreduras
+                             * no log. Ja' deram o retrato da memoria. So' as 1as vezes;
+                             * o [BMP|M2FAIL] one-liner acima continua sempre. */
+                            static int s_oom_diag_budget = 3;
+                            if (s_oom_diag_budget > 0) {
+                                s_oom_diag_budget--;
+                                mkxp_pool_diag_full("@intro-OOM");
+                                mkxp_malloc_probe("@intro-OOM");
+                            }
+                        }
+                    } else {
+                        if (fbuf) free(fbuf);
+                        if (g_dbglog)
+                            fprintf(g_dbglog, "[BMP|M2FAIL] '%s' leitura INCOMPLETA %zu/%ld "
+                                    "(buf=%s) -> e' IO/ficheiro, nao decode\n",
+                                    full, rd, fsz, fbuf ? "ok" : "NULL");
+                    }
+                }
             }
 
             char full_lc[512];
@@ -369,47 +970,11 @@ static Bitmap3DS *bmp_load_file(const char *path) {
         if (g_dbglog) fflush(g_dbglog);
     }
     fflush(stdout);
-    /* [FALLBACK-COR] Escolher a cor do placeholder 32x32 conforme a pasta:
-     *  - Graphics/Pictures/*  -> TRANSPARENTE (alpha=0). Sao imagens decorativas/
-     *    opcionais (retratos, overlays de cutscene). No PC, um bitmap em falta
-     *    aqui fica invisivel; o magenta tornava-o um quadrado gritante (ex:
-     *    PlayerSprites/0 na cutscene da Xenia). Transparente iguala o PC.
-     *  - Tudo o resto (System/, Windowskins/, Tilesets/, etc.) -> MAGENTA visivel,
-     *    porque aí um asset em falta E' um erro real que convem ver no ecra.
-     * O logging [BMP|MISS] acima mantem-se intacto em ambos os casos -> o
-     * diagnostico continua completo no log, so' muda a COR mostrada. */
-    bool is_picture = false;
-    if (path) {
-        for (const char *p = path; *p; p++) {
-            if ((p[0]=='P'||p[0]=='p') &&
-                (strncmp(p, "Pictures/", 9) == 0 || strncmp(p, "pictures/", 9) == 0)) {
-                is_picture = true; break;
-            }
-        }
-    }
-    Bitmap3DS *b = bmp_alloc(32, 32);
-    if (is_picture) {
-        /* transparente: alpha=0 (RGB irrelevante) -> invisivel, como no PC */
-        for (int i = 0; i < 32 * 32; i++) {
-            b->pixels[i*4+0] = 0;
-            b->pixels[i*4+1] = 0;
-            b->pixels[i*4+2] = 0;
-            b->pixels[i*4+3] = 0;
-        }
-        extern FILE *g_dbglog;
-        if (g_dbglog) fprintf(g_dbglog, "[BMP|MISS]   -> fallback TRANSPARENTE (e' Pictures, decorativo)\n");
-    } else {
-        /* magenta opaco: erro de asset visivel (System/Windowskins/Tilesets...) */
-        for (int i = 0; i < 32 * 32; i++) {
-            b->pixels[i*4+0] = 255;
-            b->pixels[i*4+1] = 0;
-            b->pixels[i*4+2] = 255;
-            b->pixels[i*4+3] = 255;
-        }
-    }
-    b->tex_dirty = true;
-    bmp_flush(b);
-    return b;
+    /* Marca o caminho como falhado (curto-circuita os proximos pedidos neste
+     * mapa) e devolve o fallback. A cor (transparente p/ Pictures, magenta p/ o
+     * resto) e o log [BMP|MISS] acima mantem-se -- so' deixa de RE-TENTAR. */
+    mark_path_failed(path);
+    return make_fallback_bitmap(path);
 }
 
 /* ── bmp_init ─────────────────────────────────────────────────────────────────
@@ -540,9 +1105,29 @@ static mrb_value bmp_clear(mrb_state*, mrb_value self) {
     return mrb_nil_value();
 }
 
+/* ── Leitura de 1 pixel como RGBA8888, tratando origem 8888 OU 4444 ──────────
+ * idx = y*width + x (indice de pixel, nao de byte). Os tilesets gigantes guardam
+ * b->pixels em RGBA4444 (u16/px); todo o resto e' 8888 (4 bytes/px). Expandimos
+ * cada nibble com *17 (0..15 -> 0..255, exato nos extremos: 0->0, 15->255). */
+static inline void px_read(const Bitmap3DS *b, int idx,
+                           unsigned char &r, unsigned char &g,
+                           unsigned char &bl, unsigned char &a) {
+    if (b->pixels_4444) {
+        unsigned short v = ((const unsigned short*)b->pixels)[idx];
+        r  = (unsigned char)(((v >> 12) & 0xF) * 17);
+        g  = (unsigned char)(((v >> 8)  & 0xF) * 17);
+        bl = (unsigned char)(((v >> 4)  & 0xF) * 17);
+        a  = (unsigned char)(( v        & 0xF) * 17);
+    } else {
+        const unsigned char *p = b->pixels + (size_t)idx * 4;
+        r = p[0]; g = p[1]; bl = p[2]; a = p[3];
+    }
+}
+
 static mrb_value bmp_fill_rect(mrb_state *mrb, mrb_value self) {
     Bitmap3DS *b = GET_BMP(self);
     if (!b || !b->pixels) return mrb_nil_value();
+    if (b->pixels_4444) return mrb_nil_value();  /* 4444 e' so' fonte; nao escrever */
 
     int x = 0, y = 0, w = 0, h = 0;
     float cr = 255, cg = 255, cb = 255, ca = 255;
@@ -584,6 +1169,12 @@ static mrb_value bmp_blt(mrb_state *mrb, mrb_value self) {
     mrb_get_args(mrb, "iioo|i", &dx, &dy, &srco, &sro, &opacity);
     Bitmap3DS *src = (Bitmap3DS*)DATA_PTR(srco);
     if (!src || !src->pixels) return mrb_nil_value();
+    /* DESTINO 4444 nunca acontece (4444 e' so' fonte/tileset gigante). Falha-seguro:
+     * escrever 4444 como 8888 corromperia -> registamos e saimos sem escrever. */
+    if (dst->pixels_4444) {
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|4444-GUARD] blt p/ destino 4444 ignorado (%dx%d)\n", dst->width, dst->height); fflush(g_dbglog); }
+        return mrb_nil_value();
+    }
     int sx0 = 0, sy0 = 0, sw = 0, sh = 0;
     if (!extract_rect(mrb, sro, &sx0, &sy0, &sw, &sh)) return mrb_nil_value();
     float alpha = (float)opacity / 255.0f;
@@ -591,14 +1182,15 @@ static mrb_value bmp_blt(mrb_state *mrb, mrb_value self) {
         if (sy < 0 || sy >= src->height || dy2 < 0 || dy2 >= dst->height) continue;
         for (int sxx = sx0, dx2 = (int)dx; sxx < sx0 + sw; sxx++, dx2++) {
             if (sxx < 0 || sxx >= src->width || dx2 < 0 || dx2 >= dst->width) continue;
-            int si = (sy * src->width + sxx) * 4;
+            unsigned char sr, sg, sb, sal;
+            px_read(src, sy * src->width + sxx, sr, sg, sb, sal);  /* origem 8888 ou 4444 */
             int di = (dy2 * dst->width + dx2) * 4;
-            float sa = src->pixels[si+3] / 255.0f * alpha;
+            float sa = sal / 255.0f * alpha;
             float da = 1.0f - sa;
-            dst->pixels[di]   = (unsigned char)(src->pixels[si]   * sa + dst->pixels[di]   * da);
-            dst->pixels[di+1] = (unsigned char)(src->pixels[si+1] * sa + dst->pixels[di+1] * da);
-            dst->pixels[di+2] = (unsigned char)(src->pixels[si+2] * sa + dst->pixels[di+2] * da);
-            dst->pixels[di+3] = (unsigned char)(sa * 255.0f       + dst->pixels[di+3]      * da);
+            dst->pixels[di]   = (unsigned char)(sr * sa + dst->pixels[di]   * da);
+            dst->pixels[di+1] = (unsigned char)(sg * sa + dst->pixels[di+1] * da);
+            dst->pixels[di+2] = (unsigned char)(sb * sa + dst->pixels[di+2] * da);
+            dst->pixels[di+3] = (unsigned char)(sa * 255.0f + dst->pixels[di+3] * da);
         }
     }
     dst->tex_dirty = true;
@@ -666,6 +1258,10 @@ static mrb_value bmp_stretch_blt(mrb_state *mrb, mrb_value self) {
 
     Bitmap3DS *src = (Bitmap3DS*)DATA_PTR(srco);
     if (!src || !src->pixels) return mrb_nil_value();
+    if (dst->pixels_4444) {
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|4444-GUARD] stretch_blt p/ destino 4444 ignorado (%dx%d)\n", dst->width, dst->height); fflush(g_dbglog); }
+        return mrb_nil_value();
+    }
 
     int dx, dy, dw, dh, sx0, sy0, sw, sh;
     if (!extract_rect(mrb, dro, &dx, &dy, &dw, &dh)) return mrb_nil_value();
@@ -686,14 +1282,15 @@ static mrb_value bmp_stretch_blt(mrb_state *mrb, mrb_value self) {
             if (dpx < 0 || dpx >= dst->width) continue;
             int spx = sx0 + (int)(px2 * sx_step);
             if (spx < 0 || spx >= src->width) continue;
-            int si = (spy * src->width + spx) * 4;
+            unsigned char sr, sg, sb, sal;
+            px_read(src, spy * src->width + spx, sr, sg, sb, sal);  /* origem 8888 ou 4444 */
             int di = (dpy * dst->width + dpx) * 4;
-            float sa = src->pixels[si+3] / 255.0f * alpha;
+            float sa = sal / 255.0f * alpha;
             float da = 1.0f - sa;
-            dst->pixels[di]   = (unsigned char)(src->pixels[si]   * sa + dst->pixels[di]   * da);
-            dst->pixels[di+1] = (unsigned char)(src->pixels[si+1] * sa + dst->pixels[di+1] * da);
-            dst->pixels[di+2] = (unsigned char)(src->pixels[si+2] * sa + dst->pixels[di+2] * da);
-            dst->pixels[di+3] = (unsigned char)(sa * 255.0f       + dst->pixels[di+3]      * da);
+            dst->pixels[di]   = (unsigned char)(sr * sa + dst->pixels[di]   * da);
+            dst->pixels[di+1] = (unsigned char)(sg * sa + dst->pixels[di+1] * da);
+            dst->pixels[di+2] = (unsigned char)(sb * sa + dst->pixels[di+2] * da);
+            dst->pixels[di+3] = (unsigned char)(sa * 255.0f + dst->pixels[di+3] * da);
         }
     }
     dst->tex_dirty = true;
@@ -1029,9 +1626,9 @@ static mrb_value bmp_get_pixel(mrb_state *mrb, mrb_value self) {
     mrb_int x, y; mrb_get_args(mrb, "ii", &x, &y);
     float r = 0, g = 0, bl = 0, a = 0;
     if (b && b->pixels && x >= 0 && y >= 0 && x < b->width && y < b->height) {
-        int idx = (y * b->width + x) * 4;
-        r = b->pixels[idx]; g = b->pixels[idx+1];
-        bl = b->pixels[idx+2]; a = b->pixels[idx+3];
+        unsigned char rr, gg, bb, aa;
+        px_read(b, (int)(y * b->width + x), rr, gg, bb, aa);  /* 8888 ou 4444 */
+        r = rr; g = gg; bl = bb; a = aa;
     }
     RClass *ck = mrb_class_get(mrb, "Color");
     mrb_value argv[4] = {
@@ -1043,6 +1640,7 @@ static mrb_value bmp_get_pixel(mrb_state *mrb, mrb_value self) {
 
 static mrb_value bmp_set_pixel(mrb_state *mrb, mrb_value self) {
     Bitmap3DS *b = GET_BMP(self);
+    if (b && b->pixels_4444) return mrb_nil_value();  /* 4444 e' so' fonte; nao escrever */
     mrb_int x, y; mrb_value co;
     mrb_get_args(mrb, "iio", &x, &y, &co);
     float cr, cg, cb2, ca;
@@ -1061,6 +1659,7 @@ static mrb_value bmp_set_pixel(mrb_state *mrb, mrb_value self) {
 static mrb_value bmp_clear_rect(mrb_state *mrb, mrb_value self) {
     Bitmap3DS *b = GET_BMP(self);
     if (!b) return mrb_nil_value();
+    if (b->pixels_4444) return mrb_nil_value();  /* 4444 e' so' fonte; nao escrever */
     int x = 0, y = 0, w = 0, h = 0;
     mrb_int argc = mrb_get_argc(mrb);
     if (argc == 1) {
@@ -1145,6 +1744,17 @@ MRB_CB bmp_looping_get   (mrb_state *mrb, mrb_value s) { (void)mrb; (void)s; ret
 MRB_CB bmp_looping_set   (mrb_state *mrb, mrb_value s) { (void)mrb; (void)s; return mrb_nil_value();     }
 MRB_CB bmp_snap          (mrb_state *mrb, mrb_value s) { (void)mrb; (void)s; return mrb_nil_value();     }
 
+/* Bitmap._clear_failed_loads : esvazia a cache negativa de loads falhados.
+ * Chamado pelo porte em mudanca de mapa (CustomTilemap#tileset=), p/ um mapa
+ * novo voltar a tentar carregar os seus tilesets em vez de herdar o "falhou"
+ * do mapa anterior. clear_failed_loads() esta' definida junto ao bmp_load_file. */
+static mrb_value bmp_clear_failed_loads(mrb_state *mrb, mrb_value self) {
+    (void)mrb; (void)self;
+    extern void mkxp_bmp_clear_failed_loads();
+    mkxp_bmp_clear_failed_loads();
+    return mrb_nil_value();
+}
+
 void bitmapBindingInit(mrb_state *mrb) {
     RClass *k = mrb_define_class(mrb, "Bitmap", mrb->object_class);
     MRB_SET_INSTANCE_TT(k, MRB_TT_DATA);
@@ -1181,6 +1791,8 @@ void bitmapBindingInit(mrb_state *mrb) {
     mrb_define_method(mrb, k, "font=",              bmp_set_font,          MRB_ARGS_REQ(1));
     mrb_define_class_method(mrb, k, "max_size",     bmp_max_size,          MRB_ARGS_NONE());
     mrb_define_class_method(mrb, k, "_native_exist?", bmp_native_exist,    MRB_ARGS_REQ(1));
+    mrb_define_method(mrb, k, "native_4444?",       bmp_native_4444,       MRB_ARGS_NONE());
+    mrb_define_class_method(mrb, k, "_clear_failed_loads", bmp_clear_failed_loads, MRB_ARGS_NONE());
 
     mrb_define_method(mrb, k, "animated?",          bmp_animated,          MRB_ARGS_NONE());
     mrb_define_method(mrb, k, "mega?",              bmp_mega,              MRB_ARGS_NONE());

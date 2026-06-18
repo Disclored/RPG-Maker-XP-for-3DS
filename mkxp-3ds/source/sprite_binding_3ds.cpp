@@ -19,6 +19,12 @@ extern void display_3ds_blit_ex(DS3Texture* t,
 /* global sprite list for rendering */
 static std::vector<Sprite3DS*> g_sprites;
 
+/* mrb_state principal (definido em binding_3ds.cpp). Necessario para ler o
+ * @src_rect Ruby LIVE no desenho -- o RGSS modifica-o via src_rect.set(...)
+ * in-place, que nao passa pelo setter C++, por isso a cache s->src_w fica
+ * obsoleta. Ler o Rect a cada frame resolve o "rasto" (sprite-sheet inteira). */
+extern mrb_state *g_mkxp_mrb;
+
 /* DUMP-DE-FRAME (botao Y): pedido pendente de despejo. O input poll poe true
  * quando o Y e' premido; o grph_update le, despeja e poe false. volatile
  * porque e' escrita/lida em pontos diferentes do loop. */
@@ -151,6 +157,41 @@ void sprites_draw_all() {
             s->bitmap->tex_dirty = false;
         }
         if (!s->bitmap->tex || !s->bitmap->tex->valid) continue;
+
+        /* ── FIX RASTO (sprite-sheet inteira desenhada) ─────────────────────
+         * O RGSS atualiza o recorte de frame via `self.src_rect.set(x,y,w,h)`,
+         * que modifica o objecto Rect Ruby IN-PLACE. Isso NAO chama o setter
+         * C++ `src_rect=` (spr_set_src_rect), por isso a cache s->src_w/h ficava
+         * no valor inicial (= bitmap inteiro). Resultado: a sprite-sheet de
+         * caminhada (4 frames x 4 direcoes) aparecia TODA -> jogador, NPCs e
+         * Pokemon repetidos/"com rasto".
+         * Solucao: ler o @src_rect LIVE do Ruby aqui (custo ~uns ns por sprite).
+         * So' sobrescreve se o Rect tiver @width/@height validos (>0); senao
+         * mantem o que ja' la' estava. */
+        if (g_mkxp_mrb && !mrb_nil_p(s->rb_self)) {
+            static mrb_sym sy_sr = 0, sy_w = 0, sy_h = 0, sy_x = 0, sy_y = 0;
+            if (sy_sr == 0) {
+                sy_sr = mrb_intern_lit(g_mkxp_mrb, "@src_rect");
+                sy_w  = mrb_intern_lit(g_mkxp_mrb, "@width");
+                sy_h  = mrb_intern_lit(g_mkxp_mrb, "@height");
+                sy_x  = mrb_intern_lit(g_mkxp_mrb, "@x");
+                sy_y  = mrb_intern_lit(g_mkxp_mrb, "@y");
+            }
+            mrb_value ro = mrb_iv_get(g_mkxp_mrb, s->rb_self, sy_sr);
+            if (!mrb_nil_p(ro)) {
+                mrb_value vw = mrb_iv_get(g_mkxp_mrb, ro, sy_w);
+                mrb_value vh = mrb_iv_get(g_mkxp_mrb, ro, sy_h);
+                if (mrb_fixnum_p(vw) && mrb_fixnum_p(vh) &&
+                    mrb_fixnum(vw) > 0 && mrb_fixnum(vh) > 0) {
+                    mrb_value vx = mrb_iv_get(g_mkxp_mrb, ro, sy_x);
+                    mrb_value vy = mrb_iv_get(g_mkxp_mrb, ro, sy_y);
+                    s->src_w = (int)mrb_fixnum(vw);
+                    s->src_h = (int)mrb_fixnum(vh);
+                    s->src_x = mrb_fixnum_p(vx) ? (int)mrb_fixnum(vx) : 0;
+                    s->src_y = mrb_fixnum_p(vy) ? (int)mrb_fixnum(vy) : 0;
+                }
+            }
+        }
 
         int src_w = s->src_w > 0 ? s->src_w : s->bitmap->width;
         int src_h = s->src_h > 0 ? s->src_h : s->bitmap->height;
@@ -378,6 +419,7 @@ static Bitmap3DS *resolve_bitmap(mrb_state *mrb, mrb_value bobj) {
 
 static mrb_value spr_set_bitmap(mrb_state *mrb, mrb_value self) {
     mrb_value bobj; mrb_get_args(mrb, "o", &bobj);
+    extern unsigned long long g_spr_setter_calls; g_spr_setter_calls++;
     mrb_iv_set(mrb, self, mrb_intern_lit(mrb, "@bitmap"), bobj);
     Sprite3DS *s = GET_SPR(self);
     if (s) {
@@ -437,6 +479,7 @@ static bool spr_extract_rect(mrb_state *mrb, mrb_value ro,
 
 static mrb_value spr_set_src_rect(mrb_state *mrb, mrb_value self) {
     mrb_value ro; mrb_get_args(mrb, "o", &ro);
+    extern unsigned long long g_spr_setter_calls; g_spr_setter_calls++;
     mrb_iv_set(mrb, self, mrb_intern_lit(mrb, "@src_rect"), ro);
     Sprite3DS *s = GET_SPR(self);
     if (s) {
@@ -448,12 +491,19 @@ static mrb_value spr_set_src_rect(mrb_state *mrb, mrb_value self) {
     return ro;
 }
 
+/* DEBUG LOG CERTEIRO (fix CEGO D): contador CUMULATIVO de chamadas aos setters
+ * C++ de Sprite. Exposto ao Ruby via Kernel#__mkxp_setters (binding_3ds.cpp).
+ * Diz-nos QUANTOS dispatches mruby->C++ por frame os sprites fazem -> se um
+ * batch-setter (uma chamada que poe x/y/z/bitmap/src de uma vez) valeria a pena.
+ * Incremento trivial (~1ns); sempre ligado, so' se LOGA periodicamente. */
+unsigned long long g_spr_setter_calls = 0;
+
 /* int properties */
 #define INT_PROP(name, field) \
 static mrb_value spr_get_##name(mrb_state *mrb, mrb_value s) { \
     (void)mrb; Sprite3DS *p = GET_SPR(s); return mrb_fixnum_value(p ? p->field : 0); } \
 static mrb_value spr_set_##name(mrb_state *mrb, mrb_value s) { \
-    mrb_int v; mrb_get_args(mrb, "i", &v); \
+    mrb_int v; mrb_get_args(mrb, "i", &v); g_spr_setter_calls++; \
     Sprite3DS *p = GET_SPR(s); if (p) p->field = (int)v; \
     return mrb_fixnum_value(v); }
 
@@ -465,7 +515,7 @@ INT_PROP(z, z) INT_PROP(opacity, opacity) INT_PROP(blend_type, blend_type)
 static mrb_value spr_get_##name(mrb_state *mrb, mrb_value s) { \
     Sprite3DS *p = GET_SPR(s); return mrb_float_value(mrb, p ? p->field : 0.0f); } \
 static mrb_value spr_set_##name(mrb_state *mrb, mrb_value s) { \
-    mrb_float v; mrb_get_args(mrb, "f", &v); \
+    mrb_float v; mrb_get_args(mrb, "f", &v); g_spr_setter_calls++; \
     Sprite3DS *p = GET_SPR(s); if (p) p->field = (float)v; \
     return mrb_float_value(mrb, v); }
 
@@ -476,7 +526,7 @@ FLOAT_PROP(zoom_x, zoom_x) FLOAT_PROP(zoom_y, zoom_y) FLOAT_PROP(angle, angle)
 static mrb_value spr_get_##name(mrb_state *mrb, mrb_value s) { \
     (void)mrb; Sprite3DS *p = GET_SPR(s); return mrb_bool_value(p && p->field); } \
 static mrb_value spr_set_##name(mrb_state *mrb, mrb_value s) { \
-    mrb_bool v; mrb_get_args(mrb, "b", &v); \
+    mrb_bool v; mrb_get_args(mrb, "b", &v); g_spr_setter_calls++; \
     Sprite3DS *p = GET_SPR(s); if (p) p->field = (bool)v; \
     return mrb_bool_value(v); }
 
@@ -514,6 +564,7 @@ static mrb_value spr_get_color(mrb_state *mrb, mrb_value s) {
     return v; }
 static mrb_value spr_set_color(mrb_state *mrb, mrb_value s) {
     mrb_value v; mrb_get_args(mrb, "o", &v);
+    extern unsigned long long g_spr_setter_calls; g_spr_setter_calls++;
     mrb_iv_set(mrb, s, mrb_intern_lit(mrb, "@color"), v); return v; }
 static mrb_value spr_get_tone(mrb_state *mrb, mrb_value s) {
     mrb_value v = mrb_iv_get(mrb, s, mrb_intern_lit(mrb, "@tone"));
@@ -529,6 +580,7 @@ static mrb_value spr_get_tone(mrb_state *mrb, mrb_value s) {
     return v; }
 static mrb_value spr_set_tone(mrb_state *mrb, mrb_value s) {
     mrb_value v; mrb_get_args(mrb, "o", &v);
+    extern unsigned long long g_spr_setter_calls; g_spr_setter_calls++;
     mrb_iv_set(mrb, s, mrb_intern_lit(mrb, "@tone"), v); return v; }
 
 /* P3: ler o z de um objecto Viewport Ruby de forma segura (sem rebentar se for
@@ -627,6 +679,13 @@ void spriteBindingInit(mrb_state *mrb) {
     IVAR_PROP("wave_speed")
     IVAR_PROP("wave_phase")
     #undef IVAR_PROP
+
+    // ── Acelerador OPCIONAL do Essentials (modulo isolado) ──────────────────
+    // Regista __gc_native_screen_x/y/z. So' tem efeito quando o Ruby liga a flag
+    // $__mkxp_native_spritechar (ver compat_stubs.h). Registar aqui e' seguro:
+    // corre no arranque, muito antes dos scripts do jogo definirem Game_Character.
+    extern void essentialsAccelInit(mrb_state *mrb);
+    essentialsAccelInit(mrb);
 }
 
 /* FIX3: Re-bind Sprite#initialize para spr_init C++ após os scripts Ruby terem corrido.

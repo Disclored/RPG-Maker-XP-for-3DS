@@ -3,7 +3,7 @@
  * log mesmo que o Ruby nao corra -> prova QUAL compat_stubs.h o compilador usou.
  * Bumpa a cada alteracao. Se o log mostrar 'DESCONHECIDO' ou uma tag antiga, o
  * binding_3ds.cpp foi compilado contra OUTRO compat_stubs.h (pasta errada). */
-#define MKXP_COMPAT_STUBS_BUILD_TAG "2026-06-16-B"
+#define MKXP_COMPAT_STUBS_BUILD_TAG "2026-06-16-F"
 static const char *COMPAT_STUBS_RUBY = R"RUBY(
 $VERBOSE = nil
 $_INTL_defined = true
@@ -13,7 +13,7 @@ $_INTL_defined = true
 # nao recompilas o binding_3ds.cpp (que e' o unico .cpp que embebe esta string),
 # o Makefile mantem a versao ANTIGA -> e este carimbo prova-o no log. Bumpa a
 # string a cada alteracao; o log passa a isolar "build velho" sem adivinhar.
-$MKXP_COMPAT_STUBS_VERSION = "2026-06-16-B (install deferido p/ bloco MFD)"
+$MKXP_COMPAT_STUBS_VERSION = "2026-06-16-F (libpng p/ intro pictures + profiler dos 232ms: game_map/interpreter/game_screen)"
 (dbg "[COMPAT_STUBS] versao #{$MKXP_COMPAT_STUBS_VERSION} carregada" rescue nil)
 
 # -- Settings ------------------------------------------------------------------
@@ -358,7 +358,16 @@ begin
 rescue; end
 begin
   class Bitmap
-    def mega?; (@height||0) > 1024; end
+    # mega? = true faz o CustomTilemap do jogo correr TileWrap.wrapTileset, que
+    # COPIA o tileset gigante (256xN) para um bitmap re-empacotado -> +RAM, +blts,
+    # e em 4444 (Gen4 Interior/Outside) isso rebenta a memoria -> magenta. Para
+    # tilesets 4444 NATIVOS devolvemos false: o jogo usa o tileset ORIGINAL direto
+    # como fonte de blt (o C++ recorta cada tile 32x32 em qualquer altura, incl.
+    # y>1024, sem problema). Para os restantes mantem-se height>1024 (wrap barato).
+    def mega?
+      return false if (respond_to?(:native_4444?) && native_4444?)
+      (@height || 0) > 1024
+    end
   end
 rescue; end
 
@@ -2241,6 +2250,81 @@ def __sm_tick_debug__
   end
 end
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIX RAIZ CEDO: defined? de METODO + method_missing (corrige Waterfall/plugins)
+# -------------------------------------------------------------------------------
+# CAUSA (PROVADO em mruby 3.2 host): `defined?(X)` e' compilado como CHAMADA de
+# metodo com X avaliado ANTES. Para `defined?(Constante)` o [DEFINED-FIX] do bloco
+# MFD resolve via const_missing->MKXP_UNDEF. MAS para `defined?(__metodo__)` (um
+# METODO indefinido) NAO ha' method_missing global -> mruby LANCA NoMethodError na
+# propria linha do defined?. Os plugins (Following Pokemon EX) usam exatamente:
+#   alias __followingpkmn__X Y unless defined?(__followingpkmn__X)
+# => a linha REBENTA, o alias nao nasce, o ficheiro do plugin ABORTA, e o golpe de
+# campo (Waterfall: pbHiddenMoveAnimation/pbEndSurf) chama um alias inexistente ->
+# mensagem "used 0!" com nome de especie/golpe vazios. O [DEFINED-FIX] do bloco MFD
+# corre a t=8.7s, DEPOIS dos plugins (t=6-7s) -> TARDE DEMAIS. Por isso instalamos
+# AQUI (t=0.5s, ANTES dos scripts e plugins), no FIM do compat_stubs (depois das
+# definicoes acima, para nao mudar como ELAS carregam).
+#
+# SEGURANCA: o method_missing global so' devolve MKXP_UNDEF para nomes __*
+# (convencao de alias-backup). Metodos normais indefinidos AINDA lancam
+# NoMethodError -> bugs reais e duck-typing NAO sao mascarados. Provado no host:
+#   pbHiddenMoveAnimation('x') -> "FOLLOW_ANIM(BASE_ANIM)" (cadeia intacta)
+#   pbEndSurf() -> "FOLLOW_SURF(BASE_SURF)"
+#   metodo_normal_indefinido() -> ainda NoMethodError
+#   defined?(ConstInexistente) -> nil ; defined?(String) -> "expression"
+# Desligar (se regredir): por $MKXP_DEFINED_FIX_EARLY = false e recompilar.
+# Log via MKXPDebug.log (registado em C antes desta carga -> funciona a t=0.5s).
+# ═══════════════════════════════════════════════════════════════════════════════
+$MKXP_DEFINED_FIX_EARLY = true if $MKXP_DEFINED_FIX_EARLY.nil?
+if $MKXP_DEFINED_FIX_EARLY
+  begin
+    unless Object.const_defined?(:MKXP_UNDEF)
+      __mkxp_u = Object.new
+      class << __mkxp_u
+        def inspect; "#<undef>"; end
+        def to_s; ""; end
+        def to_str; ""; end
+        def nil?; true; end
+        def empty?; true; end
+        def method_missing(m, *a, &b); self; end
+        def respond_to_missing?(m, p = false); true; end
+        def coerce(o); [o.is_a?(Numeric) ? o : 0, 0]; end
+        def ==(o); o.nil? || o.equal?(self); end
+        def !; true; end
+      end
+      Object.const_set(:MKXP_UNDEF, __mkxp_u)
+    end
+
+    # Kernel#defined?(v): recebe o valor JA' avaliado. MKXP_UNDEF -> nil (nao
+    # definido); senao -> "expression" (definido). Da' a resposta certa a
+    # defined?(Constante) E a defined?(__metodo__) (via method_missing abaixo).
+    module ::Kernel
+      def defined?(*args)
+        return nil if args.empty?
+        args[0].equal?(MKXP_UNDEF) ? nil : "expression"
+      end
+    end
+
+    # method_missing GLOBAL apenas para nomes __* (alias-backups). Resto -> super
+    # (NoMethodError normal, nao mascara bugs). const_missing -> MKXP_UNDEF (como
+    # o [DEFINED-FIX] do MFD, mas a comecar a t=0.5s em vez de t=8.7s).
+    class ::Object
+      def method_missing(m, *a, &b)
+        nm = m.to_s
+        return MKXP_UNDEF if nm.start_with?("__")
+        super
+      end
+      def self.const_missing(name)
+        MKXP_UNDEF
+      end
+    end
+    (MKXPDebug.log("[DEFINED-FIX-EARLY] instalado t=0.5s (defined?/method_missing __*/const_missing) -- corrige Waterfall/plugins") rescue nil)
+  rescue => __mkxp_dfe
+    (MKXPDebug.log("[DEFINED-FIX-EARLY] FALHOU: #{__mkxp_dfe.class}: #{__mkxp_dfe.message}") rescue nil)
+  end
+end
+
 # ─── INSTALL DEFERIDO (RUBYPROF + tint + J3) ──────────────────────────────────
 # IMPORTANTE: o COMPAT_STUBS_RUBY corre a ~t=0.5s, ANTES dos scripts do jogo.
 # Nessa altura NAO existem Spriteset_Map / Sprite_Character / pbDayNightTint, nem
@@ -2278,6 +2362,16 @@ if __rp_has_ms
   $__prof_n = 0
   $__prof_calls = Hash.new(0)
 
+  # ─── SUB-PROFILER LEAVES: DESLIGADAS ────────────────────────────────────────
+  # As folhas (sc_tint/sc_refl/sc_animupd/sc_bmpnew/sc_rpgsuper) JA' CUMPRIRAM:
+  # provaram que o custo do sprite e' o sc_inline (atribuicoes self.x=/bitmap=...)
+  # e que super/tint/reflexo/animbitmap sao desprezaveis (<0.5ms). Mante-las
+  # custava ~8 wrappers Ruby + leituras __mkxp_ms por sprite/frame -- overhead que
+  # eu proprio introduzia. Ficam DESLIGADAS por defeito (codigo preservado, so'
+  # nao instala). O topo (sprite_char + spriteset_map) FICA, para monitorizacao.
+  # Por em true se algum dia quiseres re-repartir o custo do sprite.
+  $__mkxp_subprof_leaves = false
+
   def __prof_acc(key, t0)
     $__prof[key] += (__mkxp_ms - t0)
     $__prof_calls[key] += 1
@@ -2287,15 +2381,40 @@ if __rp_has_ms
     $__prof_n += 1
     return unless ($__prof_n % 120) == 0   # ~a cada 120 frames
     line = "[RUBYPROF] f=#{$__prof_n}"
+    # TOTAL_medido = so' chaves de TOPO (sprite_char + spriteset_map). As chaves
+    # sc_* sao SUB-partes de sprite_char (senao duplicavam o total).
     total = 0.0
-    $__prof.each { |k, v| total += v }
+    # TOTAL = partes DISJUNTAS de topo: spriteset_map (ja' inclui sprite_char) +
+    # game_map + interpreter + game_screen. Excluimos sc_* (folhas) E sprite_char
+    # (aninhado no spriteset_map) p/ nao duplicar. Compara com PROFILE|frame.
+    $__prof.each { |k, v| total += v unless k.to_s.start_with?("sc_") || k == :sprite_char }
     # ordenar por tempo desc
     $__prof.sort_by { |k, v| -v }.each do |k, v|
       avg = v / 120.0
       calls = $__prof_calls[k] / 120.0
       line += sprintf(" | %s=%.1fms(x%.0f)", k, avg, calls)
     end
+    # RESIDUAL: super (RPG::Sprite#update + ::Sprite#update C++) = sprite_char -
+    # (sc_tint+sc_refl+sc_animupd). sc_bmpnew NAO se subtrai (acontece DENTRO do
+    # bloco de troca, que ja' faz parte do super-path inline; conta-se a' parte).
+    sc_total = ($__prof[:sc_tint] + $__prof[:sc_refl] + $__prof[:sc_animupd]) rescue 0.0
+    # sc_inline = atribuicoes self.x=/bitmap=/src_rect= (= sprite_char - super - leaves)
+    sc_inline = ($__prof[:sprite_char] - $__prof[:sc_rpgsuper] - sc_total) rescue 0.0
+    line += sprintf(" | sc_inline~=%.1fms/frame", sc_inline / 120.0) if $__prof[:sprite_char] > 0
     line += sprintf(" | TOTAL_medido=%.1fms/frame", total / 120.0)
+    # ─── DEBUG CERTEIRO: churn (objs/frame) + dispatches de setter/frame ────────
+    # objs/frame MAX expoe o PICO de alocacao (o +125K do dialogo): se o MAX for
+    # enorme num frame isolado e a media baixa, e' carga pontual (mapa); se a media
+    # for alta, e' custo SUSTENTADO por-frame (render da mensagem). setters/frame
+    # decide o batch-setter (fix D): ~90 = vale a pena; poucas = custo no corpo.
+    if ($__objs_fn || 0) > 0
+      line += sprintf(" | objs/frame avg=%.0f MAX=%.0f", ($__objs_fsum / $__objs_fn), ($__objs_fmax || 0))
+      $__objs_fmax = 0.0; $__objs_fsum = 0.0; $__objs_fn = 0
+    end
+    if $__set_prev0
+      line += sprintf(" | setters/frame=%.0f", (((__mkxp_setters rescue 0.0) - $__set_prev0) / 120.0))
+    end
+    $__set_prev0 = (__mkxp_setters rescue 0.0)
     (dbg line) rescue (puts line)
     $__prof = Hash.new(0.0)
     $__prof_calls = Hash.new(0)
@@ -2309,11 +2428,205 @@ if __rp_has_ms
       alias __update_prof_orig update
       def update
         t0 = __mkxp_ms
+        $__in_sc_update = true       # marca: o super que correr agora e' de char
         __update_prof_orig
+        $__in_sc_update = false
         __prof_acc(:sprite_char, t0)
       end
     end
     (dbg "[RUBYPROF] Sprite_Character#update instrumentado") rescue nil
+  end
+
+  # ─── SUB-PROFILER: REPARTIR o custo de Sprite_Character#update ───────────────
+  # O sprite_char custa ~3.7ms/sprite mas NAO sabemos QUAL parte. Em vez de
+  # adivinhar (ja' descartamos getTone -- ja' tem cache interna), MEDIMOS as
+  # pecas folha que o update chama, todas no MESMO $__prof (chaves sc_*):
+  #   sc_tint    = pbDayNightTint(self)        (tom dia/noite por sprite)
+  #   sc_refl    = Sprite_Reflection#update    (reflexo na agua -- so' jogador)
+  #   sc_animupd = AnimatedBitmap#update       (@charbitmap.update -- frames anim)
+  #   sc_bmpnew  = AnimatedBitmap.new          (RECARGA de bitmap; conta chamadas)
+  # O RESIDUAL (super = RPG::Sprite#update + ::Sprite#update C++) = sprite_char -
+  # (sc_tint+sc_refl+sc_animupd) e' calculado no dump. Wrapping por reabertura
+  # EXPLICITA de classe (provado robusto em mruby dentro da lambda). Risco baixo:
+  # sao metodos-folha + begin/rescue; nao reescrevemos o update quente.
+  begin
+    # pbDayNightTint (metodo de topo/Object) -- so' instrumenta, nao altera logica
+    if $__mkxp_subprof_leaves && (Object.method_defined?(:pbDayNightTint) || Object.private_method_defined?(:pbDayNightTint) rescue false)
+      unless (Object.method_defined?(:__pbdnt_prof_orig) || Object.private_method_defined?(:__pbdnt_prof_orig) rescue false)
+        class Object
+          alias __pbdnt_prof_orig pbDayNightTint
+          def pbDayNightTint(o)
+            __pbdnt_t0 = __mkxp_ms
+            __pbdnt_prof_orig(o)
+            __prof_acc(:sc_tint, __pbdnt_t0)
+          end
+        end
+        (dbg "[SUBPROF] pbDayNightTint instrumentado (sc_tint)") rescue nil
+      end
+    end
+  rescue => __sp_e
+    (dbg "[SUBPROF] pbDayNightTint NAO instrumentado: #{__sp_e.class}") rescue nil
+  end
+
+  if $__mkxp_subprof_leaves && Object.const_defined?(:Sprite_Reflection) &&
+     Sprite_Reflection.method_defined?(:update) &&
+     !Sprite_Reflection.method_defined?(:__refl_prof_orig)
+    class Sprite_Reflection
+      alias __refl_prof_orig update
+      def update(*a)
+        __refl_t0 = __mkxp_ms
+        __refl_prof_orig(*a)
+        __prof_acc(:sc_refl, __refl_t0)
+      end
+    end
+    (dbg "[SUBPROF] Sprite_Reflection#update instrumentado (sc_refl)") rescue nil
+  end
+
+  if $__mkxp_subprof_leaves && Object.const_defined?(:AnimatedBitmap) &&
+     AnimatedBitmap.method_defined?(:update) &&
+     !AnimatedBitmap.method_defined?(:__aupd_prof_orig)
+    class AnimatedBitmap
+      alias __aupd_prof_orig update
+      def update(*a)
+        __aupd_t0 = __mkxp_ms
+        __aupd_r = __aupd_prof_orig(*a)
+        __prof_acc(:sc_animupd, __aupd_t0)
+        __aupd_r
+      end
+    end
+    (dbg "[SUBPROF] AnimatedBitmap#update instrumentado (sc_animupd)") rescue nil
+  end
+
+  # AnimatedBitmap.new -- detecta RECARGAS de bitmap por frame (cada uma e' cara:
+  # ler PNG do disco + decode). Se sc_bmpnew tiver muitas chamadas/frame, e' o
+  # bloco de troca de bitmap (char_name/hue/tile_id a mudar) que esta' a custar.
+  begin
+    if $__mkxp_subprof_leaves && Object.const_defined?(:AnimatedBitmap) &&
+       !(class << AnimatedBitmap; method_defined?(:__anew_prof_orig); end)
+      class << AnimatedBitmap
+        alias __anew_prof_orig new
+        def new(*a, &b)
+          __anew_t0 = __mkxp_ms
+          __anew_r = __anew_prof_orig(*a, &b)
+          (($__prof[:sc_bmpnew] += (__mkxp_ms - __anew_t0)); ($__prof_calls[:sc_bmpnew] += 1)) rescue nil
+          __anew_r
+        end
+      end
+      (dbg "[SUBPROF] AnimatedBitmap.new instrumentado (sc_bmpnew)") rescue nil
+    end
+  rescue => __sp_e2
+    (dbg "[SUBPROF] AnimatedBitmap.new NAO instrumentado: #{__sp_e2.class}") rescue nil
+  end
+
+  # SPLIT FINAL do sc_super: o Sprite#update C++ e' no-op, logo o "super" e' o
+  # RPG::Sprite#update (Ruby) + as atribuicoes inline. Aqui medimos o RPG::Sprite#
+  # update ISOLADO (so' quando chamado de dentro de Sprite_Character#update, via
+  # flag $__in_sc_update -> nao conta battlers/pictures). No dump:
+  #   sc_rpgsuper = RPG::Sprite#update (durations/animations/SpriteAnimation.clear)
+  #   sc_inline   = sprite_char - sc_rpgsuper - (tint+refl+animupd) = as ~15
+  #                 atribuicoes self.x=/bitmap=/src_rect= (dispatch mruby no ARM11)
+  # Assim sabemos se otimizar o super (dificil, e' base) ou as atribuicoes (possivel
+  # via setter C++ em lote).
+  begin
+    if $__mkxp_subprof_leaves && Object.const_defined?(:RPG) && RPG.const_defined?(:Sprite) &&
+       RPG::Sprite.method_defined?(:update) &&
+       !RPG::Sprite.method_defined?(:__rpgupd_prof_orig)
+      module RPG
+        class Sprite
+          alias __rpgupd_prof_orig update
+          def update(*a)
+            if $__in_sc_update
+              __rpg_t0 = __mkxp_ms
+              __rpgupd_prof_orig(*a)
+              __prof_acc(:sc_rpgsuper, __rpg_t0)
+            else
+              __rpgupd_prof_orig(*a)
+            end
+          end
+        end
+      end
+      (dbg "[SUBPROF] RPG::Sprite#update instrumentado (sc_rpgsuper)") rescue nil
+    end
+  rescue => __sp_e3
+    (dbg "[SUBPROF] RPG::Sprite#update NAO instrumentado: #{__sp_e3.class}") rescue nil
+  end
+
+  # ─── ACELERADOR OPCIONAL (Essentials): screen_x/y/z NATIVOS ─────────────────
+  # Modulo opt-in e ISOLADO (essentials_accel_3ds.cpp). Substitui os 3 getters de
+  # posicao quentes do Game_Character por C++ (validado no host: IDENTICO ao Ruby
+  # ao pixel, inclui floor-inteiro vs round-float). E' especifico do Essentials,
+  # por isso fica atras da flag $__mkxp_native_spritechar. MUDA AQUI para ligar:
+  #   false   -> Ruby original. Nucleo 100% intacto. (DEFEITO)
+  #   :verify -> corre NATIVO e Ruby, compara, regista [ACCEL|DIFF] e conta
+  #              $__accel_diffs; mas USA o resultado Ruby (ZERO risco). Serve para
+  #              PROVAR no 3DS real que o nativo bate certo antes de confiar nele.
+  #   true    -> usa o nativo. Casos raros/complexos (salto, tile-sprites,
+  #              always_on_top) o C devolve nil e cai no Ruby automaticamente.
+  # As funcoes C sao registadas por essentialsAccelInit (de spriteBindingInit). Se
+  # o modulo nao estiver compilado, o guard falha e fica tudo em Ruby (nada parte).
+  # ⇩⇩⇩ PARA LIGAR O ACELERADOR, MUDA SO' ESTA LINHA: false | :verify | true ⇩⇩⇩
+  $__mkxp_native_spritechar = true
+  begin
+    if Object.const_defined?(:Game_Character) &&
+       Game_Character.method_defined?(:screen_x) &&
+       Game_Character.method_defined?(:__gc_native_screen_x) &&
+       !Game_Character.method_defined?(:__scrx_accel_orig)
+      class Game_Character
+        alias __scrx_accel_orig screen_x
+        alias __scry_accel_orig screen_y
+        alias __scrz_accel_orig screen_z
+        def screen_x
+          m = $__mkxp_native_spritechar
+          return __scrx_accel_orig unless m
+          nat = __gc_native_screen_x(self)
+          return __scrx_accel_orig if nat.nil?
+          if m == :verify
+            rb = __scrx_accel_orig
+            if rb != nat
+              $__accel_diffs = ($__accel_diffs || 0) + 1
+              (dbg "[ACCEL|DIFF] screen_x rb=#{rb} nat=#{nat} cls=#{self.class} tid=#{@tile_id}") rescue nil
+            end
+            return rb
+          end
+          nat
+        end
+        def screen_y
+          m = $__mkxp_native_spritechar
+          return __scry_accel_orig unless m
+          nat = __gc_native_screen_y(self)
+          return __scry_accel_orig if nat.nil?
+          if m == :verify
+            rb = __scry_accel_orig
+            if rb != nat
+              $__accel_diffs = ($__accel_diffs || 0) + 1
+              (dbg "[ACCEL|DIFF] screen_y rb=#{rb} nat=#{nat} cls=#{self.class}") rescue nil
+            end
+            return rb
+          end
+          nat
+        end
+        def screen_z(height = 0)
+          m = $__mkxp_native_spritechar
+          return __scrz_accel_orig(height) unless m
+          nat = __gc_native_screen_z(self, height)
+          return __scrz_accel_orig(height) if nat.nil?
+          if m == :verify
+            rb = __scrz_accel_orig(height)
+            if rb != nat
+              $__accel_diffs = ($__accel_diffs || 0) + 1
+              (dbg "[ACCEL|DIFF] screen_z rb=#{rb} nat=#{nat} cls=#{self.class} tid=#{@tile_id}") rescue nil
+            end
+            return rb
+          end
+          nat
+        end
+      end
+      (dbg "[ACCEL] screen_x/y/z NATIVO instalado (modo=#{$__mkxp_native_spritechar.inspect})") rescue nil
+    else
+      (dbg "[ACCEL] nativo NAO instalado (Game_Character ou __gc_native_screen_x em falta -- fica em Ruby)") rescue nil
+    end
+  rescue => __acc_e
+    (dbg "[ACCEL] nativo NAO instalado: #{__acc_e.class}: #{__acc_e.message rescue ''}") rescue nil
   end
 
   # Instrumentar Spriteset_Map#update (o contentor: sprites + tilemap + panorama)
@@ -2323,6 +2636,17 @@ if __rp_has_ms
     class Spriteset_Map
       alias __update_prof_orig update
       def update
+        # DEBUG CERTEIRO: objs alocados no FRAME INTEIRO anterior = delta de
+        # __mkxp_objs entre dois updates de spriteset (corre 1x/frame). Acumula
+        # avg e MAX p/ o dump distinguir pico pontual de custo sustentado.
+        __o = (__mkxp_objs rescue nil)
+        if __o && $__objs_lastf
+          __fd = __o - $__objs_lastf
+          $__objs_fmax = __fd if __fd > ($__objs_fmax || 0)
+          $__objs_fsum = ($__objs_fsum || 0.0) + __fd
+          $__objs_fn   = ($__objs_fn || 0) + 1
+        end
+        $__objs_lastf = __o if __o
         t0 = __mkxp_ms
         __update_prof_orig
         __prof_acc(:spriteset_map, t0)
@@ -2330,6 +2654,74 @@ if __rp_has_ms
       end
     end
     (dbg "[RUBYPROF] Spriteset_Map#update instrumentado") rescue nil
+  end
+
+  # DEBUG CERTEIRO: atribuir a carga do MAPA. Spriteset_Map.new cria todos os
+  # sprites de tiles/eventos/panorama de uma vez -- prime suspeito do pico de
+  # +125K objs quando entras num mapa. Loga quantos objs alocou (1x/carga).
+  if Object.const_defined?(:Spriteset_Map) &&
+     Spriteset_Map.method_defined?(:initialize) &&
+     !Spriteset_Map.method_defined?(:__init_churn_orig)
+    class Spriteset_Map
+      alias __init_churn_orig initialize
+      def initialize(*a, &b)
+        __o0 = (__mkxp_objs rescue nil)
+        __r = __init_churn_orig(*a, &b)
+        (dbg sprintf("[CHURN] Spriteset_Map.new alocou %.0f objs (carga de mapa)", ((__mkxp_objs rescue __o0) - __o0))) rescue nil if __o0
+        __r
+      end
+    end
+    (dbg "[CHURN] Spriteset_Map#initialize instrumentado") rescue nil
+  end
+
+  # ─── INSTRUMENTAR OS ~232ms DE "OUTRA" LOGICA (o gargalo real da catedral) ────
+  # O frame de 287ms tem so' ~55ms em sprites/tilemap; os outros ~232ms sao a
+  # logica de jogo chamada por Scene_Map#update: o loop de eventos do mapa
+  # (Game_Map#update), o interpretador do cutscene (Interpreter#update) e os
+  # efeitos de ecra'/pictures (Game_Screen#update). Medimo-los para saber QUAL
+  # domina -- e' isto que decide se o ganho vem de saltar updates de eventos
+  # dormentes, otimizar o interpretador, ou as pictures. Top-level (nao aninhados
+  # no spriteset), por isso somam-se ao total.
+  if Object.const_defined?(:Game_Map) && Game_Map.method_defined?(:update) &&
+     !Game_Map.method_defined?(:__gm_prof_orig)
+    class Game_Map
+      alias __gm_prof_orig update
+      def update(*a)
+        __gm_t0 = __mkxp_ms
+        __gm_r = __gm_prof_orig(*a)
+        __prof_acc(:game_map, __gm_t0)
+        __gm_r
+      end
+    end
+    (dbg "[RUBYPROF] Game_Map#update instrumentado") rescue nil
+  end
+
+  if Object.const_defined?(:Interpreter) && Interpreter.method_defined?(:update) &&
+     !Interpreter.method_defined?(:__interp_prof_orig)
+    class Interpreter
+      alias __interp_prof_orig update
+      def update(*a)
+        __ip_t0 = __mkxp_ms
+        __ip_r = __interp_prof_orig(*a)
+        __prof_acc(:interpreter, __ip_t0)
+        __ip_r
+      end
+    end
+    (dbg "[RUBYPROF] Interpreter#update instrumentado") rescue nil
+  end
+
+  if Object.const_defined?(:Game_Screen) && Game_Screen.method_defined?(:update) &&
+     !Game_Screen.method_defined?(:__gs_prof_orig)
+    class Game_Screen
+      alias __gs_prof_orig update
+      def update(*a)
+        __gs_t0 = __mkxp_ms
+        __gs_r = __gs_prof_orig(*a)
+        __prof_acc(:game_screen, __gs_t0)
+        __gs_r
+      end
+    end
+    (dbg "[RUBYPROF] Game_Screen#update instrumentado") rescue nil
   end
 else
   (dbg "[RUBYPROF] SKIP: __mkxp_ms AUSENTE -> binding_3ds.cpp NAO recompilado com o metodo nativo. Forcar rebuild: 'touch source/binding_3ds.cpp && make' (ou apagar binding_3ds.o). Sem isto o profiler nao mede nada.") rescue (puts "[RUBYPROF] SKIP __mkxp_ms ausente")

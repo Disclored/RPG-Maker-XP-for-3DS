@@ -26,6 +26,16 @@ struct Bitmap3DS {
                                * 2.2 fps). Limpo automaticamente quando tex_dirty
                                * volta a true (pixels mudaram -> vale a pena tentar
                                * outra vez). */
+    bool           pixels_linear; /* true = b->pixels veio de linearAlloc (fallback
+                               * quando o heap de malloc esta' esgotado pela pool do
+                               * mruby) -> bitmap_free tem de usar linearFree, nao
+                               * free. Default false (malloc/stb/calloc). */
+    bool           pixels_4444; /* true = b->pixels esta' em RGBA4444 (2 bytes/px,
+                               * um u16 por pixel: RRRRGGGGBBBBAAAA) em vez de RGBA8888
+                               * (4 bytes/px). USADO so' p/ TILESETS GIGANTES (o 8888
+                               * de 30MB nao cabe; 4444 = 15MB cabe). Quem LE b->pixels
+                               * (blt/stretch_blt/get_pixel) tem de expandir via
+                               * px_read(). NUNCA e' destino de escrita nem textura. */
 };
 
 extern const mrb_data_type Bitmap3DSType;

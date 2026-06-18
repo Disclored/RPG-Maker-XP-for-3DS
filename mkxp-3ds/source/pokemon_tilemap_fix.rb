@@ -79,6 +79,12 @@ module VWrap
   # Copia pixels do bitmap repartido para o destino,
   # traduzindo coordenadas srcrect do espaço original para o repartido.
   def self.blitVWrappedPixels(dest_x, dest_y, dest, src, srcrect)
+    # Origem 4444 (tileset gigante não-embrulhado): coordenadas originais válidas
+    # -> blt direto (o motor lê 4444 na origem). Sem tradução de colunas.
+    if src.respond_to?(:native_4444?) && src.native_4444?
+      dest.blt(dest_x, dest_y, src, srcrect)
+      return
+    end
     # Se o rect cabe inteiramente na primeira coluna, blit directo
     if srcrect.y + srcrect.height <= TILESET_HEIGHT
       dest.blt(dest_x, dest_y, src, srcrect)
@@ -103,6 +109,21 @@ if $MKXP == true && defined?(CustomTilemap) == "constant"
 
     # Override tileset= para repartir se necessário
     def tileset=(value)
+      # Mudança de mapa: limpa a cache negativa de loads falhados no motor, para
+      # este mapa voltar a TENTAR carregar os seus tilesets de raiz (o mapa
+      # anterior pode tê-los marcado como "falhou" por falta de memória que
+      # entretanto libertou). Sem isto, um tileset que falhou uma vez ficaria
+      # magenta para sempre. rescue nil: motor sem o método (build antigo).
+      Bitmap._clear_failed_loads rescue nil
+      # Tileset gigante em RGBA4444 (decodificado assim pelo motor 3DS porque o
+      # 8888 de 30MB não cabe): usa-se DIRETO, sem embrulho. As coordenadas
+      # originais (getRegularTile) já são válidas no bitmap 256xN não-embrulhado,
+      # e o blt nativo lê 4444 na origem. Poupa o Bitmap.new de ~31MB do embrulho.
+      if value && (value.respond_to?(:native_4444?) && value.native_4444?)
+        @tileset = value
+        @tilesetchanged = true
+        return value
+      end
       if value && value.width == VWrap::TILESET_WIDTH &&
          value.height > VWrap::TILESET_HEIGHT
         wrapped = VWrap.makeVWrappedTileset(value)
