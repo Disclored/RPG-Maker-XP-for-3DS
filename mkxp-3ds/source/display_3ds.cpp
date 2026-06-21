@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <vector>
 #include <algorithm>
+#include <malloc.h>   /* mallinfo: reportar memoria livre no heap malloc */
 extern FILE *g_dbglog;
 /* OTIMIZACAO 3DS: flush periodico (cada 64 escritas) em vez de a cada printf,
  * para evitar I/O sincrono ao cartao SD por frame. Contador global partilhado. */
@@ -134,6 +135,125 @@ static bool evict_idle_textures(DS3Texture* self, unsigned want_bytes, int frame
                freed, freed_bytes/1024.0, want_bytes/1024.0);
     }
     return freed > 0;
+}
+
+/* ── [MEM] Maior bloco CONTIGUO de heap linear + censo de memoria ────────────
+ * O linearSpaceFree() diz o TOTAL livre, mas o decode de um tileset precisa de
+ * um bloco CONTIGUO. Com fragmentacao pode haver 14MB livres e mesmo assim um
+ * alloc de 8MB falhar. Esta funcao mede o maior bloco real por busca binaria
+ * (linearAlloc/linearFree de tamanhos decrescentes; ~8 tentativas, cada uma
+ * libertada de imediato). So' e' chamada em momentos pontuais (transferencia de
+ * mapa / decode de tileset), nunca por-frame. */
+unsigned linear_biggest_block(void) {
+    unsigned hi = (unsigned)linearSpaceFree();
+    if (hi < 4u*1024u) return 0;
+    unsigned lo = 0, best = 0;
+    const unsigned GRAN = 256u*1024u;          /* precisao 256KB */
+    while (hi - lo > GRAN) {
+        unsigned mid = lo + (hi - lo) / 2u;
+        void* p = linearAlloc(mid);
+        if (p) { linearFree(p); best = mid; lo = mid; }
+        else   { hi = mid; }
+    }
+    return best;
+}
+
+/* Censo de memoria num so' bloco, no momento de uma decisao critica (ex: antes
+ * de decodificar um tileset). Responde de uma vez: o que FALTA (precisa vs
+ * livre vs maior bloco -> diz se e' FRAGMENTACAO ou falta mesmo), o estado dos
+ * heaps (linear/malloc/VRAM), e quanto seria EVICTAVEL (texturas da cena
+ * anterior). tag identifica o ponto; need_bytes=0 se nao aplicavel. */
+void mkxp_mem_census(const char* tag, unsigned need_bytes) {
+    unsigned lin_free = (unsigned)linearSpaceFree();
+    unsigned lin_big  = linear_biggest_block();
+    struct mallinfo mi = mallinfo();
+    unsigned mfree = (unsigned)mi.fordblks;
+    int evictable = 0; unsigned evict_bytes = 0;   /* desenhadas >=1x, com dono */
+    for (size_t i = 0; i < s_live_texs.size(); i++) {
+        DS3Texture* t = s_live_texs[i];
+        if (t && t->valid && t->owner_slot && t->last_blit_frame >= 0) {
+            evictable++; evict_bytes += t->pot_bytes;
+        }
+    }
+    const char* veredito = "";
+    if (need_bytes) {
+        if (lin_big >= need_bytes)            veredito = " => CABE contiguo";
+        else if (lin_free >= need_bytes)      veredito = " => NAO cabe: FRAGMENTADO (ha' total mas nao contiguo)";
+        else if (lin_free + evict_bytes >= need_bytes) veredito = " => NAO cabe agora, mas EVICCAO pode chegar";
+        else                                  veredito = " => FALTA MESMO (nem com eviccao)";
+    }
+    char buf[640];
+    snprintf(buf, sizeof(buf),
+        "[MEM|CENSO:%s] precisa=%.0fKB | LINEAR livre=%.0fKB maior_bloco=%.0fKB | "
+        "MALLOC livre=%.0fKB | TEX vivas=%d (%.0fKB) evictaveis=%d (%.0fKB) | VRAM livre=%.0fKB%s\n",
+        tag ? tag : "?", need_bytes/1024.0, lin_free/1024.0, lin_big/1024.0,
+        mfree/1024.0, s_tex_alive, s_tex_bytes/1024.0,
+        evictable, evict_bytes/1024.0, vramSpaceFree()/1024.0, veredito);
+    printf("%s", buf);
+    if (g_dbglog) { fprintf(g_dbglog, "%s", buf); fflush(g_dbglog); }
+}
+
+/* ── [EVICT-LIN] Eviccao de EMERGENCIA p/ caber um tileset grande (4444) ──────
+ * PROBLEMA (visto no log): ao entrar num mapa, o tileset (ex: Gen4 Outside Town
+ * 256x31040 -> 15.5MB em 4444) tenta alocar mas linear_livre=5.7MB porque a
+ * memoria linear esta' tomada por TEXTURAS vivas da cena anterior (a intro). O
+ * mrb_full_gc nao ajuda (essa memoria NAO sao bitmaps Ruby orfaos, sao C3D
+ * textures vivas) -> o tileset falha -> magenta -> fica em cache negativa.
+ *
+ * DIFERENCA p/ evict_idle_textures: durante uma transferencia de mapa o contador
+ * de frames esta' PARADO (nao ha' Graphics.update enquanto carrega), logo as
+ * texturas da cena anterior nunca parecem "idle" (last_blit ~= frame atual).
+ * Por isso aqui IGNORAMOS o limiar de idle. Em vez disso usamos um criterio
+ * seguro de QUEM evictar: texturas JA' DESENHADAS pelo menos uma vez
+ * (last_blit_frame >= 0) -> sao da cena/mapa ANTERIOR. POUPAMOS as recem-criadas
+ * (last_blit_frame == -1) -> essas pertencem ao mapa NOVO a ser construido agora
+ * (evicta-las seria desperdicio). Maiores primeiro para libertar o maximo com o
+ * minimo de evictacoes.
+ *
+ * SEGURANCA: identica a' idle -- poe *owner_slot=nullptr antes de libertar; o
+ * Bitmap dono recria a textura a partir de b->pixels (intactos em RAM) no
+ * proximo blit. So' corre quando um tileset ja' IA ser magenta, logo nunca
+ * piora um caso que funcionava. GENERICO (engine-level), nao especifico de jogo.
+ * Devolve os bytes (pot) libertados. */
+unsigned display_3ds_evict_linear(unsigned want_bytes) {
+    extern FILE *g_dbglog;
+    float    lin_before = linearSpaceFree();
+    unsigned big_before = linear_biggest_block();   /* bloco contiguo ANTES */
+    int freed = 0; unsigned freed_bytes = 0;
+    /* COPIA ordenada por tamanho desc.: liberta o maximo com menos evictacoes. */
+    std::vector<DS3Texture*> snapshot;
+    for (size_t i = 0; i < s_live_texs.size(); i++) {
+        DS3Texture* t = s_live_texs[i];
+        if (!t || !t->valid) continue;
+        if (!t->owner_slot) continue;          /* sem dono -> seguranca, nao mexer */
+        if (t->last_blit_frame < 0) continue;  /* nunca desenhada = mapa NOVO -> poupar */
+        snapshot.push_back(t);
+    }
+    std::sort(snapshot.begin(), snapshot.end(),
+              [](DS3Texture* a, DS3Texture* b){ return a->pot_bytes > b->pot_bytes; });
+    for (size_t i = 0; i < snapshot.size(); i++) {
+        DS3Texture* t = snapshot[i];
+        if (!t->valid) continue;               /* pode ter sido libertada entretanto */
+        *(t->owner_slot) = nullptr;
+        freed_bytes += t->pot_bytes;
+        display_3ds_free_texture(t);
+        freed++;
+        if (freed_bytes >= want_bytes) break;
+    }
+    float    lin_after = linearSpaceFree();
+    unsigned big_after = linear_biggest_block();    /* bloco contiguo DEPOIS */
+    const char* ok = (big_after >= want_bytes) ? "CABE agora" : "AINDA NAO cabe (fragmentado)";
+    printf("[TEX|EVICT-LIN] evictou %d tex (~%.0fKB) | maior_bloco %.0f->%.0fKB | precisa %.0fKB -> %s\n",
+           freed, freed_bytes/1024.0, big_before/1024.0, big_after/1024.0, want_bytes/1024.0, ok);
+    if (g_dbglog) {
+        fprintf(g_dbglog, "[TEX|EVICT-LIN] evictou %d tex (~%.0fKB pot) | linear_livre %.0f->%.0fKB "
+                "(ganho=%.0fKB) | maior_bloco %.0f->%.0fKB | precisa %.0fKB -> %s\n",
+                freed, freed_bytes/1024.0, lin_before/1024.0, lin_after/1024.0,
+                (lin_after-lin_before)/1024.0, big_before/1024.0, big_after/1024.0,
+                want_bytes/1024.0, ok);
+        fflush(g_dbglog);
+    }
+    return freed_bytes;
 }
 
 void display_3ds_set_texture_owner(DS3Texture* t, DS3Texture** slot) {
@@ -488,24 +608,36 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba) 
 
     memset(dst, 0, (size_t)(tw * th * 4));
 
-    for (int y = 0; y < h && y < th; y++) {
-        for (int x = 0; x < w && x < tw; x++) {
-            /* ORIENTACAO VERTICAL (causa raiz da imagem upside-down):
-             * Ha' DOIS pontos que controlam o flip vertical -- o upload (aqui) e
-             * as UVs (v_top/v_bottom no blit). A regra: EXATAMENTE UM deve
-             * inverter, nunca os dois, nunca nenhum.
-             *  - upload NATURAL (linha y -> linha y): imagem no topo da textura,
-             *    alinhada com h (nao desalinha com a POT th).
-             *  - UVs invertidas (v = 1.0 - sy/th): compensam o espaco UV do
-             *    PICA200 (V=0 base, V=1 topo), pondo o topo da imagem em cima.
-             * O codigo antigo invertia em AMBOS (th-1-y E 1.0-) com th errado ->
-             * upside-down + cortado. Agora: upload natural + UV invertida = 1 flip. */
-            int off = morton_offset(x, y, tw);
-            const u8* src = rgba + (y * w + x) * 4;
-            dst[off*4+0] = src[3]; /* A */
-            dst[off*4+1] = src[2]; /* B */
-            dst[off*4+2] = src[1]; /* G */
-            dst[off*4+3] = src[0]; /* R */
+    /* ORIENTACAO VERTICAL (causa raiz da imagem upside-down):
+     * Ha' DOIS pontos que controlam o flip vertical -- o upload (aqui) e as UVs
+     * (v_top/v_bottom no blit). A regra: EXATAMENTE UM deve inverter, nunca os
+     * dois, nunca nenhum. Aqui o upload e' NATURAL (linha y -> linha y); as UVs
+     * invertidas (v = 1.0 - sy/th) compensam o espaco UV do PICA200 (V=0 base).
+     * (Antes invertia em AMBOS com th errado -> upside-down + cortado.)
+     *
+     * P3: swizzle Morton OTIMIZADO. Antes chamava morton_offset(x,y,tw) por pixel
+     * -- recalcula `((y>>3)*(tw>>3)+(x>>3))*64` (multiplicacao + dois >>3) e copia
+     * 4 bytes um a um. Agora hoistamos a base da LINHA (so' muda a cada pixel em
+     * x>>3) para fora, e a troca de canais RGBA->ABGR do PICA200 faz-se com UM
+     * __builtin_bswap32 (instrucao REV no ARM) -> 1 load + 1 store por pixel em
+     * vez de 4+4. Bytes de saida identicos ao anterior (A,B,G,R). __builtin_memcpy
+     * de 4 bytes alinhados e' compilado para um unico load/store (sem UB de
+     * aliasing). Corre sempre que um bitmap muda (incl. o @layer0 do tilemap). */
+    {
+        static const int mt[8] = { 0, 1, 4, 5, 16, 17, 20, 21 };
+        const int twb = tw >> 3;
+        const int hh  = (h < th) ? h : th;
+        const int ww  = (w < tw) ? w : tw;
+        for (int y = 0; y < hh; y++) {
+            const int row_base = ((y >> 3) * twb) * 64 + (mt[y & 7] << 1);
+            const u8* srow = rgba + (size_t)y * w * 4;
+            for (int x = 0; x < ww; x++) {
+                const int off = row_base + (x >> 3) * 64 + mt[x & 7];
+                u32 v;
+                __builtin_memcpy(&v, srow + (size_t)x * 4, 4);
+                v = __builtin_bswap32(v);
+                __builtin_memcpy(dst + (size_t)off * 4, &v, 4);
+            }
         }
     }
 

@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <dirent.h>   /* opendir: testar se uma PASTA existe (FileTest.directory?) */
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_HDR
@@ -234,6 +235,11 @@ static unsigned char* decode_png_to_4444(const unsigned char* buf, size_t len,
     png_read_update_info(png, info);
 
     size_t need4444 = (size_t)w * (size_t)h * 2u;     /* u16 por pixel */
+    /* CENSO antes do decode: precisa vs livre vs maior_bloco contiguo, malloc,
+     * pool de texturas e quanto seria evictavel -> diz logo se vai caber, se e'
+     * fragmentacao, ou se falta mesmo. (so' p/ tilesets grandes 4444, nao spam) */
+    { extern void mkxp_mem_census(const char*, unsigned);
+      mkxp_mem_census("tileset-pre", (unsigned)need4444); }
     out = (unsigned char*)malloc(need4444);
     if (!out) { out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr); }
     if (!out) {
@@ -247,8 +253,23 @@ static unsigned char* decode_png_to_4444(const unsigned char* buf, size_t len,
         }
     }
     if (!out) {
+        /* O GC nao chegou: a memoria nao esta' em bitmaps Ruby orfaos, esta' em
+         * TEXTURAS C3D vivas da cena ANTERIOR (ex: a intro acabada de sair, cujas
+         * imagens ainda ocupam o heap linear). Evicta-as p/ libertar linear e
+         * RETENTA. So' corre quando o tileset ja' ia ser magenta -> nunca piora
+         * um caso bom; a textura evictada e' recriada do b->pixels no proximo
+         * blit. O log [TEX|EVICT-LIN] mostra quanto libertou vs o que precisa. */
+        extern unsigned display_3ds_evict_linear(unsigned want_bytes);
+        if (display_3ds_evict_linear((unsigned)need4444) > 0) {
+            out = (unsigned char*)malloc(need4444);
+            if (!out) { out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr); }
+        }
+    }
+    if (!out) {
         png_destroy_read_struct(&png, &info, nullptr);
-        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] alloc 4444 FALHOU (mesmo apos GC) need=%zuKB linear_livre=%.0fKB\n", need4444 / 1024, linearSpaceFree() / 1024.0); fflush(g_dbglog); }
+        { extern void mkxp_mem_census(const char*, unsigned);
+          mkxp_mem_census("tileset-FALHOU", (unsigned)need4444); }
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] alloc 4444 FALHOU (mesmo apos GC+EVICT) need=%zuKB linear_livre=%.0fKB\n", need4444 / 1024, linearSpaceFree() / 1024.0); fflush(g_dbglog); }
         return nullptr;
     }
     rowbuf = (png_bytep)malloc((size_t)w * 4u);
@@ -397,9 +418,59 @@ static Bitmap3DS *bmp_alloc(int w, int h) {
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     Bitmap3DS *b  = (Bitmap3DS*)calloc(1, sizeof(Bitmap3DS));
+    if (!b) return nullptr;                  /* extremo: nem a struct coube */
     b->width      = w;
     b->height     = h;
-    b->pixels     = (unsigned char*)calloc(w * h, 4);
+    size_t nbytes = (size_t)w * (size_t)h * 4;
+
+    /* caminho rapido: heap normal (calloc). */
+    b->pixels     = (unsigned char*)calloc(nbytes, 1);
+
+    /* FIX (cartao vazio + qualquer bitmap in-RAM sob pressao de memoria):
+     * Sob pressao -- ex.: abrir o Trainer Card LOGO a seguir as intro Pictures
+     * gigantes (1696x864 RGBA) que enchem o heap -- este calloc FALHAVA e
+     * b->pixels ficava NULL, MAS b->width/height continuavam 512x384. Como
+     * bmp_clear e bmp_draw_text guardam ambos `!b->pixels` e RETORNAM, o
+     * overlay do cartao desenhava-se VAZIO: sem texto, e ate' sem a linha de
+     * diagnostico [CARTAO-TXT] (o draw_text saia no 1o if, antes do log).
+     * Recuperacao em cascata (so' corre no caminho de FALHA -> custo zero
+     * no fluxo normal), reaproveitando as ferramentas que ja' tens:
+     *   (1) full_gc liberta bitmaps Ruby ORFAOS e retenta no heap normal;
+     *   (2) heap LINEAR (separado do pool do mruby; no log o linear_livre
+     *       era ~24MB > 768KB que o overlay precisa) e marca pixels_linear;
+     *   (3) se ate' o linear estiver cheio de texturas, display_3ds_evict_linear
+     *       liberta-as (recriadas do b->pixels no proximo blit) e retenta. */
+    if (!b->pixels && nbytes > 0) {
+        for (int tries = 0; tries < 3 && !b->pixels; tries++) {
+            if (!gc_reclaim_on_oom("bmp_alloc")) break;   /* nada a libertar */
+            b->pixels = (unsigned char*)calloc(nbytes, 1);
+        }
+        if (!b->pixels) {
+            b->pixels = (unsigned char*)linearAlloc(nbytes);
+            if (!b->pixels) {
+                /* linear tambem esgotado -> evictar texturas e retentar */
+                extern unsigned display_3ds_evict_linear(unsigned want_bytes);
+                if (display_3ds_evict_linear((unsigned)nbytes) > 0)
+                    b->pixels = (unsigned char*)linearAlloc(nbytes);
+            }
+            if (b->pixels) {
+                memset(b->pixels, 0, nbytes);
+                b->pixels_linear = true;
+                if (g_dbglog) {
+                    fprintf(g_dbglog,
+                        "[BMP|ALLOC-OOM] bmp_alloc(%dx%d=%uKB): heap normal esgotado -> linearAlloc OK (cartao/overlay salvo)\n",
+                        w, h, (unsigned)(nbytes / 1024));
+                    fflush(g_dbglog);
+                }
+            } else if (g_dbglog) {
+                fprintf(g_dbglog,
+                    "[BMP|ALLOC-FATAL] bmp_alloc(%dx%d=%uKB): calloc+GC+linearAlloc+EVICT TODOS falharam -> bitmap sem pixels\n",
+                    w, h, (unsigned)(nbytes / 1024));
+                fflush(g_dbglog);
+            }
+        }
+    }
+
     b->tex_dirty  = true;
     b->tex        = nullptr;
     return b;
@@ -498,6 +569,10 @@ static const char *s_game_roots[] = {
  * comuns -- a MESMA logica do loader bmp_load_file, por isso o que esta funcao diz
  * existir, o loader consegue carregar. Exposta ao Ruby como Bitmap._native_exist?
  * e usada pelo FileTest.exist?. Generico p/ QUALQUER recurso em qualquer subpasta. */
+/* fwd decl (definicao mais abaixo): tem de ser a' escala de namespace porque
+ * 'extern "C"' NAO e' permitido dentro do corpo de uma funcao (erro C++:
+ * "expected unqualified-id before string constant"). */
+extern "C" int mkxp_native_dir_exists(const char *path);
 extern "C" int mkxp_native_file_exists(const char *path) {
     if (!path || path[0] == '\0') return 0;
     static const char *exts[] = { "", ".png", ".gif", ".jpg", ".jpeg", ".bmp",
@@ -520,6 +595,38 @@ extern "C" int mkxp_native_file_exists(const char *path) {
             if (fp) { fclose(fp); return 1; }
         }
     }
+    /* O FileTest.exist? do Ruby tambem e' true para PASTAS, nao so' ficheiros. O
+     * loop acima so' testa fopen (ficheiros) -> falha numa pasta (ainda mais com
+     * '/' final). Por isso o menu Voltseon, que faz safeExists?(MENU_FILE_PATH)
+     * sobre "Graphics/Pictures/Voltseon's Pause Menu/", dava sempre "directory
+     * does not exist" apesar de a pasta estar no SD. Tenta como diretorio. */
+    if (mkxp_native_dir_exists(path)) return 1;
+    return 0;
+}
+
+/* Como mkxp_native_file_exists, mas para PASTAS: tenta abrir o caminho como
+ * diretorio (opendir) em cada raiz do jogo. Devolve 1 se ABRE numa raiz. Isto
+ * corrige o FileTest.directory? do porte, que estava fixo em false -> qualquer
+ * jogo/plugin que valida a existencia de uma pasta (ex: o menu de pausa Voltseon,
+ * que verifica MENU_FILE_PATH e mostrava "This directory does not exist") recebia
+ * sempre erro mesmo com a pasta presente no SD. SEM extensoes (e' pasta). Se
+ * opendir falhar em todas -> 0 (= comportamento antigo, zero regressao). */
+extern "C" int mkxp_native_dir_exists(const char *path) {
+    if (!path || path[0] == '\0') return 0;
+    for (int ri = 0; s_game_roots[ri] != nullptr; ri++) {
+        const char *root = s_game_roots[ri];
+        char full[512];
+        if (root[0] != '\0' && path[0] == '/') {
+            snprintf(full, sizeof(full), "%s%s", root, path + 1);
+        } else {
+            snprintf(full, sizeof(full), "%s%s", root, path);
+        }
+        /* tira barra final (opendir do newlib/3ds e' esquisito com 'dir/') */
+        size_t fl = strlen(full);
+        while (fl > 1 && (full[fl-1] == '/' || full[fl-1] == '\\')) full[--fl] = '\0';
+        DIR *d = opendir(full);
+        if (d) { closedir(d); return 1; }
+    }
     return 0;
 }
 
@@ -532,6 +639,18 @@ static mrb_value bmp_native_exist(mrb_state *mrb, mrb_value) {
     int n = (plen < (mrb_int)sizeof(buf)-1) ? (int)plen : (int)sizeof(buf)-1;
     memcpy(buf, p, n); buf[n] = '\0';
     return mkxp_native_file_exists(buf) ? mrb_true_value() : mrb_false_value();
+}
+
+/* Wrapper Ruby: Bitmap._native_dir_exist?(path) -> true/false. Liga o
+ * FileTest.directory? a um opendir real nas raizes do jogo (corrige o stub
+ * fixo em false que partia validacoes de pasta, ex: menu Voltseon). */
+static mrb_value bmp_native_dir_exist(mrb_state *mrb, mrb_value) {
+    const char *p = nullptr; mrb_int plen = 0;
+    mrb_get_args(mrb, "s", &p, &plen);
+    char buf[512];
+    int n = (plen < (mrb_int)sizeof(buf)-1) ? (int)plen : (int)sizeof(buf)-1;
+    memcpy(buf, p, n); buf[n] = '\0';
+    return mkxp_native_dir_exists(buf) ? mrb_true_value() : mrb_false_value();
 }
 
 /* true se este Bitmap esta' guardado em RGBA4444 (tileset gigante). O Ruby
@@ -584,18 +703,27 @@ void mkxp_bmp_clear_failed_loads() { s_failed_n = 0; }
 /* Constroi o bitmap 32x32 de fallback: TRANSPARENTE p/ Pictures (decorativo,
  * invisivel como no PC), MAGENTA p/ o resto (asset em falta = erro visivel). */
 static Bitmap3DS *make_fallback_bitmap(const char *path) {
-    bool is_picture = false;
+    /* TRANSPARENTE (invisivel, como no PC) para assets DECORATIVOS em falta:
+     * Pictures/ e Windowskins/. A windowskin 'speech black' nao existe neste
+     * jogo -> antes ficava MAGENTA (a mancha rosa na caixa do nome "Auntie").
+     * Agora fica transparente: a moldura desaparece mas o texto continua legivel.
+     * O resto (charsets, tilesets...) continua magenta = erro bem visivel. */
+    bool transparent = false;
     if (path) {
         for (const char *p = path; *p; p++) {
             if ((p[0]=='P'||p[0]=='p') &&
                 (strncmp(p, "Pictures/", 9) == 0 || strncmp(p, "pictures/", 9) == 0)) {
-                is_picture = true; break;
+                transparent = true; break;
+            }
+            if ((p[0]=='W'||p[0]=='w') &&
+                (strncmp(p, "Windowskins/", 12) == 0 || strncmp(p, "windowskins/", 12) == 0)) {
+                transparent = true; break;
             }
         }
     }
     Bitmap3DS *b = bmp_alloc(32, 32);
-    unsigned char rc = is_picture ? 0 : 255;   /* R e B; G=0 sempre */
-    unsigned char ac = is_picture ? 0 : 255;   /* alpha */
+    unsigned char rc = transparent ? 0 : 255;   /* R e B; G=0 sempre */
+    unsigned char ac = transparent ? 0 : 255;   /* alpha */
     for (int i = 0; i < 32 * 32; i++) {
         b->pixels[i*4+0] = rc; b->pixels[i*4+1] = 0;
         b->pixels[i*4+2] = rc; b->pixels[i*4+3] = ac;
@@ -947,7 +1075,7 @@ static Bitmap3DS *bmp_load_file(const char *path) {
      * pedido E todas as raizes/extensoes tentadas, para que qualquer imagem que
      * venha a falhar fique identificada no log com precisao (caminho exato que
      * faltou). Sem isto, so' se via "magenta" no ecra sem saber o ficheiro.
-     * Casos previstos a falhar (do Graphics.zip analisado): Graphics/System/*
+     * Casos previstos a falhar (do Graphics.zip analisado): Graphics/System/(varios)
      * (pasta inexistente), Graphics/Battlers/eggCracks (em falta).
      * IMPORTANTE: escreve no stdout E no ficheiro debug_binding.log (g_dbglog),
      * para o diagnostico ficar no log persistente como o resto. */
@@ -1071,7 +1199,14 @@ static mrb_value bmp_dispose(mrb_state*, mrb_value self) {
          * RPG Maker XP game. bitmap_free() (GC path) is null-safe, so the
          * eventual collection of this object will not double-free. */
         if (b->tex)    { display_3ds_free_texture(b->tex); b->tex = nullptr; }
-        if (b->pixels) { free(b->pixels); b->pixels = nullptr; }
+        /* FIX: respeitar a origem do buffer. b->pixels pode vir de linearAlloc
+         * (fallback de OOM em bmp_alloc, ou PNG carregado p/ heap linear): nesse
+         * caso free() corrompe o heap linear. Espelha o bitmap_free (GC). */
+        if (b->pixels) {
+            if (b->pixels_linear) linearFree(b->pixels);
+            else                  free(b->pixels);
+            b->pixels = nullptr;
+        }
         b->tex_dirty = false;
         b->disposed  = true;
     }
@@ -1104,6 +1239,13 @@ static mrb_value bmp_clear(mrb_state*, mrb_value self) {
     }
     return mrb_nil_value();
 }
+
+/* /255 rapido para x em [0, 65025]: evita a divisao por software (o ARM11 do 3DS
+ * nao tem instrucao de divisao inteira). Devolve ~round(x/255), exato nos
+ * extremos. Usado no blending em ponto-fixo de bmp_blt/bmp_stretch_blt -- subst.
+ * o blending em virgula flutuante (4 mult + 4 conversoes float->u8 por pixel),
+ * caro no ARM. So' afeta pixels semi-transparentes; os opacos usam copia direta. */
+#define DIV255(x) (((x) + 1 + ((x) >> 8)) >> 8)
 
 /* ── Leitura de 1 pixel como RGBA8888, tratando origem 8888 OU 4444 ──────────
  * idx = y*width + x (indice de pixel, nao de byte). Os tilesets gigantes guardam
@@ -1177,20 +1319,41 @@ static mrb_value bmp_blt(mrb_state *mrb, mrb_value self) {
     }
     int sx0 = 0, sy0 = 0, sw = 0, sh = 0;
     if (!extract_rect(mrb, sro, &sx0, &sy0, &sw, &sh)) return mrb_nil_value();
-    float alpha = (float)opacity / 255.0f;
-    for (int sy = sy0, dy2 = (int)dy; sy < sy0 + sh; sy++, dy2++) {
-        if (sy < 0 || sy >= src->height || dy2 < 0 || dy2 >= dst->height) continue;
-        for (int sxx = sx0, dx2 = (int)dx; sxx < sx0 + sw; sxx++, dx2++) {
-            if (sxx < 0 || sxx >= src->width || dx2 < 0 || dx2 >= dst->width) continue;
+    if (opacity < 0) opacity = 0; else if (opacity > 255) opacity = 255;
+
+    /* ── P2: clipping por INTERVALO (calculado UMA vez) em vez de um ramo por
+     * pixel. Mapeamento fonte->destino: (sx0+i, sy0+j) -> (dx+i, dy+j). Os
+     * limites validos de i e j garantem fonte E destino dentro dos limites. */
+    const int sW = src->width,  sH = src->height;
+    const int dW = dst->width,  dH = dst->height;
+    const int DX = (int)dx, DY = (int)dy;
+    int i0 = 0;  if (-sx0 > i0) i0 = -sx0;  if (-DX > i0) i0 = -DX;
+    int i1 = sw; if (sW - sx0 < i1) i1 = sW - sx0;  if (dW - DX < i1) i1 = dW - DX;
+    int j0 = 0;  if (-sy0 > j0) j0 = -sy0;  if (-DY > j0) j0 = -DY;
+    int j1 = sh; if (sH - sy0 < j1) j1 = sH - sy0;  if (dH - DY < j1) j1 = dH - DY;
+
+    unsigned char *dpx = dst->pixels;
+    const int op = (int)opacity;
+    for (int j = j0; j < j1; j++) {
+        const int srow = (sy0 + j) * sW;
+        const int drow = (DY  + j) * dW;
+        for (int i = i0; i < i1; i++) {
             unsigned char sr, sg, sb, sal;
-            px_read(src, sy * src->width + sxx, sr, sg, sb, sal);  /* origem 8888 ou 4444 */
-            int di = (dy2 * dst->width + dx2) * 4;
-            float sa = sal / 255.0f * alpha;
-            float da = 1.0f - sa;
-            dst->pixels[di]   = (unsigned char)(sr * sa + dst->pixels[di]   * da);
-            dst->pixels[di+1] = (unsigned char)(sg * sa + dst->pixels[di+1] * da);
-            dst->pixels[di+2] = (unsigned char)(sb * sa + dst->pixels[di+2] * da);
-            dst->pixels[di+3] = (unsigned char)(sa * 255.0f + dst->pixels[di+3] * da);
+            px_read(src, srow + (sx0 + i), sr, sg, sb, sal);
+            if (sal == 0) continue;                    /* fonte 100% transparente */
+            const int di = (drow + (DX + i)) * 4;
+            if (op >= 255 && sal == 255) {             /* CAMINHO RAPIDO: copia opaca */
+                dpx[di] = sr; dpx[di+1] = sg; dpx[di+2] = sb; dpx[di+3] = 255;
+                continue;
+            }
+            /* blending em ponto-fixo (sem FPU): a = alpha-fonte efetivo 0..255 */
+            const int a  = (op >= 255) ? (int)sal : DIV255((int)sal * op);
+            if (a == 0) continue;
+            const int ia = 255 - a;
+            dpx[di]   = (unsigned char)DIV255(sr * a + dpx[di]   * ia);
+            dpx[di+1] = (unsigned char)DIV255(sg * a + dpx[di+1] * ia);
+            dpx[di+2] = (unsigned char)DIV255(sb * a + dpx[di+2] * ia);
+            dpx[di+3] = (unsigned char)DIV255(a * 255 + dpx[di+3] * ia);
         }
     }
     dst->tex_dirty = true;
@@ -1268,7 +1431,8 @@ static mrb_value bmp_stretch_blt(mrb_state *mrb, mrb_value self) {
     if (!extract_rect(mrb, sro, &sx0, &sy0, &sw, &sh)) return mrb_nil_value();
     if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return mrb_nil_value();
 
-    float alpha   = (float)opacity / 255.0f;
+    if (opacity < 0) opacity = 0; else if (opacity > 255) opacity = 255;
+    const int op  = (int)opacity;
     float sx_step = (float)sw / (float)dw;
     float sy_step = (float)sh / (float)dh;
 
@@ -1284,13 +1448,20 @@ static mrb_value bmp_stretch_blt(mrb_state *mrb, mrb_value self) {
             if (spx < 0 || spx >= src->width) continue;
             unsigned char sr, sg, sb, sal;
             px_read(src, spy * src->width + spx, sr, sg, sb, sal);  /* origem 8888 ou 4444 */
+            if (sal == 0) continue;                    /* fonte 100% transparente */
             int di = (dpy * dst->width + dpx) * 4;
-            float sa = sal / 255.0f * alpha;
-            float da = 1.0f - sa;
-            dst->pixels[di]   = (unsigned char)(sr * sa + dst->pixels[di]   * da);
-            dst->pixels[di+1] = (unsigned char)(sg * sa + dst->pixels[di+1] * da);
-            dst->pixels[di+2] = (unsigned char)(sb * sa + dst->pixels[di+2] * da);
-            dst->pixels[di+3] = (unsigned char)(sa * 255.0f + dst->pixels[di+3] * da);
+            if (op >= 255 && sal == 255) {             /* CAMINHO RAPIDO: copia opaca */
+                dst->pixels[di] = sr; dst->pixels[di+1] = sg;
+                dst->pixels[di+2] = sb; dst->pixels[di+3] = 255;
+                continue;
+            }
+            const int a  = (op >= 255) ? (int)sal : DIV255((int)sal * op);
+            if (a == 0) continue;
+            const int ia = 255 - a;
+            dst->pixels[di]   = (unsigned char)DIV255(sr * a + dst->pixels[di]   * ia);
+            dst->pixels[di+1] = (unsigned char)DIV255(sg * a + dst->pixels[di+1] * ia);
+            dst->pixels[di+2] = (unsigned char)DIV255(sb * a + dst->pixels[di+2] * ia);
+            dst->pixels[di+3] = (unsigned char)DIV255(a * 255 + dst->pixels[di+3] * ia);
         }
     }
     dst->tex_dirty = true;
@@ -1542,6 +1713,31 @@ static void fnt_draw_into_bitmap(Bitmap3DS *b, int x, int y,
  * 0=esq, 1=centro, 2=dir. */
 static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
     Bitmap3DS *b = GET_BMP(self);
+    /* DIAG-DT (cartao vazio -- SEMPRE ligado): apanha o caso que o early-return
+     * '!b->pixels' a seguir engolia SEM deixar rasto. So' bitmaps ALTOS (o
+     * overlay do cartao e' 384; exclui o dialogo 96 e os tiles 32). Para CADA
+     * draw_text num bitmap alto regista: se b existe, se b->pixels existe (a
+     * causa suspeita), o tamanho real, e se esta' disposed. Cruzar com:
+     *   - se [DIAG-DT] NAO aparece quando abres o cartao -> draw_text nem sequer
+     *     e' chamado no overlay -> a causa esta' no fluxo Ruby (cor/sprite/z),
+     *     nao no desenho de texto;
+     *   - se aparece com pixels=NULL -> o overlay perdeu/nunca teve buffer;
+     *   - se aparece com pixels=OK -> entao o [CARTAO-TXT] mais abaixo TAMBEM
+     *     dispara e diz a cor/alpha do texto. */
+    {
+        static int s_dtn = 0;
+        if (b && b->height >= 200 && s_dtn < 80) {
+            s_dtn++;
+            extern FILE *g_dbglog;
+            if (g_dbglog) {
+                fprintf(g_dbglog, "[DIAG-DT] draw_text: b=%p bmp=%dx%d pixels=%s disposed=%d tex=%s\n",
+                    (void*)b, b->width, b->height,
+                    (b->pixels ? "OK" : "NULL"), (b->disposed ? 1 : 0),
+                    (b->tex ? "sim" : "nao"));
+                fflush(g_dbglog);
+            }
+        }
+    }
     if (!b || !b->pixels) return mrb_nil_value();
 
     int ax = 0, ay = 0, aw = 0, ah = 0, align = 0;
@@ -1567,6 +1763,29 @@ static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
         str = RSTRING_PTR(s2); slen = RSTRING_LEN(s2);
     }
     if (!str || slen <= 0) return mrb_nil_value();
+
+    /* [DIAG-DT-TXT] Complemento do DIAG-DT: agora que o texto esta' extraido,
+     * regista o conteudo (so' bitmaps ALTOS >=200, p/ apanhar o overlay do
+     * cartao 512x384 e excluir o dialogo 96). Se ao abrir o cartao virmos aqui
+     * 'Player', '3000', etc. -> draw_text E' chamado e os pixels escrevem-se;
+     * a causa do cartao vazio passa a ser composicao/z-order do overlay, nao o
+     * texto. Se NUNCA aparecer com o conteudo do cartao -> o texto vai por outro
+     * caminho. Cap p/ nao encher o log. */
+    if (b && b->height >= 200) {
+        static int s_dttx = 0;
+        if (s_dttx < 120) {
+            s_dttx++;
+            char tb[40]; int tn = (slen < 39) ? (int)slen : 39;
+            for (int i = 0; i < tn; i++) { char c = str[i]; tb[i] = (c >= 32 && c < 127) ? c : '.'; }
+            tb[tn] = 0;
+            extern FILE *g_dbglog;
+            if (g_dbglog) {
+                fprintf(g_dbglog, "[DIAG-DT-TXT] bmp=%dx%d rect=(%d,%d,%d,%d) txt='%s'\n",
+                    b->width, b->height, ax, ay, aw, ah, tb);
+                fflush(g_dbglog);
+            }
+        }
+    }
 
     /* cor do texto: bitmap.font.color (se existir), senao branco */
     u8 R = 255, G = 255, B = 255, A = 255;
@@ -1594,11 +1813,40 @@ static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
 
     fnt_draw_into_bitmap(b, drawX, drawY, str, (int)slen, R, G, B, A);
     b->has_text = true;   /* -> textura usa filtro LINEAR (texto legivel no downscale) */
+    b->tex_dirty = true;  /* FIX (cartao vazio): draw_text MODIFICA os pixels, logo a
+                           * textura GPU tem de ser re-enviada. Sem isto, uma bitmap
+                           * EXIBIDA DIRETAMENTE (ex.: @sprites["overlay"] do Trainer Card)
+                           * mostrava a textura ANTERIOR: o overlay.clear marcava dirty e
+                           * enviava a bitmap VAZIA, e o draw_text seguinte (nome/ID/dinheiro)
+                           * nao re-marcava -> a textura vazia ficava -> cartao sem texto.
+                           * (O dialogo escapava porque o texto e' BLT para a janela, e o
+                           * blt ja' marcava dirty.) Idempotente: varios draw_text no mesmo
+                           * frame -> um unico upload no bmp_flush do render. */
     /* LOG DIAGNOSTICO (DBG_DIALOG): o TEXTO que esta a ser desenhado, em que
      * retangulo, em que bitmap (tamanho), com que cor e largura medida. Mostra
      * o conteudo real das caixas e se o letra-a-letra avanca (strings a crescer). */
     DBG(DBG_DIALOG, "[TXT] '%.50s' rect=(%d,%d,%d,%d) al=%d -> bmp=%dx%d rgba=%d,%d,%d,%d tw=%d",
         str, ax, ay, aw, ah, align, b->width, b->height, R, G, B, A, tw);
+    /* DIAGNOSTICO CARTAO (sempre ligado): so' para bitmaps ALTOS (>=200px) ->
+     * apanha o TextSprite 512x384 do Trainer Card (e overlays grandes), exclui
+     * caixas de dialogo (96px) e tiles (32px). Responde DEFINITIVAMENTE a:
+     *   - o draw_text e' MESMO chamado p/ o texto do cartao (nome/ID/dinheiro)?
+     *   - com que cor/ALPHA? (A=0 ou cor==fundo -> texto invisivel)
+     *   - tw>0? (glifos encontrados) | @font era nil? | bitmap real (512x384)?
+     * Se NAO aparecerem linhas [CARTAO-TXT] com o nome -> o cartao desenha o
+     * texto por OUTRA via (drawTextEx/blt) e nao por draw_text -> ver probe. */
+    if (b->height >= 200) {
+        static int s_card_txt_n = 0;
+        if (s_card_txt_n < 120) {
+            s_card_txt_n++;
+            bool font_nil = mrb_nil_p(mrb_iv_get(mrb, self, mrb_intern_lit(mrb, "@font")));
+            printf("[CARTAO-TXT] #%d '%.40s' rect=(%d,%d,%d,%d) al=%d bmp=%dx%d rgba=%d,%d,%d,%d tw=%d font_nil=%d has_text=%d\n",
+                   s_card_txt_n, str, ax, ay, aw, ah, align,
+                   b->width, b->height, (int)R, (int)G, (int)B, (int)A, tw,
+                   font_nil ? 1 : 0, b->has_text ? 1 : 0);
+            fflush(stdout);
+        }
+    }
     return mrb_nil_value();
 }
 
@@ -1759,6 +2007,18 @@ void bitmapBindingInit(mrb_state *mrb) {
     RClass *k = mrb_define_class(mrb, "Bitmap", mrb->object_class);
     MRB_SET_INSTANCE_TT(k, MRB_TT_DATA);
 
+    /* [BUILD-CHK-J20] Marcador INCONDICIONAL de compilacao. Dispara 1x no
+     * arranque, sem depender de qualquer estado do jogo. Se NAO aparecer no
+     * log, este bitmap_binding_3ds.cpp NAO foi compilado/ligado no binario que
+     * corre no 3DS (independentemente do que o `make` disse). Resolve a duvida
+     * "recompilou ou nao" de forma definitiva. */
+    {
+        extern FILE *g_dbglog;
+        const char *m = "[BUILD-CHK-J20] bitmap_binding_3ds ATIVO (draw_text/DIAG-DT presentes)\n";
+        printf("%s", m);
+        if (g_dbglog) { fprintf(g_dbglog, "%s", m); fflush(g_dbglog); }
+    }
+
     /* Pré-criar BitmapWrapper como subclasse C com MRB_TT_DATA ANTES dos scripts.
      * Quando os scripts fizerem "class BitmapWrapper < Bitmap" reabrerem a classe
      * já existente (em vez de criar nova) e MRB_TT_DATA mantém-se correcto. */
@@ -1791,6 +2051,7 @@ void bitmapBindingInit(mrb_state *mrb) {
     mrb_define_method(mrb, k, "font=",              bmp_set_font,          MRB_ARGS_REQ(1));
     mrb_define_class_method(mrb, k, "max_size",     bmp_max_size,          MRB_ARGS_NONE());
     mrb_define_class_method(mrb, k, "_native_exist?", bmp_native_exist,    MRB_ARGS_REQ(1));
+    mrb_define_class_method(mrb, k, "_native_dir_exist?", bmp_native_dir_exist, MRB_ARGS_REQ(1));
     mrb_define_method(mrb, k, "native_4444?",       bmp_native_4444,       MRB_ARGS_NONE());
     mrb_define_class_method(mrb, k, "_clear_failed_loads", bmp_clear_failed_loads, MRB_ARGS_NONE());
 

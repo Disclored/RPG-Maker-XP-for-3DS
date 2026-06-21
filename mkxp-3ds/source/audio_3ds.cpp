@@ -21,6 +21,23 @@ extern "C" {
     typedef struct stb_vorbis stb_vorbis;
     extern int  stb_vorbis_decode_filename(const char *filename, int *channels,
                                            int *sample_rate, short **output);
+    /* ---- API de STREAMING (pull) -- usada pelo BGM/BGS/ME ------------------- */
+    typedef struct stb_vorbis_alloc stb_vorbis_alloc;   /* opaco; passamos NULL */
+    typedef struct {
+        unsigned int sample_rate;
+        int          channels;
+        unsigned int setup_memory_required;
+        unsigned int setup_temp_memory_required;
+        unsigned int temp_memory_required;
+        int          max_frame_size;
+    } stb_vorbis_info;
+    extern stb_vorbis *stb_vorbis_open_filename(const char *filename, int *error,
+                                                const stb_vorbis_alloc *alloc_buffer);
+    extern stb_vorbis_info stb_vorbis_get_info(stb_vorbis *f);
+    extern int  stb_vorbis_get_samples_short_interleaved(stb_vorbis *f, int channels,
+                                                         short *buffer, int num_shorts);
+    extern int  stb_vorbis_seek_start(stb_vorbis *f);
+    extern void stb_vorbis_close(stb_vorbis *f);
 }
 
 /* O log do projeto: usamos o mesmo ficheiro/també stdout que o resto do
@@ -209,6 +226,148 @@ static int se_reap(void) {
 /* ─────────────────────────────────────────────────────────────────────────────
  * API publica
  * ─────────────────────────────────────────────────────────────────────────── */
+/* ============================================================================
+ * STREAMING (BGM/BGS/ME) -- decode incremental de OGG, alimentado por frame.
+ * ----------------------------------------------------------------------------
+ * Canais NDSP dedicados: 0=BGM, 1=BGS, 2=ME (os SE usam 3..14). Cada stream usa
+ * 2 buffers LINEAR (~0.35s cada) em ping-pong: quando o DSP termina um, o
+ * audio_3ds_update() (1x/frame) descodifica o bloco seguinte e re-enfileira.
+ * Loop (BGM/BGS): ao chegar ao fim faz stb_vorbis_seek_start e continua a encher
+ * o MESMO bloco (sem buraco audivel). ME nao faz loop. Buffers pequenos =>
+ * ~150KB por stream activo => NAO mexe na memoria dos mapas grandes.
+ * ========================================================================= */
+#define STREAM_SECS_PER_BUF 0.35f
+#define BGM_CHANNEL 0
+#define BGS_CHANNEL 1
+#define ME_CHANNEL  2
+
+struct Stream {
+    stb_vorbis *v;
+    int16_t    *buf[2];
+    ndspWaveBuf wbuf[2];
+    int         channel;
+    int         chans;        /* 1 ou 2 */
+    int         rate;
+    int         bufSamples;   /* samples por canal por buffer */
+    bool        looping;
+    bool        active;
+    int         volume;       /* 0..100 */
+    char        name[256];
+};
+
+static Stream s_bgm, s_bgs, s_me;
+
+/* Descodifica bufSamples (por canal) para dst, fazendo loop se 'looping'.
+ * Devolve nº de samples por canal escritos (0 = fim e sem loop). */
+static int stream_decode_block(Stream *s, int16_t *dst) {
+    int total = 0, guard = 0;
+    while (total < s->bufSamples) {
+        int want = s->bufSamples - total;
+        int got  = stb_vorbis_get_samples_short_interleaved(
+                       s->v, s->chans, dst + total * s->chans, want * s->chans);
+        if (got <= 0) {
+            if (s->looping) {
+                stb_vorbis_seek_start(s->v);
+                if (++guard > 2) break;     /* ficheiro vazio: evita loop infinito */
+                continue;
+            }
+            break;
+        }
+        total += got;
+    }
+    return total;
+}
+
+/* Enche e enfileira o buffer 'which'. false => fim (sem loop). */
+static bool stream_queue(Stream *s, int which) {
+    int n = stream_decode_block(s, s->buf[which]);
+    if (n <= 0) return false;
+    memset(&s->wbuf[which], 0, sizeof(ndspWaveBuf));
+    s->wbuf[which].data_vaddr = s->buf[which];
+    s->wbuf[which].nsamples   = n;
+    s->wbuf[which].looping    = false;
+    DSP_FlushDataCache(s->buf[which], (u32)n * s->chans * sizeof(int16_t));
+    ndspChnWaveBufAdd(s->channel, &s->wbuf[which]);
+    return true;
+}
+
+static void stream_stop(Stream *s) {
+    if (s->active) {
+        ndspChnWaveBufClear(s->channel);
+        ndspChnReset(s->channel);
+    }
+    if (s->v) { stb_vorbis_close(s->v); s->v = NULL; }
+    for (int i = 0; i < 2; i++)
+        if (s->buf[i]) { linearFree(s->buf[i]); s->buf[i] = NULL; }
+    s->active = false;
+}
+
+static void stream_start(Stream *s, const char *name, int volume, int pitch,
+                         bool looping, const char *tag) {
+    stream_stop(s);
+    if (!name || name[0] == '\0') { aud_log("[AUDIO] %s_play nome VAZIO -- ignorado\n", tag); return; }
+
+    char full[512];
+    int type = resolve_audio(name, full, sizeof(full));
+    if (type == 0) { aud_log("[AUDIO|MISS] %s_play: '%s' nao encontrado\n", tag, name); return; }
+    if (type != 1) { aud_log("[AUDIO] %s_play: '%s' nao e' OGG (streaming so' OGG por agora) -- ignorado\n", tag, name); return; }
+
+    int err = 0;
+    s->v = stb_vorbis_open_filename(full, &err, NULL);
+    if (!s->v) { aud_log("[AUDIO|ERR] %s_play: stb_vorbis_open '%s' falhou (err=%d)\n", tag, full, err); return; }
+
+    stb_vorbis_info info = stb_vorbis_get_info(s->v);
+    s->chans      = (info.channels >= 2) ? 2 : 1;
+    s->rate       = (info.sample_rate > 0) ? (int)info.sample_rate : 44100;
+    s->bufSamples = (int)(s->rate * STREAM_SECS_PER_BUF);
+    if (s->bufSamples < 1024) s->bufSamples = 1024;
+    s->looping    = looping;
+    s->volume     = (volume < 0 ? 0 : (volume > 100 ? 100 : volume));
+    strncpy(s->name, name, sizeof(s->name) - 1); s->name[sizeof(s->name) - 1] = '\0';
+
+    size_t bytes = (size_t)s->bufSamples * s->chans * sizeof(int16_t);
+    for (int i = 0; i < 2; i++) {
+        s->buf[i] = (int16_t *)linearAlloc(bytes);
+        if (!s->buf[i]) { aud_log("[AUDIO|ERR] %s_play: linearAlloc %u falhou\n", tag, (unsigned)bytes); stream_stop(s); return; }
+    }
+
+    ndspChnReset(s->channel);
+    ndspChnSetInterp(s->channel, NDSP_INTERP_LINEAR);
+    float rate = (float)s->rate * ((pitch > 0 && pitch != 100) ? (pitch / 100.0f) : 1.0f);
+    ndspChnSetRate(s->channel, rate);
+    ndspChnSetFormat(s->channel, (s->chans == 2) ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
+    float vol = s->volume / 100.0f;
+    float mix[12]; memset(mix, 0, sizeof(mix));
+    mix[0] = vol; mix[1] = vol;
+    ndspChnSetMix(s->channel, mix);
+
+    s->active = true;
+    bool a = stream_queue(s, 0);
+    bool b = stream_queue(s, 1);
+    if (!a && !b) { aud_log("[AUDIO|ERR] %s_play: '%s' sem dados decodificaveis\n", tag, name); stream_stop(s); return; }
+
+    aud_log("[AUDIO] %s_play '%s' -> OGG %dch %dHz buf=%dsmp x2 canal=%d vol=%d pitch=%d loop=%d\n",
+            tag, name, s->chans, s->rate, s->bufSamples, s->channel, s->volume, pitch, looping ? 1 : 0);
+}
+
+/* 1x/frame: re-enche os buffers que o DSP ja' consumiu. */
+static void stream_pump(Stream *s) {
+    if (!s->active || !s->v) return;
+    bool anyAlive = false;
+    for (int i = 0; i < 2; i++) {
+        if (s->wbuf[i].status == NDSP_WBUF_DONE) {
+            if (stream_queue(s, i)) anyAlive = true;
+        } else if (s->wbuf[i].status == NDSP_WBUF_QUEUED ||
+                   s->wbuf[i].status == NDSP_WBUF_PLAYING) {
+            anyAlive = true;
+        }
+    }
+    if (!anyAlive && !s->looping) {
+        aud_log("[AUDIO] stream canal=%d terminou (sem loop) -- a parar\n", s->channel);
+        stream_stop(s);
+    }
+}
+
 extern "C" void audio_3ds_init(void) {
     if (s_inited) { aud_log("[AUDIO] init: ja' inicializado (ignorado)\n"); return; }
 
@@ -222,15 +381,21 @@ extern "C" void audio_3ds_init(void) {
         s_se[i].active  = false;
         ndspChnReset(s_se[i].channel);
     }
+    /* streams BGM/BGS/ME: zerar estado + reset dos canais 0/1/2 (SE usam 3..14) */
+    memset(&s_bgm, 0, sizeof(Stream)); s_bgm.channel = BGM_CHANNEL;
+    memset(&s_bgs, 0, sizeof(Stream)); s_bgs.channel = BGS_CHANNEL;
+    memset(&s_me,  0, sizeof(Stream)); s_me.channel  = ME_CHANNEL;
+    ndspChnReset(BGM_CHANNEL); ndspChnReset(BGS_CHANNEL); ndspChnReset(ME_CHANNEL);
     s_se_rr = 0;
     s_play_count = 0;
     s_inited = true;
-    aud_log("[AUDIO] init OK: NDSP STEREO, %d canais SE (%d..%d), decoders OGG+WAV\n",
+    aud_log("[AUDIO] init OK: NDSP STEREO | SE %d canais (%d..%d) | BGM/BGS/ME streaming canais 0/1/2 | OGG+WAV\n",
             SE_SLOTS, SE_CH_FIRST, SE_CH_LAST);
 }
 
 extern "C" void audio_3ds_exit(void) {
     if (!s_inited) return;
+    stream_stop(&s_bgm); stream_stop(&s_bgs); stream_stop(&s_me);
     for (int i = 0; i < SE_SLOTS; i++) se_slot_free(&s_se[i]);
     s_inited = false;
     aud_log("[AUDIO] exit: %ld SE tocados nesta sessao, buffers libertados\n", s_play_count);
@@ -336,19 +501,44 @@ extern "C" void audio_3ds_update(void) {
     if (!s_inited) return;
     int freed = se_reap();
     if (freed > 0) aud_log("[AUDIO] update: %d buffer(s) de SE reciclado(s)\n", freed);
+    /* alimentar os streams (re-enche os buffers ja' consumidos pelo DSP) */
+    stream_pump(&s_bgm);
+    stream_pump(&s_bgs);
+    stream_pump(&s_me);
 }
 
-/* ---- BGM/BGS/ME: stubs da Fase 1 (logam, nao tocam ainda) ----------------- */
+/* ---- BGM/BGS/ME: streaming OGG real (canais 0/1/2) ------------------------ */
 extern "C" void audio_3ds_bgm_play(const char *name, int volume, int pitch) {
-    aud_log("[AUDIO|TODO] bgm_play '%s' vol=%d pitch=%d (streaming na Fase 2)\n",
-            name ? name : "?", volume, pitch);
+    if (!s_inited) { aud_log("[AUDIO] bgm_play antes de init -- ignorado\n"); return; }
+    /* mesmo BGM ja' a tocar em loop -> NAO reiniciar (evita cortar a musica a
+       cada mapa que use a mesma faixa); apenas ajusta o volume se mudou. */
+    if (s_bgm.active && name && strcmp(s_bgm.name, name) == 0) {
+        int v = (volume < 0 ? 0 : (volume > 100 ? 100 : volume));
+        if (v != s_bgm.volume) {
+            s_bgm.volume = v;
+            float mix[12]; memset(mix, 0, sizeof(mix));
+            mix[0] = mix[1] = v / 100.0f;
+            ndspChnSetMix(s_bgm.channel, mix);
+            aud_log("[AUDIO] bgm '%s' ja' a tocar -- volume -> %d\n", name, v);
+        }
+        return;
+    }
+    stream_start(&s_bgm, name, volume, pitch, true, "bgm");
 }
-extern "C" void audio_3ds_bgm_stop(void) { aud_log("[AUDIO|TODO] bgm_stop (Fase 2)\n"); }
+extern "C" void audio_3ds_bgm_stop(void) { if (s_inited) { stream_stop(&s_bgm); aud_log("[AUDIO] bgm_stop\n"); } }
+
 extern "C" void audio_3ds_bgs_play(const char *name, int volume, int pitch) {
-    aud_log("[AUDIO|TODO] bgs_play '%s' vol=%d pitch=%d (Fase 2)\n", name ? name : "?", volume, pitch);
+    if (!s_inited) return;
+    if (s_bgs.active && name && strcmp(s_bgs.name, name) == 0) return;
+    stream_start(&s_bgs, name, volume, pitch, true, "bgs");
 }
-extern "C" void audio_3ds_bgs_stop(void) { aud_log("[AUDIO|TODO] bgs_stop (Fase 2)\n"); }
+extern "C" void audio_3ds_bgs_stop(void) { if (s_inited) { stream_stop(&s_bgs); aud_log("[AUDIO] bgs_stop\n"); } }
+
 extern "C" void audio_3ds_me_play(const char *name, int volume, int pitch) {
-    aud_log("[AUDIO|TODO] me_play '%s' vol=%d pitch=%d (Fase 3)\n", name ? name : "?", volume, pitch);
+    if (!s_inited) return;
+    /* ME (jingle, ex: subir de nivel / apanhar item): one-shot, sem loop. Em
+       RMXP o ME pausa o BGM; aqui toca por cima e o jogo volta a chamar bgm_play
+       quando o ME acaba (o motor RMXP trata do resume ao nivel do script). */
+    stream_start(&s_me, name, volume, pitch, false, "me");
 }
-extern "C" void audio_3ds_me_stop(void) { aud_log("[AUDIO|TODO] me_stop (Fase 3)\n"); }
+extern "C" void audio_3ds_me_stop(void) { if (s_inited) { stream_stop(&s_me); aud_log("[AUDIO] me_stop\n"); } }

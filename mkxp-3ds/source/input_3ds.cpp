@@ -7,11 +7,15 @@ static const BMap MAP[] = {
     {KEY_DUP,    RMXP_UP},    {KEY_DDOWN,  RMXP_DOWN},
     {KEY_DLEFT,  RMXP_LEFT},  {KEY_DRIGHT, RMXP_RIGHT},
     {KEY_A,      RMXP_C},
-    {KEY_B,      RMXP_X},
+    {KEY_B,      RMXP_B},
     {KEY_X,      RMXP_Z},
     {KEY_Y,      RMXP_A},
     {KEY_L,      RMXP_L},     {KEY_R,      RMXP_R},
     {KEY_START,  RMXP_F5},    {KEY_SELECT, RMXP_SHIFT},
+    /* New 3DS: gatilhos ZL/ZR completam Input::X e Input::Y (JUMPUP/JUMPDOWN,
+       scroll rapido em listas + algumas accoes de plugins/menus). No Old 3DS
+       estes botoes nao existem e nunca disparam -- inofensivo. */
+    {KEY_ZL,     RMXP_X},     {KEY_ZR,     RMXP_Y},
 };
 static const int MSIZ = (int)(sizeof(MAP)/sizeof(MAP[0]));
 

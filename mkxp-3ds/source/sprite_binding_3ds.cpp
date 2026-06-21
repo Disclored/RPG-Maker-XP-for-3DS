@@ -49,6 +49,19 @@ static int read_viewport_z(mrb_state *mrb, mrb_value vp);
 #include "tilemap_binding_3ds.h"
 
 void sprites_draw_all() {
+    /* [BUILD-CHK-J20] Marcador INCONDICIONAL de compilacao (dispara 1x, sem
+     * depender de estado do jogo). Se NAO aparecer no log, este
+     * sprite_binding_3ds.cpp (com o FIX-GRELHA7) NAO esta' no binario. */
+    {
+        static bool s_once = false;
+        if (!s_once) {
+            s_once = true;
+            extern FILE *g_dbglog;
+            const char *m = "[BUILD-CHK-J20] sprite_binding_3ds ATIVO (FIX-GRELHA7 presente)\n";
+            printf("%s", m);
+            if (g_dbglog) { fprintf(g_dbglog, "%s", m); fflush(g_dbglog); }
+        }
+    }
     /* ── DIAGNÓSTICO: dump completo nos primeiros 3 frames ── */
     {
         static int s_diag_frame = 0;
@@ -181,20 +194,93 @@ void sprites_draw_all() {
             if (!mrb_nil_p(ro)) {
                 mrb_value vw = mrb_iv_get(g_mkxp_mrb, ro, sy_w);
                 mrb_value vh = mrb_iv_get(g_mkxp_mrb, ro, sy_h);
-                if (mrb_fixnum_p(vw) && mrb_fixnum_p(vh) &&
-                    mrb_fixnum(vw) > 0 && mrb_fixnum(vh) > 0) {
+                /* Aceita Fixnum E Float. Alguns plugins/efeitos poem floats no
+                 * Rect; a versao anterior so' aceitava Fixnum (mrb_fixnum_p) e
+                 * por isso saltava-os, deixando a folha inteira. NAO usar
+                 * mrb_to_int aqui -- pode levantar excepcao dentro do loop de
+                 * desenho. So' sobrescreve se ambos forem numericos e > 0. */
+                int rw = -1, rh = -1;
+                if      (mrb_fixnum_p(vw)) rw = (int)mrb_fixnum(vw);
+                else if (mrb_float_p(vw))  rw = (int)mrb_float(vw);
+                if      (mrb_fixnum_p(vh)) rh = (int)mrb_fixnum(vh);
+                else if (mrb_float_p(vh))  rh = (int)mrb_float(vh);
+                if (rw > 0 && rh > 0) {
                     mrb_value vx = mrb_iv_get(g_mkxp_mrb, ro, sy_x);
                     mrb_value vy = mrb_iv_get(g_mkxp_mrb, ro, sy_y);
-                    s->src_w = (int)mrb_fixnum(vw);
-                    s->src_h = (int)mrb_fixnum(vh);
-                    s->src_x = mrb_fixnum_p(vx) ? (int)mrb_fixnum(vx) : 0;
-                    s->src_y = mrb_fixnum_p(vy) ? (int)mrb_fixnum(vy) : 0;
+                    s->src_w = rw;
+                    s->src_h = rh;
+                    s->src_x = mrb_fixnum_p(vx) ? (int)mrb_fixnum(vx)
+                             : (mrb_float_p(vx)  ? (int)mrb_float(vx)  : 0);
+                    s->src_y = mrb_fixnum_p(vy) ? (int)mrb_fixnum(vy)
+                             : (mrb_float_p(vy)  ? (int)mrb_float(vy)  : 0);
                 }
             }
         }
 
         int src_w = s->src_w > 0 ? s->src_w : s->bitmap->width;
         int src_h = s->src_h > 0 ? s->src_h : s->bitmap->height;
+
+        /* ── FIX BUG 7 (quarto: sprite do JOGADOR repetida em grelha 4x4) ─────
+         * Algumas sprites de personagem (tipicamente o jogador, gerido por um
+         * plugin FORA de @character_sprites -> o census nao o ve) desenham a
+         * FOLHA INTEIRA porque o recorte de frame via @src_rect nunca se aplica
+         * (fica = bitmap inteiro). Pokemon/NPCs normais nao sofrem porque o
+         * @src_rect deles fica correcto (src_w=64 != 256, logo nao entram aqui).
+         * Prova (FRAMEDUMP map=3): #067 bmp=256x256 src=[0,0,256,256] mas com
+         * origem o=(32,64) = de UM frame 64x64 -> a folha 4x4 aparece como
+         * ~8-16 copias (exactamente a imagem do quarto).
+         * Fallback RGSS-correcto: se uma sprite COM @character desenha a folha
+         * toda de um charset QUADRADO (w==h, %4==0, >=128 => 4 frames x 4
+         * direcoes de 64x64), recortamos aqui o frame a partir de
+         * @character.@pattern/@direction -- tal como Sprite_Character#update
+         * faria. So' actua na CONDICAO DO BUG (src cobre tudo); sprites ja'
+         * recortadas (pokemon, npcs) nao sao tocadas. */
+        if (g_mkxp_mrb && !mrb_nil_p(s->rb_self)
+            && s->bitmap->width == s->bitmap->height
+            && s->bitmap->width >= 128 && (s->bitmap->width % 4) == 0
+            && src_w >= s->bitmap->width && src_h >= s->bitmap->height) {
+            static mrb_sym sy_ch = 0, sy_pat = 0, sy_dir = 0, sy_ev = 0;
+            if (sy_ch == 0) {
+                sy_ch  = mrb_intern_lit(g_mkxp_mrb, "@character");
+                sy_pat = mrb_intern_lit(g_mkxp_mrb, "@pattern");
+                sy_dir = mrb_intern_lit(g_mkxp_mrb, "@direction");
+                sy_ev  = mrb_intern_lit(g_mkxp_mrb, "@event");
+            }
+            /* Fonte de pattern/direction: @character -> @event -> o proprio sprite.
+             * Antes so' tratava @character; reflexos/sombras (Overworld Shadows EX,
+             * Sprite_Reflection) usam o charset mas guardam a ref noutro ivar -> a
+             * folha inteira ia para o void. Agora recortamos SEMPRE; sem fonte,
+             * frame (0,0) -- um sprite estatico, nunca a grelha 4x4. */
+            mrb_value src = mrb_iv_get(g_mkxp_mrb, s->rb_self, sy_ch);
+            if (mrb_nil_p(src)) src = mrb_iv_get(g_mkxp_mrb, s->rb_self, sy_ev);
+            mrb_value powner = mrb_nil_p(src) ? s->rb_self : src;
+            mrb_value vp = mrb_iv_get(g_mkxp_mrb, powner, sy_pat);
+            mrb_value vd = mrb_iv_get(g_mkxp_mrb, powner, sy_dir);
+            int pat = mrb_fixnum_p(vp) ? (int)mrb_fixnum(vp) : 0;
+            int dir = mrb_fixnum_p(vd) ? (int)mrb_fixnum(vd) : 2;
+            if (pat < 0) pat = 0; else if (pat > 3) pat = pat & 3;
+            int row = (dir >= 2 && dir <= 8) ? ((dir - 2) / 2) : 0;
+            int cw = s->bitmap->width  / 4;
+            int ch = s->bitmap->height / 4;
+            s->src_x = pat * cw; s->src_y = row * ch;
+            s->src_w = cw;       s->src_h = ch;
+            src_w = cw;          src_h = ch;
+            static int s_gp = 0;
+            if (s_gp++ < 12) {
+                const char *cls = "?";
+                struct RClass *kc = mrb_class(g_mkxp_mrb, s->rb_self);
+                if (kc) cls = mrb_class_name(g_mkxp_mrb, kc);
+                extern FILE *g_dbglog;
+                if (g_dbglog) {
+                    fprintf(g_dbglog, "[FIX-GRELHA7] folha recortada: classe=%s "
+                        "bmp=%dx%d pat=%d dir=%d fonte=%s -> src=(%d,%d,%d,%d)\n",
+                        cls, s->bitmap->width, s->bitmap->height, pat, dir,
+                        (mrb_nil_p(src) ? "self" : "char/event"),
+                        s->src_x, s->src_y, cw, ch);
+                    fflush(g_dbglog);
+                }
+            }
+        }
 
         /* [DIAG SETAS] Generico: deteta uma TIRA de animacao (sprite-sheet
          * horizontal) desenhada SEM recorte de frame (src_rect por definir) ->
@@ -425,6 +511,44 @@ static mrb_value spr_set_bitmap(mrb_state *mrb, mrb_value self) {
     if (s) {
         Bitmap3DS *bmp = resolve_bitmap(mrb, bobj);
         s->bitmap = bmp;
+
+        /* ── FIX GRELHA/RASTO (CAUSA RAIZ, provado pelo FRAMEDUMP) ───────────
+         * No RGSS verdadeiro, `sprite.bitmap = bmp` define AUTOMATICAMENTE
+         * src_rect = (0,0,bmp.width,bmp.height). Aqui isso FALTAVA: o @src_rect
+         * ficava NIL. O Sprite_Character (all_core 12093) faz
+         *     self.src_rect.set(pattern*cw, dir*ch, cw, ch)
+         * mas `self.src_rect` devolvia NIL e `nil.set(...)` cai no patch do
+         * NilClass (no-op) -> o frame NUNCA era recortado -> a folha 4x4
+         * inteira (256x256) aparecia -> jogador e Pokemon repetidos em grelha.
+         * O FRAMEDUMP (botao Y) provou-o: TODO o Sprite_Character tinha
+         * src=[0,0,0,0] (s->src_w=0 -> o blit usa bitmap->width = folha toda).
+         *
+         * Solucao RGSS-correcta: inicializar/repor @src_rect para o bitmap
+         * INTEIRO sempre que bitmap= e' chamado. O `.set(...)` do jogo, logo a
+         * seguir (mesma passagem de Sprite_Character#update), recorta este Rect
+         * para 1 frame; o live-read em sprites_draw_all le' entao o Rect ja'
+         * recortado e poe s->src_w/h = cw/ch. Reutiliza o Rect existente (sem
+         * churn de GC -- Sprite_Character chama bitmap= todos os frames p/
+         * charsets animados) ou cria um se ainda for nil. */
+        if (bmp) {
+            const int bw = bmp->width, bh = bmp->height;
+            mrb_value ro = mrb_iv_get(mrb, self, mrb_intern_lit(mrb, "@src_rect"));
+            if (mrb_nil_p(ro)) {
+                RClass *rk = mrb_class_get(mrb, "Rect");
+                mrb_value argv[4] = { mrb_fixnum_value(0), mrb_fixnum_value(0),
+                                      mrb_fixnum_value(bw), mrb_fixnum_value(bh) };
+                ro = mrb_obj_new(mrb, rk, 4, argv);
+                mrb_iv_set(mrb, self, mrb_intern_lit(mrb, "@src_rect"), ro);
+            } else {
+                /* repor dims no Rect existente (RGSS reseta src_rect em bitmap=) */
+                mrb_iv_set(mrb, ro, mrb_intern_lit(mrb, "@x"),      mrb_fixnum_value(0));
+                mrb_iv_set(mrb, ro, mrb_intern_lit(mrb, "@y"),      mrb_fixnum_value(0));
+                mrb_iv_set(mrb, ro, mrb_intern_lit(mrb, "@width"),  mrb_fixnum_value(bw));
+                mrb_iv_set(mrb, ro, mrb_intern_lit(mrb, "@height"), mrb_fixnum_value(bh));
+            }
+            s->src_x = 0; s->src_y = 0; s->src_w = bw; s->src_h = bh;
+        }
+
         /* DIAGNÓSTICO: log nas primeiras 20 chamadas */
         static int s_set_bmp_count = 0;
         s_set_bmp_count++;

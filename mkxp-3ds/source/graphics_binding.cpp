@@ -26,9 +26,22 @@ extern int g_dbglog_flushc;
 
 extern void inputBindingUpdate();
 
-static int  s_frame_rate  = 40;
+/* CLAMP do frame_rate. O jogo faz Graphics.frame_rate = 60, mas o New 3DS so'
+ * atinge ~20-30 FPS em mapas pesados. Como o movimento do Essentials e'
+ * frame-rate-INDEPENDENTE (move_speed_real = val*40/frame_rate; scroll idem),
+ * a velocidade real fica correta SE o FPS real == frame_rate declarado. Ao
+ * reportar 30 (em vez de 60), a logica do jogo calibra para 30 -> a 30 FPS
+ * reais o movimento fica a' velocidade de design (em vez de 1/3, que e' o
+ * descompasso 60-declarado-vs-20-reais que faz o jogo parecer camara lenta).
+ * Muda aqui o alvo se quiseres (20/40 sao "redondos" p/ a matematica /20). */
+#ifndef MKXP_FPS_CAP
+#define MKXP_FPS_CAP 30
+#endif
+
+static int  s_frame_rate  = MKXP_FPS_CAP;
 static int  s_frame_count = 0;
 static bool s_frozen      = false;
+static long long g_last_present_us = 0;   /* limitador de FPS por relogio (us) */
 
 static int  s_freeze_count      = 0;
 static int  s_transition_count  = 0;
@@ -219,13 +232,22 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
         }
     }
 
+    /* vsync + limitador por relogio (CORRIGIDO). O codigo antigo somava um
+     * "residual" FIXO depois do vblank: quando a logica ja' passava de 1 vblank
+     * (mapas pesados, >16.7ms), isso davam OVERSHOOT -- um frame de 25ms ficava
+     * 50ms. Aqui so' dormimos se o frame foi MAIS RAPIDO que o alvo; frames
+     * lentos passam direto (so' o vblank de vsync, como dantes). Isto mantem o
+     * cap no alvo (ex: 30) para os mapas leves nao correrem a 60 (rapido demais
+     * para a calibracao do jogo), sem penalizar os pesados. */
     gspWaitForVBlank();
-    if (s_frame_rate < 60 && s_frame_rate > 0) {
-        long long target_ns = 1000000000LL / s_frame_rate;
-        long long vblank_ns = 1000000000LL / 60;
-        long long residual  = target_ns - vblank_ns;
-        if (residual > 0) svcSleepThread(residual);
+    if (s_frame_rate > 0) {
+        long long frame_us = 1000000LL / s_frame_rate;          /* 30fps -> 33333us */
+        long long now_us   = (long long)osGetTime() * 1000LL;   /* osGetTime() = ms  */
+        long long elapsed  = now_us - g_last_present_us;
+        if (g_last_present_us != 0 && elapsed > 0 && elapsed < frame_us)
+            svcSleepThread((frame_us - elapsed) * 1000LL);      /* us -> ns */
     }
+    g_last_present_us = (long long)osGetTime() * 1000LL;
 
     return mrb_nil_value();
 }
@@ -291,8 +313,12 @@ static mrb_value grph_frame_rate_get(mrb_state *mrb, mrb_value self) {
 static mrb_value grph_frame_rate_set(mrb_state *mrb, mrb_value self) {
     (void)self; mrb_int v; mrb_get_args(mrb, "i", &v);
     int old = s_frame_rate;
-    s_frame_rate = (v < 1) ? 1 : (v > 120) ? 120 : (int)v;
-    printf("[GFX] frame_rate %d → %d\n", old, s_frame_rate);
+    int req = (int)v;
+    if (req < 1) req = 1;
+    if (req > MKXP_FPS_CAP) req = MKXP_FPS_CAP;   /* CLAMP: 60 pedido -> 30 efetivo */
+    s_frame_rate = req;
+    printf("[GFX] frame_rate pedido=%d -> efetivo=%d (cap=%d) [old=%d]\n",
+           (int)v, s_frame_rate, MKXP_FPS_CAP, old);
     return mrb_int_value(mrb, s_frame_rate);
 }
 static mrb_value grph_frame_count_get(mrb_state *mrb, mrb_value self) {

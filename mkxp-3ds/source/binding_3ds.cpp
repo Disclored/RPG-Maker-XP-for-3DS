@@ -493,6 +493,24 @@ static void show_error(mrb_state *mrb, const char *ctx_msg) {
     if (mrb->exc) { mrb->exc = 0; mesg = mrb_nil_value(); }
     const char *msg = mrb_string_p(mesg) ? RSTRING_PTR(mesg) : "(no message)";
 
+    /* #4: erros benignos de ORDEM DE LOAD -- o metodo EXISTE e funciona em runtime
+     * (verificado em base_scripts/plugins); o plugin so' o chamou antes de a classe
+     * o ter definido. Rebaixar de [ERROR] p/ [LOADORDER] e NAO despejar backtrace,
+     * para nao alarmar nem floodar. Lista fechada de metodos confirmados. */
+    {
+        static const char *benign_lo[] = {
+            "pbGetMoveScoreFunctionCode", "compile_encounters", "convert_files",
+            "setUp", "DependentEventSprites", "heal_party", NULL
+        };
+        if (mrb_string_p(mesg)) {
+            for (int bi = 0; benign_lo[bi]; bi++) {
+                if (strstr(msg, benign_lo[bi])) {
+                    DBGLOG("[LOADORDER] %s: %s (metodo existe em runtime -- benigno)\n", ctx_msg, msg);
+                    return;
+                }
+            }
+        }
+    }
     DBGLOG("[ERROR] %s: %s: %s\n", ctx_msg, cls, msg);
 
     mrb_value bt = mrb_funcall(mrb, exc, "backtrace", 0);
@@ -1083,10 +1101,19 @@ mrb_define_module_function(mrb, dbg_mod, "log",
                 verbose = mrb_test(v);
             }
             if (!verbose && s) {
-                /* prefixos de alta-frequencia a suprimir (comparacao barata) */
+                /* prefixos de alta-frequencia a suprimir quando NAO-verbose.
+                 * Estes probes correm por-frame/por-redraw e cada linha escreve
+                 * ao SD (~ms). Sao SO diagnostico -> suprimidos por defeito agora
+                 * que o jogo arranca. $MKXP_VERBOSE=true reativa-os.
+                 * Prefixos sem ']' apanham variantes (ex. [DIAG-DT]/[DIAG-DT-TXT]). */
                 static const char *noisy[] = {
                     "[SM#update]", "[PRB]", "[MISSING-DET]", "[MISSING]",
-                    "[SM#update", "[CHK]", NULL
+                    "[SM#update", "[CHK]",
+                    "[SPRDUMP", "[DLG", "[DIAG", "[TF]", "[TCMD]", "[MOVEDBG",
+                    "[WSKIN-PROBE", "[CFIX", "[CORNERFIX", "[BACKFILL", "[BOXFIT",
+                    "[PLANE-DIAG", "[MAPDUMP", "[MEVENT", "[SEQ>", "[TSTAT",
+                    "[SHEET?", "[CARTAO", "[SPRGUARD", "[DEPGUARD",
+                    NULL
                 };
                 for (int i = 0; noisy[i]; i++) {
                     size_t n = strlen(noisy[i]);
@@ -1355,6 +1382,51 @@ begin
     end
   end
 rescue; end
+
+# -- CORRECAO #4a/#4b/#4-heal: metodos em falta (ANTES dos scripts/plugins) -----
+# round/Numeric e Dir.delete faltam mesmo no port; heal_party e' chamado por um
+# plugin sem receiver (devia ser $Trainer.heal_party). Definidos cedo para os
+# plugins (Tileset Rearranger / Marin's Map Exporter / Following Pkmn) carregarem
+# sem erro. Guardas 'unless' garantem que NAO substituem nada que ja' exista.
+begin
+  class Numeric
+    unless method_defined?(:round)
+      def round(ndigits = 0)
+        if ndigits <= 0
+          (self >= 0 ? (self + 0.5).to_i : (self - 0.5).to_i)
+        else
+          f = 10.0 ** ndigits
+          v = self * f
+          v = (v >= 0 ? (v + 0.5).to_i : (v - 0.5).to_i)
+          v / f
+        end
+      end
+    end
+  end
+rescue; end
+begin
+  if Object.const_defined?(:Dir)
+    class << Dir
+      unless respond_to?(:delete)
+        def delete(*); 0; end            # no-op seguro (ferramentas de export; sem efeito no jogo)
+        alias_method :rmdir,  :delete rescue nil
+        alias_method :unlink, :delete rescue nil
+      end
+    end
+  end
+rescue; end
+begin
+  module Kernel
+    unless method_defined?(:heal_party) || private_method_defined?(:heal_party)
+      def heal_party
+        t = ($Trainer rescue nil); t = ($player rescue nil) if t.nil?
+        t.heal_party if t.respond_to?(:heal_party)
+      end
+      module_function :heal_party
+    end
+  end
+rescue; end
+# -- FIM CORRECAO #4a/#4b/#4-heal -----------------------------------------------
 
 # -- DependentEvents stub -------------------------------------------------------
 # Game_DependentEvents (script 50) esta blankeado (Fix 8) -- a classe nao existe.
@@ -1749,7 +1821,12 @@ begin
     def self.exist?(p);       __mkxp_exist?(p); end
     def self.exists?(p);      __mkxp_exist?(p); end
     def self.file?(p);        __mkxp_exist?(p); end
-    def self.directory?(p);   false; end
+    def self.directory?(p)
+      return false if !p
+      s = p.to_s
+      return false if s.empty?
+      (Bitmap._native_dir_exist?(s) rescue false)
+    end
     def self.audio_exist?(p); __mkxp_exist?(p); end
     def self.size?(p);        nil;   end
     def self.zero?(p);        true;  end
@@ -1855,6 +1932,36 @@ rescue => e
   (MKXPDebug.log("[TILEWRAP] override falhou: #{e.class}: #{e.message}") rescue nil)
 end
 
+# -- CustomTilemap: forcar extracao dos tiles de PRIORIDADE (pos-scripts) ------
+# RAIZ PROVADA (casa invisivel / arvore cortada a meio / objetos cortados): os
+# tilesets do jogo sao gigantes (ex: 256x31040) e excedem o limite de textura do
+# 3DS (1024) -> ficam sem textura GPU. No getRegularTile, com @diffsizes=false (o
+# caso normal: tile 32 == fonte 32), o sprite do tile de PRIORIDADE aponta DIRETO
+# ao tileset gigante (que nao tem textura) -> nao desenha. Por isso todo o topo
+# (telhados, copas de arvores, topo de moveis) fica invisivel, enquanto o layer0
+# (chao, composto por blt software, sem precisar de textura) aparece bem.
+# FIX: forcar o caminho @diffsizes -> o Essentials EXTRAI cada tile para um bitmap
+# 32x32 proprio (que TEM textura), usando stretchBlitWrappedPixels (que o override
+# de TileWrap acima ja' torna num blt direto, valido a qualquer Y ate' 31040).
+# Aplica-se a TODAS as instancias de CustomTilemap e auto-corrige no refresh
+# seguinte. So' mexe nos tiles de prioridade; o chao continua exatamente igual.
+begin
+  if Object.const_defined?(:CustomTilemap)
+    class CustomTilemap
+      alias_method :__df_orig_getRegularTile, :getRegularTile
+      def getRegularTile(sprite, id)
+        @diffsizes = true
+        __df_orig_getRegularTile(sprite, id)
+      end
+    end
+    (MKXPDebug.log("[DIFFSIZES] getRegularTile -> extracao p/ bitmap pequeno (tiles de prioridade aparecem)") rescue nil)
+  else
+    (MKXPDebug.log("[DIFFSIZES] CustomTilemap ausente -- override NAO aplicado") rescue nil)
+  end
+rescue => e
+  (MKXPDebug.log("[DIFFSIZES] override falhou: #{e.class}: #{e.message}") rescue nil)
+end
+
 module PluginManager
   def self.register(hash); end
   def self.runPlugins; end
@@ -1905,6 +2012,42 @@ module Game
       end
     rescue => e
       dbg "[Game.init] GameData.load_all geral: #{e.message}"
+    end
+    # ---- #7 GPS-FIX: get_player robusto, AGORA que GameData::Metadata.load correu ----
+    # O picker "what picture you'd like to use?" constroi o caminho da imagem a
+    # partir de GameData::Metadata.get_player(i)[0], que DEVIA ser o simbolo do
+    # treinador. O marshal do port le' o [0] como 0 -> pede 'PlayerSprites/0' ->
+    # falha -> paineis vazios. Aqui (logo apos o load do Metadata, ~t=6.46s, muito
+    # antes do picker abrir ~t=46s) instalamos um get_player que, se o [0] vier bom,
+    # confia; senao usa a lista real do metadata.dat, preservando o resto do array.
+    # Idempotente (guarda no alias). NB: se o roster mudar, atualizar a lista.
+    begin
+      if defined?(GameData) && GameData.const_defined?(:Metadata)
+        __MD = GameData::Metadata
+        unless __MD.respond_to?(:__mkxp_orig_get_player)
+          __MD.singleton_class.send(:alias_method, :__mkxp_orig_get_player, :get_player)
+          __MD.define_singleton_method(:get_player) do |id|
+            meta = (__mkxp_orig_get_player(id) rescue nil)
+            if meta.is_a?(Array) && meta[0] && !meta[0].is_a?(Integer)
+              next meta
+            end
+            tbl = [:POKEMONTRAINER_Sorin, :POKEMONTRAINER_Soleil, :POKEMONTRAINER_Luan,
+                   :POKEMONTRAINER_Lusine, :POKEMONTRAINER_Ethan, :POKEMONTRAINER_Lyra,
+                   :POKEMONTRAINER_Lucas, :POKEMONTRAINER_Dawn, :POKEMONTRAINER_Black,
+                   :POKEMONTRAINER_White]
+            if id.is_a?(Integer) && id >= 0 && id < tbl.size
+              rest = (meta.is_a?(Array) && meta.size > 1) ? meta[1..-1] : []
+              next ([tbl[id]] + rest)
+            end
+            meta
+          end
+          dbg "[GPS-FIX] get_player robusto instalado (em Game.init, Metadata carregado)"
+        end
+      else
+        dbg "[GPS-FIX] AVISO: GameData::Metadata ausente em Game.init"
+      end
+    rescue => e
+      dbg "[GPS-FIX] falhou em Game.init: #{e.class}: #{e.message}"
     end
     dbg "[Game.init] Game.initialize concluido"
   end
@@ -2707,6 +2850,24 @@ begin
           rescue
             noext_ws = sw
           end
+          # ── Redirect de windowskins CONHECIDAS em falta no JOGO ──────────────
+          # 'speech black' e' pedida pela janela de NOME do orador (plugin, quando
+          # isDark==true: setSkin("Graphics/Windowskins/speech black")), mas esse
+          # ficheiro NAO existe nos Graphics deste jogo -> a box do nome ("Auntie")
+          # ficava magenta/invisivel. Caimos numa skin EXISTENTE para a box
+          # aparecer. So' actua se 'speech black' realmente NAO existir: se a
+          # adicionares a Graphics/Windowskins/, passa a usar a tua.
+          begin
+            __ws_missing = { "Graphics/Windowskins/speech black" => "Graphics/Windowskins/speech bw 1" }
+            if __ws_missing.key?(noext_ws) && !(safeExists?(noext_ws + ".png") rescue false)
+              __ws_alt = __ws_missing[noext_ws]
+              if (safeExists?(__ws_alt + ".png") rescue false)
+                dbg "[BMP|WSKIN-REDIR] '#{noext_ws}' (em falta no jogo) -> '#{__ws_alt}'"
+                return __ws_alt
+              end
+            end
+          rescue
+          end
           dbg "[BMP|WSKIN-TRUST] '#{s}' -> '#{noext_ws}' (confia no loader)" if ($__mkxp_wskin_trust_logged ||= 0) < 4 && ($__mkxp_wskin_trust_logged += 1)
           return noext_ws
         end
@@ -3103,6 +3264,74 @@ rescue => e
   dbg "[WSKIN] forcar windowskin falhou: #{e.class}: #{e.message}"
 end
 # === /FORCAR windowskin ======================================================
+
+# -- WSKIN DINAMICO: usar o textskin/frame REAIS do save (nao o indice 0) ------
+# O patch acima (FORCAR windowskin) memoiza @@defaultTextSkin com o INDICE 0
+# ("speech se 1"), porque o pbGetSpeechFrame original falha (pbResolveBitmap nao
+# resolve caminhos relativos no 3DS e devolve "" -> caixa invisivel). Mas isso
+# IGNORA a skin que o jogador escolheu (Settings::SPEECH_WINDOWSKINS[textskin]).
+# Aqui substituimos pbGetSpeechFrame/pbGetSystemFrame para devolverem o caminho
+# DIRETO da skin do textskin/frame ATUAIS (lidos do save), sem pbResolveBitmap
+# (o loader C++ resolve o caminho na mesma, prefixando sdmc:/mkxp/game/). Assim
+# a caixa de fala usa exatamente a skin do jogo, igual ao PC. Re-resolve sempre
+# (nao memoiza) -> se o jogador mudar a skin nas opcoes, atualiza logo.
+# class << MessageConfig: funciona quer MessageConfig seja module quer class.
+begin
+  if Object.const_defined?(:MessageConfig) && defined?(Settings) && Settings.const_defined?(:SPEECH_WINDOWSKINS)
+    class << MessageConfig
+      def pbGetSpeechFrame
+        arr = Settings::SPEECH_WINDOWSKINS
+        return "Graphics/Windowskins/001-Blue01" if !arr.is_a?(Array) || arr.empty?
+        idx = ($PokemonSystem.textskin rescue 0) || 0
+        idx = 0 if idx < 0 || idx >= arr.length
+        return "Graphics/Windowskins/" + arr[idx].to_s
+      end
+      def pbGetSystemFrame
+        arr = (defined?(Settings) && Settings.const_defined?(:MENU_WINDOWSKINS)) ? Settings::MENU_WINDOWSKINS : nil
+        return MessageConfig.pbGetSpeechFrame if !arr.is_a?(Array) || arr.empty?
+        idx = ($PokemonSystem.frame rescue 0) || 0
+        idx = 0 if idx < 0 || idx >= arr.length
+        return "Graphics/Windowskins/" + arr[idx].to_s
+      end
+    end
+    (MKXPDebug.log("[WSKIN-DYN] speech/system frame dinamicos (usam textskin/frame REAIS do save)") rescue nil)
+  end
+rescue => e
+  (MKXPDebug.log("[WSKIN-DYN] override falhou: #{e.class}: #{e.message}") rescue nil)
+end
+# === /WSKIN DINAMICO =========================================================
+
+# -- SOMBRA do JOGADOR: seguir a posicao REAL do player no ecra ----------------
+# A sombra (Sprite_OWShadow) posiciona-se em @rsprite.x/y (o sprite principal do
+# personagem). No teu jogo o sprite principal do player fica DESALINHADO (a
+# sombra aparece no centro/mesa enquanto o player visivel esta' noutro sitio).
+# So' para a sombra do PLAYER (@event == $game_player), forcamos a posicao a
+# partir de $game_player.screen_x/screen_y -- onde o player e' REALMENTE
+# desenhado. No caso normal isto da' o mesmo valor (sem mexer); no caso bugado,
+# corrige. NPCs ficam intactos na logica original. Idempotente (alias 1x).
+begin
+  if Object.const_defined?(:Sprite_OWShadow)
+    class Sprite_OWShadow
+      unless method_defined?(:__df_orig_owshadow_update)
+        alias_method :__df_orig_owshadow_update, :update
+        def update
+          __df_orig_owshadow_update
+          begin
+            if @sprite && !@sprite.disposed? && @event && @event == $game_player
+              @sprite.x = @event.screen_x
+              @sprite.y = @event.screen_y
+            end
+          rescue
+          end
+        end
+      end
+    end
+    (MKXPDebug.log("[OWSHADOW-FIX] sombra do player segue screen_x/y de $game_player") rescue nil)
+  end
+rescue => e
+  (MKXPDebug.log("[OWSHADOW-FIX] falhou: #{e.class}: #{e.message}") rescue nil)
+end
+# === /SOMBRA do JOGADOR ======================================================
 
 # -- PROBE DA CAIXA DE TEXTO (diagnostico do problema "caixa invisivel") -------
 # A logica de pbMessage corre mas a janela nao aparece no ecra. Suspeita: a
@@ -4084,6 +4313,39 @@ begin
         def createSpritesets
           dbg "[createSpritesets] $MapFactory=#{$MapFactory.nil? ? 'NIL' : $MapFactory.class}"
           dbg "[createSpritesets] $game_map=#{$game_map.nil? ? 'NIL' : $game_map.class}"
+          # ===== FIX ECRA PRETO (entrar mapa ligado c/ tileset vizinho falhado) =====
+          # O wrapper INTERNO do porte (__orig_update_3ds__) foi instalado no BOOT,
+          # ANTES dos plugins. O Following Pokemon EX / EBDX embrulham
+          # Spriteset_Map#update POR CIMA dele, por isso os crashes deles (ex:
+          # "cannot set instance variable" quando o tileset do mapa vizinho falha
+          # -> magenta) ESCAPAM ao guard interno e MATAM o createSpritesets ->
+          # Graphics.transition() nunca corre -> ECRA PRETO/CONGELADO.
+          # Aqui instalamos (1x, ja' com os plugins carregados) um wrapper EXTERNO
+          # que apanha esses crashes: o mapa ACTUAL continua a desenhar; so' o
+          # update do vizinho partido e' saltado. Resolve o preto sem tocar no jogo.
+          unless $__ss_outer_guard_installed
+            $__ss_outer_guard_installed = true
+            begin
+              if Object.const_defined?(:Spriteset_Map) && Spriteset_Map.method_defined?(:update) &&
+                 !Spriteset_Map.method_defined?(:__ss_outer_orig_update)
+                Spriteset_Map.class_eval do
+                  alias_method :__ss_outer_orig_update, :update
+                  def update(*a)
+                    begin
+                      __ss_outer_orig_update(*a)
+                    rescue => _e
+                      $__ss_outer_n = ($__ss_outer_n || 0) + 1
+                      (dbg "[SS-OUTER-GUARD] update protegido (#{$__ss_outer_n}): #{_e.class}: #{_e.message}") if $__ss_outer_n <= 3
+                      nil
+                    end
+                  end
+                end
+                dbg "[SS-OUTER-GUARD] wrapper EXTERNO de Spriteset_Map#update instalado (apanha plugins: Following Pkmn EX / EBDX)"
+              end
+            rescue => _ge
+              dbg "[SS-OUTER-GUARD] instalacao falhou: #{_ge.class}: #{_ge.message}"
+            end
+          end
           begin
             maps = $MapFactory.maps rescue nil
             dbg "[createSpritesets] $MapFactory.maps=#{maps.nil? ? 'NIL' : "Array(#{maps.size})"}"
@@ -4099,6 +4361,11 @@ begin
             begin
               bt = e.backtrace
               bt[0,10].each_with_index { |l,i| dbg "[createSpritesets]   bt[#{i}]: #{l}" } if bt
+            rescue; end
+            # RECUPERACAO anti-ecra-preto: libertar o freeze mesmo que algo escape.
+            begin
+              Graphics.transition(0)
+              dbg "[createSpritesets] RECUPERACAO: Graphics.transition(0) forcado (anti-ecra-preto)"
             rescue; end
           end
         end
@@ -4854,7 +5121,10 @@ begin
   def pbGetAutotile(name)
     name = name.to_s rescue ""
     if name.nil? || name == ""
-      dbg "[BMP] pbGetAutotile: nome vazio -> fallback 96x128"
+      unless $__mkxp_autotile_empty_logged
+        $__mkxp_autotile_empty_logged = true
+        dbg "[BMP] pbGetAutotile: nome vazio -> fallback 96x128 (slot autotile vazio = NORMAL; log 1x)"
+      end
       return BitmapWrapper.new(96, 128)
     end
     dbg "[BMP] pbGetAutotile: tentando 'Graphics/Autotiles/#{name}'"
@@ -5772,6 +6042,237 @@ begin
   end
   # ---- FIM DIAGNOSTICO appearance -------------------------------------------
 
+  # ---- CORRECAO #7: ecra preto do picker GenderPickSelection -----------------
+  # Causa: a cena "what picture you'd like to use?" constroi o caminho da imagem
+  # a partir de GameData::Metadata.get_player(i)[0], que DEVIA ser o simbolo do
+  # treinador (ex. :POKEMONTRAINER_Sorin). No metadata.dat o dado esta' correto
+  # (player_A..player_H + player_K/_L = 10 jogadores), MAS o marshal do port le'
+  # o simbolo DENTRO do array como 0 -> meta[0]=0 -> pede "PlayerSprites/0" ->
+  # falha -> paineis vazios/escuros -> ecra preto.
+  # Fix (so' no port, runtime): se o [0] ja' veio bom, confia; senao usa a lista
+  # real extraida do metadata.dat deste jogo, PRESERVANDO o resto do array
+  # (charsets) quando o marshal so' estragou o [0]. Idempotente e protegido.
+  # NB: se o roster de jogadores do jogo mudar, atualizar a lista abaixo.
+  begin
+    if defined?(GameData) && GameData.const_defined?(:Metadata)
+      __MD = GameData::Metadata
+      unless __MD.respond_to?(:__mkxp_orig_get_player)
+        __MD.singleton_class.send(:alias_method, :__mkxp_orig_get_player, :get_player)
+        __MD.define_singleton_method(:get_player) do |id|
+          meta = (__mkxp_orig_get_player(id) rescue nil)
+          # [0] valido (simbolo ou string, NAO inteiro) -> usar tal e qual
+          if meta.is_a?(Array) && meta[0] && !meta[0].is_a?(Integer)
+            next meta
+          end
+          # lista correta (ordem A,B,C,D,E,F,G,H,K,L do metadata.dat)
+          tbl = [:POKEMONTRAINER_Sorin, :POKEMONTRAINER_Soleil, :POKEMONTRAINER_Luan,
+                 :POKEMONTRAINER_Lusine, :POKEMONTRAINER_Ethan, :POKEMONTRAINER_Lyra,
+                 :POKEMONTRAINER_Lucas, :POKEMONTRAINER_Dawn, :POKEMONTRAINER_Black,
+                 :POKEMONTRAINER_White]
+          if id.is_a?(Integer) && id >= 0 && id < tbl.size
+            rest = (meta.is_a?(Array) && meta.size > 1) ? meta[1..-1] : []
+            next ([tbl[id]] + rest)
+          end
+          meta  # nil para id>=10 -> quant_registered_player para' aqui (=> @realquant=10)
+        end
+        MKXPDebug.log("[GPS-FIX] get_player robusto instalado (picker usa nomes reais de treinador)") rescue nil
+      end
+    end
+  rescue => __egps
+    MKXPDebug.log("[GPS-FIX] falhou: #{__egps.class}: #{__egps.message}") rescue nil
+  end
+  # ---- FIM CORRECAO #7 -------------------------------------------------------
+
+  # ---- CORRECAO #8: crash terrain_tag->valid? (Integer < nil) no mapa exterior ----
+  # Overworld Shadows chama terrain_tag(x,y) durante o Spriteset init; se a coord
+  # OU width/height vier nil (mapa ainda nao pronto), valid? faz "Integer < nil" e
+  # rebenta (ArgumentError). Guarda: coord/dimensao nil => tile invalido (false).
+  # So' previne o crash -- uma query a coordenada nil nunca seria valida na mesma.
+  begin
+    if Object.const_defined?(:Game_Map) && Game_Map.method_defined?(:valid?) &&
+       !Game_Map.method_defined?(:__mkxp_orig_valid?)
+      Game_Map.send(:alias_method, :__mkxp_orig_valid?, :valid?)
+      Game_Map.send(:define_method, :valid?) do |x, y|
+        next false if x.nil? || y.nil?
+        w = (width rescue nil); h = (height rescue nil)
+        next false if w.nil? || h.nil?
+        (x >= 0 && x < w && y >= 0 && y < h)
+      end
+      MKXPDebug.log("[VALIDFIX] Game_Map#valid? robusto a coord/dimensao nil (anti-crash owshadow)") rescue nil
+    end
+  rescue => __ev8
+    MKXPDebug.log("[VALIDFIX] falhou: #{__ev8.class}: #{__ev8.message}") rescue nil
+  end
+  # ---- FIM CORRECAO #8 -------------------------------------------------------
+
+  # ---- LOG CIRURGICO #9: 'cannot set instance variable' (Following Pkmn) --------
+  # Nao-fatal (o port recupera) mas queremos a causa EXACTA: que classe e que ivar.
+  # Envolve Object#instance_variable_set SO' para apanhar a 1a falha, regista
+  # classe+ivar+receiver, e depois RESTAURA o metodo original (zero peso por-frame
+  # dai em diante). Re-lanca o erro -> comportamento inalterado (o port recupera).
+  begin
+    unless $__mkxp_ivset_diag
+      $__mkxp_ivset_diag = true
+      class Object
+        alias_method :__mkxp_orig_ivset, :instance_variable_set
+        def instance_variable_set(name, val)
+          __mkxp_orig_ivset(name, val)
+        rescue => __eiv
+          begin
+            MKXPDebug.log("[IVSET-DIAG] FALHOU set #{name} em classe=#{self.class} " \
+                          "val=#{val.class} (#{__eiv.class}: #{__eiv.message})")
+          rescue; end
+          # auto-remover: repor o metodo C original para nao pesar mais
+          Object.send(:alias_method, :instance_variable_set, :__mkxp_orig_ivset) rescue nil
+          raise
+        end
+      end
+      MKXPDebug.log("[IVSET-DIAG] sonda instance_variable_set instalada (auto-removivel)") rescue nil
+    end
+  rescue => __ed9
+    MKXPDebug.log("[IVSET-DIAG] instalacao falhou: #{__ed9.class}: #{__ed9.message}") rescue nil
+  end
+  # ---- FIM LOG #9 ------------------------------------------------------------
+
+  # ---- PERF: throttle de Sprite_Character FORA do ecra (mapa ativo) -----------
+  # O J3 trata dos mapas VIZINHOS, mas no mapa exterior o mapa ATIVO tem dezenas
+  # de NPCs (no log: 54). Sprite_Character#update corre p/ TODOS a 30fps, mesmo
+  # os que estao muito fora do ecra (invisiveis). Aqui saltamos o update desses
+  # sprites em 2 de cada 3 frames -- so' os CLARAMENTE fora do ecra (margem
+  # generosa de ~3 tiles para nunca afetar nada visivel). Quando o sprite entra
+  # na margem, volta a 30fps e sincroniza ANTES de ficar visivel (sem "pop").
+  # A posicao logica do NPC (real_x/real_y) e' do jogo e nao e' tocada -- so' a
+  # SINCRONIZACAO do sprite e' adiada. Reversivel: $MKXP_PERF_OFFSCREEN=false.
+  begin
+    $MKXP_PERF_OFFSCREEN = true if $MKXP_PERF_OFFSCREEN.nil?
+    $__os_skipped = 0; $__os_ran = 0
+    if Object.const_defined?(:Sprite_Character) &&
+       Sprite_Character.method_defined?(:update) &&
+       !Sprite_Character.method_defined?(:__mkxp_os_orig_update)
+      Sprite_Character.send(:alias_method, :__mkxp_os_orig_update, :update)
+      Sprite_Character.send(:define_method, :update) do |*a|
+        if $MKXP_PERF_OFFSCREEN
+          c = (@character rescue nil)
+          if c
+            sx = (c.screen_x rescue nil); sy = (c.screen_y rescue nil)
+            # ecra util 0..512 x 0..384; margem 96px (~3 tiles) p/ seguranca
+            if sx && sy && (sx < -96 || sx > 608 || sy < -96 || sy > 480)
+              @__os_n = (@__os_n || 0) + 1
+              if (@__os_n % 3) != 0
+                $__os_skipped += 1
+                next   # fora do ecra: salta 2 de 3 frames
+              end
+            end
+          end
+        end
+        $__os_ran += 1
+        __mkxp_os_orig_update(*a)
+      end
+      MKXPDebug.log("[OFFSCREEN] throttle de Sprite_Character fora-do-ecra instalado (every=3, flag $MKXP_PERF_OFFSCREEN)") rescue nil
+    end
+  rescue => __eos
+    MKXPDebug.log("[OFFSCREEN] instalacao falhou: #{__eos.class}: #{__eos.message}") rescue nil
+  end
+  # ---- FIM PERF offscreen ----------------------------------------------------
+
+  # ---- PERF + CORRECAO: screen_y_ground nativo & offset de escadas ------------
+  # O acelerador (compat_stubs.h, corre antes a ~t=3.95s) ja' poe screen_x/y/z
+  # do Game_Character em C nativo. Mas ficaram DOIS problemas, que tratamos aqui
+  # (este bloco corre DEPOIS, a ~t=4.0s, e e' independente da ordem porque so'
+  # usa __gc_native_* que sao registados no arranque):
+  #
+  #  (1) PERF: screen_y_ground NAO foi acelerado e e' chamado p/ os 54 eventos
+  #      TODOS os frames dentro de Game_Event#should_update? (a par de screen_x).
+  #      Ou seja, metade da verificacao de visibilidade dos eventos ficou em
+  #      Ruby. Aqui aceleramo-la SEM tocar no essentials_accel_3ds.cpp: quando o
+  #      character NAO esta' a saltar, __gc_native_screen_y devolve exatamente
+  #      acc_screen_y_ground (== screen_y_ground). A saltar (raro, e quase sempre
+  #      on-screen) devolve nil e caimos no Ruby. Valores IDENTICOS ao Ruby.
+  #
+  #  (2) CORRECAO de compatibilidade: a ligacao do compat_stubs devolve screen_x
+  #      e screen_y do NATIVO, que NAO inclui o offset do plugin "Terrain Tag
+  #      Side Stairs" (@real_offset_x/@real_offset_y). Resultado: nas escadas, os
+  #      sprites ficam desalinhados ate' alguns pixels durante o movimento. Aqui
+  #      re-definimos screen_x/screen_y = nativo + offset -> rapido E correto.
+  #      O caso de salto cai no fallback (que ja' inclui o offset e o arco).
+  #
+  # Idempotente. Reversivel: $MKXP_PERF_SCREENFIX=false (volta ao estado do
+  # compat_stubs, i.e. nativo sem offset + screen_y_ground em Ruby).
+  begin
+    $MKXP_PERF_SCREENFIX = true if $MKXP_PERF_SCREENFIX.nil?
+    if $MKXP_PERF_SCREENFIX &&
+       Object.const_defined?(:Game_Character) &&
+       Game_Character.method_defined?(:__gc_native_screen_x) &&
+       Game_Character.method_defined?(:__gc_native_screen_y) &&
+       Game_Character.method_defined?(:screen_y_ground) &&
+       !Game_Character.method_defined?(:__mkxp_screenfix)
+      class Game_Character
+        def __mkxp_screenfix; true; end
+        # fallbacks = versao atual (a do compat_stubs p/ x/y; a base Ruby p/ y_ground)
+        alias_method :__sfx_fallback_sx,  :screen_x
+        alias_method :__sfx_fallback_sy,  :screen_y
+        alias_method :__sfx_fallback_syg, :screen_y_ground
+        def screen_x
+          n = __gc_native_screen_x(self)
+          return __sfx_fallback_sx if n.nil?   # sem mapa: Ruby (ja' c/ offset)
+          n + (@real_offset_x || 0)            # nativo + offset escadas
+        end
+        def screen_y
+          n = __gc_native_screen_y(self)       # nil se a saltar / sem mapa
+          return __sfx_fallback_sy if n.nil?   # salto: Ruby (arco + offset)
+          n + (@real_offset_y || 0)            # nativo + offset escadas
+        end
+        def screen_y_ground
+          n = __gc_native_screen_y(self)       # NAO salta: == screen_y_ground
+          n.nil? ? __sfx_fallback_syg : n      # salto/sem-mapa: Ruby
+        end
+      end
+      MKXPDebug.log("[SCREENFIX] screen_x/y nativos+offset-escadas e screen_y_ground nativo instalados") rescue nil
+    end
+  rescue => __esfx
+    MKXPDebug.log("[SCREENFIX] instalacao falhou: #{__esfx.class}: #{__esfx.message}") rescue nil
+  end
+  # ---- FIM PERF screenfix ----------------------------------------------------
+
+  # ---- FIX menu Voltseon: menu_icon_width chama load_bitmap com 1 arg --------
+  # O CALLMENU-DIAG capturou o backtrace do crash do menu de pausa:
+  #   quicksave_update -> call_menu -> ... -> new -> initialize -> menu_icon_width
+  #   -> load_bitmap  (ArgumentError "given 1, expected 2").
+  # Causa REAL: o plugin (PokemonTemp#menu_icon_width) chama
+  #   RPG::Cache.load_bitmap(MENU_FILE_PATH + "menuDebug")  -> 1 caminho combinado,
+  # mas o load_bitmap do jogo e' load_bitmap(folder, filename, hue=0) (2 args:
+  # faz path = folder + filename). Como menuDebug.png EXISTE, o safeExists? da'
+  # true, o ramo corre e rebenta -> menu morto + picos ~50ms.
+  # Re-implementamos menu_icon_width com a chamada CORRETA (2 args), protegido.
+  # Idempotente. Cobre a UNICA chamada load_bitmap de 1 arg do jogo todo.
+  begin
+    if Object.const_defined?(:PokemonTemp) &&
+       PokemonTemp.method_defined?(:menu_icon_width) &&
+       !PokemonTemp.method_defined?(:__mkxp_orig_menu_icon_width)
+      PokemonTemp.send(:alias_method, :__mkxp_orig_menu_icon_width, :menu_icon_width)
+      PokemonTemp.send(:define_method, :menu_icon_width) do
+        @menu_icon_width ||= begin
+          __w = 48
+          begin
+            __mp = (defined?(MENU_FILE_PATH) ? MENU_FILE_PATH : "Graphics/Pictures/Voltseon's Pause Menu/")
+            if (safeExists?(__mp + "menuDebug") rescue false)
+              __bmp = RPG::Cache.load_bitmap(__mp, "menuDebug")   # 2 args (CORRETO)
+              __w = __bmp.width
+              __bmp.dispose
+            end
+          rescue
+            __w = 48
+          end
+          __w
+        end
+      end
+      MKXPDebug.log("[MENUFIX] PokemonTemp#menu_icon_width corrigido (load_bitmap com 2 args)") rescue nil
+    end
+  rescue => __emf
+    MKXPDebug.log("[MENUFIX] falhou: #{__emf.class}: #{__emf.message}") rescue nil
+  end
+  # ---- FIM FIX menu Voltseon -------------------------------------------------
+
   def self.__mkxp_hook_scene(klass_name)
     return false unless (Object.const_defined?(klass_name) rescue false)
     klass = Object.const_get(klass_name)
@@ -5808,7 +6309,10 @@ begin
   def self.__mkxp_hook_global(meth)
     ok = Object.method_defined?(meth)
     ok ||= (Object.allocate.respond_to?(meth, true) rescue false) unless ok
-    return false unless ok
+    unless ok
+      MKXPDebug.log("[NAMEIN] #{meth} ausente -- este jogo nao usa este metodo (ignorado, benigno)") rescue nil
+      return false
+    end
     diag = "__diag_g_#{meth}".to_sym
     return true if Object.method_defined?(diag)
     Object.send(:alias_method, diag, meth)
@@ -6899,6 +7403,44 @@ end
 
     run_plugin_scripts(mrb, game_path);
 
+    /* ── CALLMENU-DIAG: wrapper de backtrace INNER a' sonda ───────────────────
+     * O menu de pausa rebenta com ArgumentError "given 1, expected 2" num metodo
+     * fundo do Voltseon Pause Menu que NAO consegui identificar estaticamente
+     * (call_menu/pbShowCommands/startComponent/initialize batem todos certo).
+     * A sonda (MENUGUARD) apanha o erro mas a versao em uso nao loga backtrace.
+     * Instalo este wrapper ANTES da sonda -> fica INNER -> apanha o erro primeiro,
+     * loga bt[0..11] (bt[0] = a chamada exata com aridade errada) e re-lanca para
+     * a sonda recuperar na mesma. Assim o proximo log da o ficheiro:linha exato.
+     * Idempotente; nao altera comportamento (a sonda continua a tratar). */
+    mrb_load_string(mrb, R"CMDIAG(
+begin
+  if defined?(Scene_Map) && Scene_Map.method_defined?(:call_menu) && !$__mkxp_callmenu_diag
+    $__mkxp_callmenu_diag = true
+    class Scene_Map
+      alias_method :__mkxp_diag_orig_call_menu, :call_menu
+      def call_menu(*a, &b)
+        begin
+          __mkxp_diag_orig_call_menu(*a, &b)
+        rescue ArgumentError => __cme
+          (MKXPDebug.log("[CALLMENU-DIAG] ArgumentError: #{__cme.message}") rescue nil)
+          __bt = (__cme.backtrace || [])
+          if __bt.empty?
+            (MKXPDebug.log("[CALLMENU-DIAG]   (sem backtrace)") rescue nil)
+          else
+            __bt[0, 12].each_with_index { |__ln, __i| (MKXPDebug.log("[CALLMENU-DIAG]   bt[#{__i}] #{__ln}") rescue nil) }
+          end
+          raise
+        end
+      end
+    end
+    (MKXPDebug.log("[CALLMENU-DIAG] wrapper de backtrace instalado (inner a' sonda)") rescue nil)
+  end
+rescue => __cmei
+  (MKXPDebug.log("[CALLMENU-DIAG] instalacao falhou: #{__cmei.class}: #{__cmei.message}") rescue nil)
+end
+)CMDIAG");
+    if (mrb->exc) { mrb->exc = 0; }
+
     /* Carregar debug_probe.rb DEPOIS dos scripts do jogo.
      * CRITICO: tem de ser aqui. Scene_Map, mainFunctionDebug e todas as
      * classes do jogo so existem depois dos 376 scripts terem sido
@@ -7588,10 +8130,46 @@ end
         MRB_ARGS_NONE());
     DBGLOG("[FIX4] __rebind_bitmapwrapper_init__ registado em Kernel OK\n");
 
+    /* ── PRE-FIX #4: round/Dir.delete ANTES dos scripts/plugins ──────────────
+     * Os plugins chamam .round e Dir.delete no proprio LOAD (~t=3s). O bloco MFD
+     * que os definia corre dentro de check_entry_methods a ~t=4s -> TARDE DEMAIS,
+     * logo davam [ERROR] 'undefined method round/delete'. Definimo-los aqui, antes
+     * de run_rmxp_scripts, para estarem prontos quando o 1o plugin carrega.
+     * Idempotente (unless method_defined?). */
+    mrb_load_string(mrb, R"PREFIX(
+begin
+  class Numeric
+    unless method_defined?(:round)
+      def round(ndigits = 0)
+        if ndigits && ndigits > 0
+          f = 10 ** ndigits
+          (((self * f) + (self >= 0 ? 0.5 : -0.5)).to_i).to_f / f
+        else
+          ((self + (self >= 0 ? 0.5 : -0.5)).to_i)
+        end
+      end
+    end
+  end
+rescue; end
+begin
+  class << Dir
+    def delete(*a); 0; end unless respond_to?(:delete)
+    alias_method :rmdir,  :delete rescue nil
+    alias_method :unlink, :delete rescue nil
+  end
+rescue; end
+)PREFIX");
+    if (mrb->exc) { mrb->exc = 0; }
+    DBGLOG("[PRE-FIX] Numeric#round + Dir.delete definidos ANTES dos scripts\n");
+
     // Carregar scripts (ainda vazia, mas vamos preencher)
     DBGLOG("[BOOT] passo 3/4: run_rmxp_scripts (carregar+correr 376 scripts -- FASE MAIS LONGA)...\n");
     run_rmxp_scripts(mrb, game_path);
     DBGLOG("[BOOT] passo 3/4 OK (scripts carregados e executados).\n");
+    /* NB: o #7 GPS-FIX (override de get_player) NAO fica aqui: GameData::Metadata
+     * so' e' carregado em Game.initialize (~t=6.46s), bem depois de este ponto
+     * (~t=3.72s). O override esta' instalado dentro de Game.initialize, logo a
+     * seguir a GameData::Metadata.load -- ver bloco [GPS-FIX] mais acima. */
 
     /* ---------------------------------------------------------------
      * REINIT CRÍTICO: Bitmap + BitmapWrapper + Sprite
