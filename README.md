@@ -126,6 +126,9 @@ All optimizations above were driven by real profiling data.
 
   * sound effects work
   * BGM/BGS streaming not implemented yet
+
+ ---
+
  
 ### 25/06/2026 — Fixing more Memory issues and Sprites bugs
 Some Screenshots Progress:
