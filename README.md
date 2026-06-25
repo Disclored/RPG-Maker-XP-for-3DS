@@ -126,3 +126,15 @@ All optimizations above were driven by real profiling data.
 
   * sound effects work
   * BGM/BGS streaming not implemented yet
+ 
+### 25/06/2026 — Fixing more Memory issues and Sprites bugs
+Some Screenshots Progress:
+<img width="538" height="290" alt="Captura de ecrã 2026-06-21 191029" src="https://github.com/user-attachments/assets/82162505-5f0f-435c-a44f-c9f51f0999eb" />
+<img width="627" height="449" alt="Captura de ecrã 2026-06-24 140227" src="https://github.com/user-attachments/assets/d10aea49-4914-4353-a24a-fb7d53a31662" />
+<img width="658" height="306" alt="Captura de ecrã 2026-06-18 202454" src="https://github.com/user-attachments/assets/96441403-59a2-468a-9da8-03c5d2319455" />
+<img width="730" height="512" alt="Captura de ecrã 2026-06-18 210938" src="https://github.com/user-attachments/assets/fe516b1a-59da-4988-a102-5f7a7d870db0" />
+<img width="587" height="454" alt="Captura de ecrã 2026-06-21 112132" src="https://github.com/user-attachments/assets/6eabef6f-c241-49d8-9393-a801fda3cb15" />
+<img width="613" height="399" alt="Captura de ecrã 2026-06-25 212628" src="https://github.com/user-attachments/assets/5f5965e5-bddf-4e86-9ee7-7a4c798e31f9" />
+<img width="550" height="369" alt="Captura de ecrã 2026-06-25 212634" src="https://github.com/user-attachments/assets/effdc0f9-b5fc-43ef-83ba-0f36eb0aec53" />
+<img width="593" height="344" alt="Captura de ecrã 2026-06-25 212640" src="https://github.com/user-attachments/assets/89ec40d6-2833-4d54-af40-08700109ea68" />
+
