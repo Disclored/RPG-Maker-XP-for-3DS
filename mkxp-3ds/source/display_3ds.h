@@ -25,8 +25,10 @@ struct DS3Texture {
 void        display_3ds_init();
 void        display_3ds_begin_frame();
 void        display_3ds_end_frame();
-DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba);
+DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba, bool prefer_vram = false);
 void        display_3ds_free_texture(DS3Texture* t);
+/* SUPERDBG: contagem/bytes das texturas vivas (out params podem ser NULL). */
+void        display_3ds_tex_stats(size_t* out_count, size_t* out_bytes, size_t* out_vram);
 /* [EVICT] Regista o slot do Bitmap dono (ex: &b->tex) na textura, para que a
  * eviccao on-demand possa libertar texturas idle em seguranca. Chamar logo
  * apos atribuir a textura ao dono: b->tex = create_texture(...);

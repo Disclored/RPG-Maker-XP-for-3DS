@@ -494,7 +494,7 @@ static inline int morton_offset(int x, int y, int tw) {
  * [DBG] Log com dimensões, POT, resultado do TexInit e valid=true/false.
  *       Cada falha indica a causa exacta.
  * ═══════════════════════════════════════════════════════════════════════════ */
-DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba) {
+DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba, bool prefer_vram) {
     /* [DBG] Argumento inválido */
     if (!rgba || w <= 0 || h <= 0) {
         printf("[TEX|CREATE] ERRO argumento inválido: w=%d h=%d rgba=%p\n",
@@ -523,8 +523,30 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba) 
                s_tex_log_count + 1, w, h, tw, th, (tw*th*4)/1024.0f);
     }
 
+    /* [fix #5] TILESET COMPACTADO marcado pelo probe (prefer_vram): tentar VRAM
+     * PRIMEIRO. Estes bitmaps sao estaticos (construidos 1x, never_dispose) e cabem
+     * num banco de VRAM (3MB). Po'-los em VRAM tira-os do heap linear -> este deixa
+     * de ser fragmentado por obstaculos pinned -> a camada do tilemap (4MB) passa a
+     * caber no linear contiguo. So' p/ texturas que CABEM num banco (<3MB); a camada
+     * de 4MB nunca entra aqui (>3MB) e fica no linear, como deve. Se a VRAM falhar
+     * (cheia), cai no caminho linear normal abaixo -> nunca pior que o atual. */
+    bool init_ok = false;
+    {
+        const unsigned VRAM_PREFER_MAX = 3072u * 1024; /* <3MB = cabe num banco */
+        unsigned want_v = (unsigned)(tw * th * 4);
+        if (prefer_vram && want_v < VRAM_PREFER_MAX &&
+            vramSpaceFree() >= (want_v + VRAM_OVERFLOW_KEEP)) {
+            if (C3D_TexInitVRAM(&tex->tex, (u16)tw, (u16)th, GPU_RGBA8)) {
+                init_ok = true;
+                tex->in_vram = true;
+                printf("[TEX|VRAM-PREFER] tileset %dx%d (%.0fKB) -> VRAM (libera heap linear)\n",
+                       tw, th, want_v/1024.0);
+            }
+        }
+    }
+
     /* Tenta o heap linear (FCRAM) primeiro — caminho normal. */
-    bool init_ok = C3D_TexInit(&tex->tex, (u16)tw, (u16)th, GPU_RGBA8);
+    if (!init_ok) init_ok = C3D_TexInit(&tex->tex, (u16)tw, (u16)th, GPU_RGBA8);
 
     /* [fix] Heap linear cheio? Encaminha texturas pequenas para a VRAM livre
      * em vez de falhar (e deixar a UI/texto por desenhar). Aditivo: so' corre
@@ -675,6 +697,20 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba) 
  * [DBG] Confirma que a textura era válida antes de libertar.
  *       Se free é chamado com valid=false, confirma bug upstream.
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* SUPERDBG: estatisticas das texturas vivas (lido por MKXPDebug.mem_info). */
+void display_3ds_tex_stats(size_t* out_count, size_t* out_bytes, size_t* out_vram) {
+    size_t n = s_live_texs.size(), bytes = 0, vram = 0;
+    for (size_t i = 0; i < s_live_texs.size(); i++) {
+        DS3Texture* t = s_live_texs[i];
+        if (!t) continue;
+        bytes += t->pot_bytes;
+        if (t->in_vram) vram += t->pot_bytes;
+    }
+    if (out_count) *out_count = n;
+    if (out_bytes) *out_bytes = bytes;
+    if (out_vram)  *out_vram  = vram;
+}
+
 void display_3ds_free_texture(DS3Texture* t) {
     if (!t) {
         printf("[TEX|FREE] chamado com t=NULL (double-free?)\n");

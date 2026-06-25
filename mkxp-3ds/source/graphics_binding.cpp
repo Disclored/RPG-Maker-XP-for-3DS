@@ -43,6 +43,12 @@ static int  s_frame_count = 0;
 static bool s_frozen      = false;
 static long long g_last_present_us = 0;   /* limitador de FPS por relogio (us) */
 
+/* FIX vsync judder (precipicio 30->20fps): ver bloco de pacing em grph_update.
+ * true  = pacing suave (frames lentos seguem ja', sem o salto 35ms->50ms);
+ * false = comportamento antigo (gspWaitForVBlank incondicional).
+ * volatile + nao-static: pode ser lido/escrito de fora (ex: toggle de debug). */
+volatile bool g_vsync_smooth = true;
+
 static int  s_freeze_count      = 0;
 static int  s_transition_count  = 0;
 static int  s_skipped_frames    = 0;
@@ -129,6 +135,40 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
      * mesmo frame fazem o segundo devolver keysDown=0 -> os triggers (ex: botao A
      * = Input::USE para avancar o titulo) sao limpos antes do jogo os ler. */
     inputBindingUpdate();
+
+    /* ── [FCRAM] VÁLVULA DE SEGURANÇA anti-OOM de OBJETOS (crash do roupeiro) ───
+     * O full_gc no freeze (grph_freeze) limpa o lixo ENTRE cenas. Mas um menu
+     * DENTRO do mapa — como o roupeiro/wardrobe deste jogo, que corre o seu
+     * proprio loop com Graphics.update sem nunca fazer freeze — acumula objetos
+     * orfaos no old-gen que o GC GERACIONAL so' recolhe num full GC. Forense do
+     * crash (log: troca de outfit): o working-set normal e' ~230K vivos, picos
+     * normais ate' ~590K; o menu do roupeiro escalou ate' 1.2M (970K orfaos) ->
+     * o heap REGULAR do mruby (malloc, onde vivem os RObject) esgotou -> a
+     * proxima alocacao de QUALQUER objeto falhou -> abort duro (o log termina
+     * a seco logo a seguir a CommonEvent #112). bmp_alloc nao crasha (cai p/
+     * linearAlloc); o que crasha e' o mruby sem RAM p/ objetos.
+     *
+     * Esta valvula forca um full GC quando os vivos passam um limiar seguro
+     * (720K: acima dos picos normais ~590K, bem abaixo do ponto de crash 1.2M),
+     * capando o pico. Cooldown de 30 frames p/ nunca fazer thrash (no max. 1
+     * full GC / 30 frames sob pressao). No jogo normal (sempre < limiar) NUNCA
+     * dispara -> custo zero. Generico p/ qualquer menu/churn in-map; mantem
+     * diagnostico no log sempre que atua. */
+    {
+        const size_t GC_VALVE_LIVE = 720000;
+        static int s_gc_valve_cooldown = 0;
+        if (s_gc_valve_cooldown > 0) {
+            s_gc_valve_cooldown--;
+        } else if ((size_t)mrb->gc.live > GC_VALVE_LIVE) {
+            size_t before = (size_t)mrb->gc.live;
+            mrb_full_gc(mrb);
+            s_gc_valve_cooldown = 30;
+            printf("[GC|VALVULA] vivos=%u > %u -> full_gc -> %u (recolheu %d) "
+                   "[frame %d] -- anti-OOM menu/churn in-map (crash do roupeiro)\n",
+                   (unsigned)before, (unsigned)GC_VALVE_LIVE, (unsigned)mrb->gc.live,
+                   (int)((long)before - (long)mrb->gc.live), s_frame_count);
+        }
+    }
 
     /* [DBG-A] Primeiros 3 frames: dump completo para confirmar estado inicial */
     if (s_frame_count < 3) {
@@ -239,13 +279,44 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
      * lentos passam direto (so' o vblank de vsync, como dantes). Isto mantem o
      * cap no alvo (ex: 30) para os mapas leves nao correrem a 60 (rapido demais
      * para a calibracao do jogo), sem penalizar os pesados. */
-    gspWaitForVBlank();
-    if (s_frame_rate > 0) {
-        long long frame_us = 1000000LL / s_frame_rate;          /* 30fps -> 33333us */
+    /* ── PACING SEM PRECIPICIO (FIX do salto 30->20fps) ───────────────────────
+     * O codigo anterior fazia gspWaitForVBlank() INCONDICIONAL. Como o ecra' do
+     * 3DS atualiza a 60Hz (vblank cada 16.7ms) e o alvo sao 30fps (2 vblanks =
+     * 33.3ms), um frame que demore so' um pouco MAIS que 33.3ms (ex: 35ms) perde
+     * a janela e e' empurrado para o PROXIMO vblank (~50ms) -> 20fps. E' o
+     * classico "vsync judder": basta passar 1ms do alvo para cair de 30 para 20.
+     * Como o C3D_FrameEnd (display_3ds_end_frame) ja' enfileira o swap e o GSP
+     * apresenta sincronizado com vblank, o gspWaitForVBlank extra so' servia para
+     * ESPACAR frames RAPIDOS. Agora:
+     *   - frame RAPIDO (abaixo do alvo): espera vblank + dorme ate' ao alvo
+     *     (cap suave a 30, sem tearing, como antes);
+     *   - frame LENTO (ja' passou do alvo): segue JA' para o proximo (o GSP
+     *     alinha o swap no vblank na mesma) -> 28fps em vez de 20fps.
+     * Reverter: substituir todo este bloco por um simples "gspWaitForVBlank();".
+     * Flag para desligar em runtime: g_vsync_smooth (default true). */
+    {
+        long long frame_us = (s_frame_rate > 0) ? (1000000LL / s_frame_rate) : 0;
         long long now_us   = (long long)osGetTime() * 1000LL;   /* osGetTime() = ms  */
-        long long elapsed  = now_us - g_last_present_us;
-        if (g_last_present_us != 0 && elapsed > 0 && elapsed < frame_us)
-            svcSleepThread((frame_us - elapsed) * 1000LL);      /* us -> ns */
+        long long elapsed  = (g_last_present_us != 0) ? (now_us - g_last_present_us)
+                                                      : frame_us;
+        if (!g_vsync_smooth || frame_us == 0) {
+            /* comportamento antigo (vsync incondicional) */
+            gspWaitForVBlank();
+            if (frame_us > 0) {
+                now_us  = (long long)osGetTime() * 1000LL;
+                elapsed = now_us - g_last_present_us;
+                if (g_last_present_us != 0 && elapsed > 0 && elapsed < frame_us)
+                    svcSleepThread((frame_us - elapsed) * 1000LL);
+            }
+        } else if (elapsed < frame_us) {
+            /* frame rapido: vsync + dorme o resto ate' ao alvo (cap a 30) */
+            gspWaitForVBlank();
+            now_us  = (long long)osGetTime() * 1000LL;
+            elapsed = now_us - g_last_present_us;
+            if (elapsed > 0 && elapsed < frame_us)
+                svcSleepThread((frame_us - elapsed) * 1000LL);
+        }
+        /* frame lento: sem espera extra -> evita o salto 35ms->50ms */
     }
     g_last_present_us = (long long)osGetTime() * 1000LL;
 

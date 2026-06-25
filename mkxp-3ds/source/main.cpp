@@ -13,6 +13,13 @@ extern void mkxp_3ds_cleanup();
  * estendida do New 3DS. No Old 3DS/2DS fica false e nada muda. */
 bool g_mkxp_is_new3ds = false;
 
+/* Resultado do ndspInit() guardado para o binding o registar no log de debug
+ * (que so' abre depois do init_services). Se for R_FAILED, NAO ha som nenhum:
+ * o DSP nao processa os wavebufs (no log isto aparece como "0 buffers de SE
+ * reciclados" e os 12 canais de SE a encherem e nunca libertarem). Causa quase
+ * sempre: falta o firmware do DSP (dspfirm.cdc). */
+s32 g_ndsp_init_result = 0;
+
 /* Deteta o modelo e, se for New 3DS, liga o clock de 804 MHz + cache L2 via
  * osSetSpeedupEnable. No Old 3DS/2DS isto e' inofensivo (no-op) e a flag fica
  * false. O ganho grande vem daqui: a logica Ruby e' single-thread e domina o
@@ -36,7 +43,19 @@ static void init_services() {
     C2D_Prepare();
     consoleInit(GFX_BOTTOM, NULL);
     romfsInit();
-    ndspInit();
+    /* ndspInit(): em 3DS real / emulador o DSP precisa do firmware (dspfirm.cdc).
+     * Se falhar, NAO ha som (BGM nem SE) -- o resto do jogo corre na mesma. Antes
+     * o resultado era ignorado; agora verificamos e avisamos no ecra de baixo. */
+    g_ndsp_init_result = ndspInit();
+    if (R_FAILED(g_ndsp_init_result)) {
+        printf("\n[AUDIO][FALHA] ndspInit rc=0x%08lX -> SEM SOM.\n", (unsigned long)g_ndsp_init_result);
+        printf("  Falta o firmware do DSP. Solucao:\n");
+        printf("   * 3DS REAL: corre uma vez o homebrew 'DSP1' (extrai dspfirm.cdc).\n");
+        printf("   * Azahar/Citra: Emulation>Configure>Audio = HLE (Output: cubeb/auto).\n");
+        printf("  Confirma tambem que o volume nao esta a 0 nem em silencio.\n\n");
+    } else {
+        printf("[AUDIO] ndspInit OK rc=0x%08lX (DSP disponivel)\n", (unsigned long)g_ndsp_init_result);
+    }
     audio_3ds_init();   /* subsistema de audio (SE/cries) -- depois de ndspInit */
 }
 

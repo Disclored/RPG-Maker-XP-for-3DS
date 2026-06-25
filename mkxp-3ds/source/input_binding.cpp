@@ -21,6 +21,20 @@ static bool s_released[RMXP_KEY_COUNT];
 static bool s_trigger_latch[RMXP_KEY_COUNT];
 static bool s_release_latch[RMXP_KEY_COUNT];
 
+/* FIX menu/Outfit nao fecham/avancam com B: o latch de trigger era
+ * SINGLE-CONSUME (inp_trigger lia E limpava). Com o mapa POR BAIXO do menu a
+ * ler trigger?(B) primeiro, o flanco era DRENADO antes de o menu/picker o ver
+ * (por isso o cartao fechava -- sem mapa por baixo -- mas o menu de pausa e o
+ * picker de Outfit nao). Como inputBindingUpdate corre UMA vez por frame
+ * (sincronizado com grph_update; Input.update Ruby e' no-op), nao precisamos de
+ * acumular: repomos a semantica RGSS NORMAL -- o latch reflecte o flanco DESTE
+ * frame (limpo a cada frame) e a leitura NAO consome, logo VARIOS leitores no
+ * mesmo frame veem o flanco (standard RGSS, que e' como Essentials foi escrito).
+ *   true  = novo comportamento (multi-leitor, corrige menus);
+ *   false = antigo (single-consume).
+ * REVERTER: por false aqui. */
+static bool g_trigger_multiread = true;
+
 /* Contador de frames que cada tecla esta' em baixo, para o Input.repeat? real
  * do RGSS. Sem isto, repeat? = press? (true em TODOS os frames) -> 1 toque
  * fisico (que dura ~4 frames) movia o cursor 4 vezes. */
@@ -41,9 +55,16 @@ void inputBindingUpdate() {
     for (int i = 0; i < RMXP_KEY_COUNT; i++) {
         s_triggered[i] = new_triggered[i];
         s_released[i]  = new_released[i];
-        /* acumula no latch: uma vez true, fica true ate o Ruby ler */
-        if (new_triggered[i]) s_trigger_latch[i] = true;
-        if (new_released[i])  s_release_latch[i]  = true;
+        if (g_trigger_multiread) {
+            /* latch = flanco DESTE frame (limpo automaticamente a cada frame ->
+             * leitura nao-consumidora; varios leitores veem-no). */
+            s_trigger_latch[i] = new_triggered[i];
+            s_release_latch[i] = new_released[i];
+        } else {
+            /* antigo: acumula no latch -- uma vez true, fica true ate o Ruby ler */
+            if (new_triggered[i]) s_trigger_latch[i] = true;
+            if (new_released[i])  s_release_latch[i]  = true;
+        }
         if (new_triggered[i]) s_pressed[i] = true;
         if (new_released[i])  s_pressed[i] = false;
         /* contar frames em baixo (para o repeat? real): incrementa enquanto
@@ -72,8 +93,8 @@ static mrb_value inp_press(mrb_state *mrb, mrb_value self) {
 static mrb_value inp_trigger(mrb_state *mrb, mrb_value self) {
     (void)self; mrb_int k; mrb_get_args(mrb, "i", &k);
     if (k>=0 && k<RMXP_KEY_COUNT && s_trigger_latch[k]) {
-        s_trigger_latch[k] = false;   /* consome o latch ao ler */
-        DBG(DBG_INPUT, "trigger? k=%d -> TRUE (latch consumido)", (int)k);
+        if (!g_trigger_multiread) s_trigger_latch[k] = false;   /* antigo: consome ao ler */
+        DBG(DBG_INPUT, "trigger? k=%d -> TRUE", (int)k);
         return mrb_true_value();
     }
     /* DIAGNOSTICO: o log por-frame de "trigger? -> false" disparava 2x por frame
@@ -108,7 +129,7 @@ static mrb_value inp_repeat(mrb_state *mrb, mrb_value self) {
 static mrb_value inp_release(mrb_state *mrb, mrb_value self) {
     (void)self; mrb_int k; mrb_get_args(mrb, "i", &k);
     if (k>=0 && k<RMXP_KEY_COUNT && s_release_latch[k]) {
-        s_release_latch[k] = false;   /* consome o latch ao ler */
+        if (!g_trigger_multiread) s_release_latch[k] = false;   /* antigo: consome ao ler */
         return mrb_true_value();
     }
     return mrb_false_value();

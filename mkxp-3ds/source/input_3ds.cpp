@@ -60,12 +60,14 @@ static inline void cpad_axis(bool* pressed, bool* released, int n,
 void input_3ds_poll(bool* pressed, bool* released, int n) {
     hidScanInput();
     u32 dn = hidKeysDown(), up = hidKeysUp();
-    /* DUMP-DE-FRAME: o botao Y, alem do seu uso normal no jogo (mapeado p/
-     * RMXP_A), pede um despejo completo do frame seguinte. So' regista a
-     * intencao aqui (flanco de pressao); o render le e limpa a flag. Nao
-     * consome o Y -- o jogo continua a receber A normalmente. */
+    /* DUMP-DE-FRAME: DESLIGADO. O botao Y e' usado p/ abrir o menu de pausa;
+     * cada Y disparava um despejo completo de todos os sprites para o cartao SD
+     * (dezenas de escritas), causando uma quebra de FPS ao abrir o menu. O
+     * despejo so' servia para diagnostico de sprites (ja' resolvido). Para
+     * reativar pontualmente, descomentar a linha abaixo. */
     extern volatile bool g_dump_frame_requested;
-    if (dn & KEY_Y) g_dump_frame_requested = true;
+    /* if (dn & KEY_Y) g_dump_frame_requested = true; */
+    (void)g_dump_frame_requested;
     for (int i = 0; i < MSIZ; i++) {
         int k = (int)MAP[i].key;
         if (k < 0 || k >= n) continue;

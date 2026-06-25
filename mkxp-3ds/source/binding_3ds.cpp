@@ -2,6 +2,7 @@
 #include <mruby.h>
 #include <mruby/string.h>
 #include <mruby/array.h>
+#include <time.h>
 #include <mruby/compile.h>
 #include <mruby/class.h>
 #include <mruby/variable.h>
@@ -14,6 +15,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <vector>
+#include <malloc.h>   /* SUPERDBG: mallinfo p/ MKXPDebug.mem_info (heap livre/usado) */
 #include "audio_3ds.h"
 #include "profile_3ds.h"
 
@@ -1127,6 +1129,29 @@ mrb_define_module_function(mrb, dbg_mod, "log",
         return mrb_nil_value();
     }, MRB_ARGS_REQ(1));
 
+    /* ── [SUPERDBG] MKXPDebug.mem_info -> string com a fotografia da memoria ────
+     * Linear livre (decodes de tilesets), heap malloc (livre/usado via mallinfo),
+     * texturas vivas (contagem + bytes POT + VRAM) e Bitmaps vivos. O probe chama
+     * isto no [SNAP] periodico. Tudo o que e' preciso p/ caçar fugas/fragmentacao
+     * num so' sitio, sem por-frame. */
+    mrb_define_module_function(mrb, dbg_mod, "mem_info",
+        [](mrb_state *mrb, mrb_value) -> mrb_value {
+            extern int g_live_bitmaps;
+            size_t tex_n = 0, tex_bytes = 0, tex_vram = 0;
+            display_3ds_tex_stats(&tex_n, &tex_bytes, &tex_vram);
+            struct mallinfo mi = mallinfo();
+            char buf[320];
+            snprintf(buf, sizeof(buf),
+                "linear_free=%.0fKB heap_free=%.0fKB heap_used=%.1fMB "
+                "texturas=%u tex_mem=%.0fKB tex_vram=%.0fKB bitmaps=%d",
+                linearSpaceFree() / 1024.0,
+                (double)mi.fordblks / 1024.0,
+                (double)mi.uordblks / 1048576.0,
+                (unsigned)tex_n, tex_bytes / 1024.0, tex_vram / 1024.0,
+                g_live_bitmaps);
+            return mrb_str_new_cstr(mrb, buf);
+        }, MRB_ARGS_NONE());
+
     /* ===========================================================================
      * AUDIO NATIVO (FASE 1: SE/cries via NDSP) -- substitui os stubs vazios do
      * modulo Audio (compat_stubs.h) por chamadas reais a audio_3ds.cpp. Cada
@@ -1326,9 +1351,13 @@ begin
         (idx >= 0 && idx < @data.length) ? (@data[idx] || 0) : 0
       end
       def []=(*args)
+        # args = [coord1, (coord2), (coord3), valor] -> o ultimo e' SEMPRE o valor,
+        # os anteriores sao coordenadas. Nao de' o nr de coords pela presenca de
+        # args[1], senao a forma 1D `t[i]=v` (=[]=(i,v)) trata o VALOR v como coord-y
+        # -> idx=v*@x+i (fora dos limites) -> escrita DESCARTADA (paredes passaveis).
         v   = args.last.to_i
         x   = args[0].to_i
-        y   = (args[1] || 0).to_i
+        y   = (args.length > 2 ? args[1] : 0).to_i
         z   = (args.length > 3 ? args[2] : 0).to_i
         idx = z * @x * @y + y * @x + x
         @data[idx] = v if idx >= 0 && idx < @data.length
@@ -1953,8 +1982,52 @@ begin
         @diffsizes = true
         __df_orig_getRegularTile(sprite, id)
       end
+
+      # -- PERF (quarto/interiores a 20fps): saltar a RE-RENDERIZACAO periodica
+      # de autotiles quando o mapa NAO tem autotiles animados. -----------------
+      # O Essentials, em CustomTilemap#update, corre `repaintAutotiles; refresh(true)`
+      # a cada Animated_Autotiles_Frames (=5 frames a 30fps) para animar agua/etc.
+      # refresh(true)->refreshLayer0(true) re-blita a camada de chao (ex: 832x704)
+      # a partir do tileset gigante. Num mapa sem nada animado (um quarto interior)
+      # isto re-desenha SEMPRE o mesmo -> ~40ms/frame de pico medido = ~20 fps mesmo
+      # sem nada a acontecer.
+      # refresh_autotiles JA' calcula quantos frames tem cada autotile (@framecount
+      # e a var local 'hasanimated'); replicamos esse teste, guardamo-lo, e tornamos
+      # as duas chamadas periodicas NO-OP quando nao ha animacao. O render estatico
+      # inicial (feito uma vez no load) mantem-se; o SCROLL (refresh(false)) e os
+      # mapas COM agua ficam exatamente iguais. Self-corrige: se houver mesmo um
+      # autotile animado, @__mkxp_hasanim fica true e tudo corre como o original.
+      alias_method :__mkxp_orig_refresh_autotiles, :refresh_autotiles
+      def refresh_autotiles
+        __mkxp_orig_refresh_autotiles
+        @__mkxp_hasanim = false
+        fc = @framecount
+        if fc.is_a?(Array)
+          i = 0
+          while i < 7
+            if fc[i] && fc[i] >= 2 ; @__mkxp_hasanim = true ; break ; end
+            i += 1
+          end
+        else
+          @__mkxp_hasanim = true   # sem info -> nao arriscar, deixa correr o original
+        end
+        (MKXPDebug.log("[TILEANIM] mapa hasanim=#{@__mkxp_hasanim} framecount=#{fc.inspect[0,40]}") rescue nil)
+      end
+
+      alias_method :__mkxp_orig_repaintAutotiles, :repaintAutotiles
+      def repaintAutotiles
+        return if @__mkxp_hasanim == false   # mapa sem autotiles animados -> nada a repintar
+        __mkxp_orig_repaintAutotiles
+      end
+
+      alias_method :__mkxp_orig_refresh_anim, :refresh
+      def refresh(autotiles = false)
+        return if autotiles && @__mkxp_hasanim == false   # so' salta a re-render de ANIMACAO
+        __mkxp_orig_refresh_anim(autotiles)
+      end
     end
     (MKXPDebug.log("[DIFFSIZES] getRegularTile -> extracao p/ bitmap pequeno (tiles de prioridade aparecem)") rescue nil)
+    (MKXPDebug.log("[TILEANIM] refresh/repaintAutotiles guardados (no-op sem autotiles animados -> interiores deixam de re-renderizar por frame)") rescue nil)
   else
     (MKXPDebug.log("[DIFFSIZES] CustomTilemap ausente -- override NAO aplicado") rescue nil)
   end
@@ -2019,25 +2092,49 @@ module Game
     # treinador. O marshal do port le' o [0] como 0 -> pede 'PlayerSprites/0' ->
     # falha -> paineis vazios. Aqui (logo apos o load do Metadata, ~t=6.46s, muito
     # antes do picker abrir ~t=46s) instalamos um get_player que, se o [0] vier bom,
-    # confia; senao usa a lista real do metadata.dat, preservando o resto do array.
-    # Idempotente (guarda no alias). NB: se o roster mudar, atualizar a lista.
+    # confia; senao recupera o nome do sprite a partir dos PROPRIOS dados do jogo
+    # (charset "trainer_<TIPO>" em meta[1], ou varrendo a pasta PlayerSprites/),
+    # preservando o resto do array. Sem nomes hardcoded -> serve qualquer jogo.
+    # Idempotente (guarda no alias).
     begin
       if defined?(GameData) && GameData.const_defined?(:Metadata)
         __MD = GameData::Metadata
-        unless __MD.respond_to?(:__mkxp_orig_get_player)
+        # NB: NAO usar respond_to? aqui -- o method_missing universal faz
+        # respond_to_missing? devolver true p/ tudo, logo respond_to? seria sempre
+        # true e o fix NUNCA instalava. method_defined? ve' metodos REAIS.
+        unless __MD.singleton_class.method_defined?(:__mkxp_orig_get_player)
           __MD.singleton_class.send(:alias_method, :__mkxp_orig_get_player, :get_player)
           __MD.define_singleton_method(:get_player) do |id|
             meta = (__mkxp_orig_get_player(id) rescue nil)
             if meta.is_a?(Array) && meta[0] && !meta[0].is_a?(Integer)
               next meta
             end
-            tbl = [:POKEMONTRAINER_Sorin, :POKEMONTRAINER_Soleil, :POKEMONTRAINER_Luan,
-                   :POKEMONTRAINER_Lusine, :POKEMONTRAINER_Ethan, :POKEMONTRAINER_Lyra,
-                   :POKEMONTRAINER_Lucas, :POKEMONTRAINER_Dawn, :POKEMONTRAINER_Black,
-                   :POKEMONTRAINER_White]
-            if id.is_a?(Integer) && id >= 0 && id < tbl.size
+            # [0] veio como Integer => o marshal estragou o simbolo do treinador.
+            # Recuperar o nome do sprite SEM hardcoding (serve QUALQUER jogo):
+            #  (1) do proprio array: o charset do treinador (meta[1]) segue a
+            #      convencao Essentials "trainer_<TIPO>"; tirar o prefixo da' o
+            #      nome usado em PlayerSprites/ (== nome do TrainerType).
+            #  (2) se falhar, varrer Graphics/Pictures/PlayerSprites/ e usar o
+            #      id-esimo sprite base (sem sufixo de outfit _N).
+            __sym = nil
+            if meta.is_a?(Array) && meta[1].is_a?(String) && !meta[1].empty?
+              __nm = meta[1].sub(/\Atrainer_/i, "")
+              __sym = __nm.to_sym unless __nm.empty?
+            end
+            if __sym.nil? && id.is_a?(Integer) && id >= 0
+              __base = (Dir.entries("Graphics/Pictures/PlayerSprites") rescue [])
+              __base = __base.select { |f| f =~ /\.(png|gif)\z/i }
+                             .map    { |f| f.sub(/\.[^.]+\z/, "") }
+                             .reject { |f| f =~ /_\d+\z/ }
+                             .uniq.sort
+              __sym = __base[id].to_sym if __base[id]
+            end
+            if __sym
+              if (($__mkxp_gpsfix_log ||= 0) < 3) && ($__mkxp_gpsfix_log += 1)
+                dbg "[GPS-FIX] meta[0] veio Integer p/ id=#{id}; recuperado :#{__sym} (meta=#{meta.inspect[0,80]})"
+              end
               rest = (meta.is_a?(Array) && meta.size > 1) ? meta[1..-1] : []
-              next ([tbl[id]] + rest)
+              next ([__sym] + rest)
             end
             meta
           end
@@ -5040,8 +5137,14 @@ begin
       end
       unless method_defined?(:never_dispose)
         def never_dispose; @never_dispose; end
-        def never_dispose=(v); @never_dispose = v; end
       end
+      # FIX #5: o Essentials define never_dispose como attr_accessor (allscripts
+      # L15612), por isso o guard 'unless method_defined?' acima SALTA o nosso setter.
+      # Redefinimos o setter INCONDICIONALMENTE aqui (corre depois do attr_accessor,
+      # pos-scripts -> prevalece): never_dispose=true liga prefer_vram p/ a textura do
+      # tileset ir para VRAM (libertando o heap linear p/ a camada de 4MB). Mantemos a
+      # semantica (so' poe @never_dispose) e juntamos o hook.
+      def never_dispose=(v); @never_dispose = v; (self.prefer_vram = !!v rescue nil); end
       unless method_defined?(:dispose)
         def dispose
           return if disposed? rescue false
@@ -6049,10 +6152,11 @@ begin
   # (player_A..player_H + player_K/_L = 10 jogadores), MAS o marshal do port le'
   # o simbolo DENTRO do array como 0 -> meta[0]=0 -> pede "PlayerSprites/0" ->
   # falha -> paineis vazios/escuros -> ecra preto.
-  # Fix (so' no port, runtime): se o [0] ja' veio bom, confia; senao usa a lista
-  # real extraida do metadata.dat deste jogo, PRESERVANDO o resto do array
+  # Fix (so' no port, runtime): se o [0] ja' veio bom, confia; senao recupera o
+  # nome do sprite a partir dos PROPRIOS dados do jogo (charset "trainer_<TIPO>"
+  # em meta[1], ou varrendo a pasta PlayerSprites/), PRESERVANDO o resto do array
   # (charsets) quando o marshal so' estragou o [0]. Idempotente e protegido.
-  # NB: se o roster de jogadores do jogo mudar, atualizar a lista abaixo.
+  # Sem nomes hardcoded -> serve qualquer jogo Essentials.
   begin
     if defined?(GameData) && GameData.const_defined?(:Metadata)
       __MD = GameData::Metadata
@@ -6064,14 +6168,31 @@ begin
           if meta.is_a?(Array) && meta[0] && !meta[0].is_a?(Integer)
             next meta
           end
-          # lista correta (ordem A,B,C,D,E,F,G,H,K,L do metadata.dat)
-          tbl = [:POKEMONTRAINER_Sorin, :POKEMONTRAINER_Soleil, :POKEMONTRAINER_Luan,
-                 :POKEMONTRAINER_Lusine, :POKEMONTRAINER_Ethan, :POKEMONTRAINER_Lyra,
-                 :POKEMONTRAINER_Lucas, :POKEMONTRAINER_Dawn, :POKEMONTRAINER_Black,
-                 :POKEMONTRAINER_White]
-          if id.is_a?(Integer) && id >= 0 && id < tbl.size
+          # [0] veio como Integer => o marshal estragou o simbolo do treinador.
+          # Recuperar o nome do sprite SEM hardcoding (serve QUALQUER jogo):
+          #  (1) charset do treinador (meta[1]) segue a convencao Essentials
+          #      "trainer_<TIPO>"; tirar o prefixo da' o nome de PlayerSprites/.
+          #  (2) senao, varrer Graphics/Pictures/PlayerSprites/ e usar o id-esimo
+          #      sprite base (sem sufixo de outfit _N).
+          __sym = nil
+          if meta.is_a?(Array) && meta[1].is_a?(String) && !meta[1].empty?
+            __nm = meta[1].sub(/\Atrainer_/i, "")
+            __sym = __nm.to_sym unless __nm.empty?
+          end
+          if __sym.nil? && id.is_a?(Integer) && id >= 0
+            __base = (Dir.entries("Graphics/Pictures/PlayerSprites") rescue [])
+            __base = __base.select { |f| f =~ /\.(png|gif)\z/i }
+                           .map    { |f| f.sub(/\.[^.]+\z/, "") }
+                           .reject { |f| f =~ /_\d+\z/ }
+                           .uniq.sort
+            __sym = __base[id].to_sym if __base[id]
+          end
+          if __sym
+            if (($__mkxp_gpsfix_log ||= 0) < 3) && ($__mkxp_gpsfix_log += 1)
+              MKXPDebug.log("[GPS-FIX] meta[0] veio Integer p/ id=#{id}; recuperado :#{__sym} (meta=#{meta.inspect[0,80]})") rescue nil
+            end
             rest = (meta.is_a?(Array) && meta.size > 1) ? meta[1..-1] : []
-            next ([tbl[id]] + rest)
+            next ([__sym] + rest)
           end
           meta  # nil para id>=10 -> quant_registered_player para' aqui (=> @realquant=10)
         end
@@ -6175,6 +6296,52 @@ begin
   end
   # ---- FIM PERF offscreen ----------------------------------------------------
 
+  # ---- PERF FPS (Fase 1): throttle de Game_Event#update FORA do ecra ----------
+  # MEDIDO no log (FPSPROBE, steady-state a andar): update=19ms = updateMaps~10.5
+  # (Game_Map#update) + updateSpritesets~8.5 (ja' aliviado pelo OFFSCREEN acima) +
+  # resto~0.5. O frame real e' ~40ms: 19ms Ruby + ~16-21ms GPU/compositing/swap.
+  # A 60Hz, um frame de ~35-40ms perde o vsync de 33ms e salta para 50ms = 20fps.
+  # Para ficar SOB 33ms (=30fps) basta cortar ~9ms ao update Ruby.
+  # updateMaps = @events.each{ e.update }. O OFFSCREEN ja' aliviou os SPRITES dos
+  # eventos invisiveis, mas a LOGICA (Game_Event#update: movimento/animacao) corre
+  # para TODOS a 30fps. Aqui saltamos 2 de 3 frames a logica dos eventos CLARAMENTE
+  # fora do ecra -- com as MESMAS margens do OFFSCREEN (consistente) e guardas duras:
+  #   * NUNCA saltar trigger paralelo(3)/autorun(4)  -> logica de fundo intacta
+  #   * NUNCA saltar com @move_route_forcing          -> cutscenes/movimentos guiados
+  #   * so' eventos a >96px fora do ecra util (512x384) -> nada visivel e' afetado
+  # A posicao logica (real_x/real_y) e' do jogo; so' adiamos quem nao se ve. Quando
+  # o evento entra na margem volta a 30fps. Reversivel: $MKXP_PERF_EVENTSKIP=false.
+  begin
+    $MKXP_PERF_EVENTSKIP = true if $MKXP_PERF_EVENTSKIP.nil?
+    $__ev_skipped = 0; $__ev_ran = 0
+    if Object.const_defined?(:Game_Event) &&
+       Game_Event.method_defined?(:update) &&
+       !Game_Event.method_defined?(:__mkxp_ev_orig_update)
+      Game_Event.send(:alias_method, :__mkxp_ev_orig_update, :update)
+      Game_Event.send(:define_method, :update) do |*a|
+        if $MKXP_PERF_EVENTSKIP
+          tr = (@trigger rescue nil)              # 3=paralelo, 4=autorun
+          if tr != 3 && tr != 4 && !(@move_route_forcing rescue false)
+            sx = (screen_x rescue nil); sy = (screen_y rescue nil)
+            if sx && sy && (sx < -96 || sx > 608 || sy < -96 || sy > 480)
+              @__ev_n = (@__ev_n || 0) + 1
+              if (@__ev_n % 3) != 0
+                $__ev_skipped += 1
+                next                              # fora do ecra: salta 2 de 3 frames
+              end
+            end
+          end
+        end
+        $__ev_ran += 1
+        __mkxp_ev_orig_update(*a)
+      end
+      MKXPDebug.log("[EVSKIP] throttle de Game_Event#update fora-do-ecra instalado (every=3; nao mexe em paralelo/autorun/move-route; flag $MKXP_PERF_EVENTSKIP)") rescue nil
+    end
+  rescue => __evs
+    MKXPDebug.log("[EVSKIP] instalacao falhou: #{__evs.class}: #{__evs.message}") rescue nil
+  end
+  # ---- FIM PERF FPS Fase 1 ---------------------------------------------------
+
   # ---- PERF + CORRECAO: screen_y_ground nativo & offset de escadas ------------
   # O acelerador (compat_stubs.h, corre antes a ~t=3.95s) ja' poe screen_x/y/z
   # do Game_Character em C nativo. Mas ficaram DOIS problemas, que tratamos aqui
@@ -6272,6 +6439,78 @@ begin
     MKXPDebug.log("[MENUFIX] falhou: #{__emf.class}: #{__emf.message}") rescue nil
   end
   # ---- FIM FIX menu Voltseon -------------------------------------------------
+
+  # ---- BAGFIX: atalhos globais de saco rebentam quando $PokemonBag e' nil ----
+  # CRASH capturado no teu log: menu de pausa -> call_menu -> ... -> pbHasItem?
+  # -> SystemStackError (recursao infinita), bt[0..7] TODOS pbHasItem?.
+  # Causa: os atalhos GLOBAIS (base_scripts.rb:82055-82071) fazem
+  #   $PokemonBag.pbHasItem?(*args)   SEM guarda nenhuma. No quarto (logo apos
+  # acordar, o "UP AND AT 'EM") o $PokemonBag ainda e' nil (saco criado mais
+  # tarde). Como o mruby resolve nil.pbHasItem? para o PROPRIO atalho global
+  # (Object#pbHasItem?), fica $PokemonBag.pbHasItem? == nil.pbHasItem? == atalho
+  # -> recursao infinita -> SystemStackError. O menu Voltseon chama pbHasItem?/
+  # pbQuantity SEM prefixo ao construir-se, com o saco nil -> crash.
+  # NAO da' para guardar com respond_to? (respond_to_missing? universal devolve
+  # true p/ tudo). Usamos is_a?(PokemonBag): cobre nil E tipo errado.
+  # Sem saco: "tens item?" -> false, "quantos?" -> 0 (comportamento correto).
+  begin
+    if Object.const_defined?(:PokemonBag)
+      Object.send(:define_method, :pbHasItem?) do |*args|
+        $PokemonBag.is_a?(PokemonBag) ? $PokemonBag.pbHasItem?(*args) : false
+      end
+      Object.send(:define_method, :pbQuantity) do |*args|
+        $PokemonBag.is_a?(PokemonBag) ? $PokemonBag.pbQuantity(*args) : 0
+      end
+      Object.send(:define_method, :pbCanStore?) do |*args|
+        $PokemonBag.is_a?(PokemonBag) ? $PokemonBag.pbCanStore?(*args) : false
+      end
+      Object.send(:define_method, :pbStoreItem) do |*args|
+        $PokemonBag.is_a?(PokemonBag) ? $PokemonBag.pbStoreItem(*args) : false
+      end
+      Object.send(:define_method, :pbStoreAllOrNone) do |*args|
+        $PokemonBag.is_a?(PokemonBag) ? $PokemonBag.pbStoreAllOrNone(*args) : false
+      end
+      MKXPDebug.log("[BAGFIX] atalhos globais de saco guardados vs $PokemonBag nil (anti-recursao)") rescue nil
+    end
+  rescue => __ebag
+    MKXPDebug.log("[BAGFIX] falhou: #{__ebag.class}: #{__ebag.message}") rescue nil
+  end
+
+  # ---- OUTFITDIAG: a estante deveria abrir o menu de outfit -----------------
+  # Evento #15 "Closet" @tile(26,3) em Map003 e' Action Button (trigger 0), SEM
+  # condicoes, e faz 117[34] -> Common Event 34 ("Change Clothes") -> CE173
+  # (o menu de outfit, confirmado a funcionar pelo teu screenshot).
+  # Como crashaste antes de testar a estante, ainda nao sabemos PORQUE nao abre.
+  # Em vez de adivinhar, espiamos command_117 (chamar Common Event): se carregares
+  # A virado p/ a estante e isto disparar p/ CE 34/173, o evento FUNCIONA e o
+  # problema e' a jusante; se NAO disparar, estas virado p/ o objeto errado (a
+  # comoda de madeira nao e' o Closet -- este esta' na parede de cima, tile x=26)
+  # ou a trigger nao bate. command_117 e' no-arg e le @parameters[0]=ID do CE.
+  begin
+    if Object.const_defined?(:Interpreter) && Interpreter.method_defined?(:command_117) &&
+       !Interpreter.method_defined?(:__mkxp_orig_command_117)
+      Interpreter.send(:alias_method, :__mkxp_orig_command_117, :command_117)
+      Interpreter.send(:define_method, :command_117) do
+        begin
+          __ceid = (@parameters[0] rescue nil)
+          if __ceid.is_a?(Integer)
+            $__mkxp_ce_seen ||= {}
+            $__mkxp_ce_seen[__ceid] = ($__mkxp_ce_seen[__ceid] || 0) + 1
+            # cadeia do outfit (34->212 picker,173; 20/21 closet) SEMPRE;
+            # qualquer outro CE so' as 2 primeiras vezes (evita flood por-frame).
+            if [34, 173, 212, 20, 21].include?(__ceid) || $__mkxp_ce_seen[__ceid] <= 2
+              MKXPDebug.log("[OUTFITDIAG] command_117 -> CommonEvent ##{__ceid} (x#{$__mkxp_ce_seen[__ceid]})") rescue nil
+            end
+          end
+        rescue
+        end
+        __mkxp_orig_command_117
+      end
+      MKXPDebug.log("[OUTFITDIAG] hook command_117 instalado") rescue nil
+    end
+  rescue => __eod
+    MKXPDebug.log("[OUTFITDIAG] falhou: #{__eod.class}: #{__eod.message}") rescue nil
+  end
 
   def self.__mkxp_hook_scene(klass_name)
     return false unless (Object.const_defined?(klass_name) rescue false)
@@ -7393,6 +7632,51 @@ begin
       MKXP_UNDEF
     end
   end
+  # ---- Module#*_method_defined? (mruby 3.2.0 nao os implementa) -------------
+  # CAUSA (teu log linha 117): durante o load do 'Voltseon's Pause Menu' um
+  # plugin chama X.private_method_defined?(:m) p/ decidir se faz alias; mruby
+  # nao tem esse metodo -> cai no method_missing universal -> NoMethodError
+  # (nao fatal, mas suja o log e pode desligar uma feature do plugin).
+  # Definimos com semantica aproximada via *_instance_methods (que mruby TEM).
+  # Guardas por-metodo: so' definimos os que faltam.
+  class ::Module
+    unless method_defined?(:private_method_defined?)
+      def private_method_defined?(name)
+        s = (name.to_sym rescue name)
+        a = (private_instance_methods(true) rescue nil)
+        a.is_a?(Array) ? a.include?(s) : false
+      end
+    end
+    unless method_defined?(:protected_method_defined?)
+      def protected_method_defined?(name)
+        s = (name.to_sym rescue name)
+        a = (protected_instance_methods(true) rescue nil)
+        a.is_a?(Array) ? a.include?(s) : false
+      end
+    end
+    unless method_defined?(:public_method_defined?)
+      def public_method_defined?(name)
+        s = (name.to_sym rescue name)
+        a = (public_instance_methods(true) rescue nil)
+        if a.is_a?(Array) then a.include?(s) else (method_defined?(s) rescue false) end
+      end
+    end
+  end
+  # ---- Dir.delete CEDO (antes dos plugins) ----------------------------------
+  # O PRE-FIX (t=0.05s) tenta definir Dir.delete, mas o Dir so' nasce no
+  # compat_stubs (t=0.314s), logo o 'class << Dir' do PRE-FIX falha em silencio.
+  # O bloco equivalente no literal RUBY carrega tarde (~t=3.8s) e usa respond_to?
+  # (que o method_missing universal estraga). Resultado: o plugin do Marin chama
+  # Dir.delete a t=3.251s e rebenta com NameError (nao fatal, mas suja o log).
+  # Aqui (DEFEARLY, t=2.738s) o Dir JA' existe e ainda nao corremos plugins.
+  # Usamos method_defined? (ve' metodos REAIS; nao dispara method_missing).
+  if Object.const_defined?(:Dir)
+    class << Dir
+      def delete(*a); 0; end unless method_defined?(:delete)   # no-op seguro
+      alias_method :rmdir,  :delete rescue nil
+      alias_method :unlink, :delete rescue nil
+    end
+  end
 rescue
 end
 )DEFEARLY";
@@ -7421,8 +7705,8 @@ begin
       def call_menu(*a, &b)
         begin
           __mkxp_diag_orig_call_menu(*a, &b)
-        rescue ArgumentError => __cme
-          (MKXPDebug.log("[CALLMENU-DIAG] ArgumentError: #{__cme.message}") rescue nil)
+        rescue StandardError => __cme
+          (MKXPDebug.log("[CALLMENU-DIAG] #{__cme.class}: #{__cme.message}") rescue nil)
           __bt = (__cme.backtrace || [])
           if __bt.empty?
             (MKXPDebug.log("[CALLMENU-DIAG]   (sem backtrace)") rescue nil)
@@ -7480,6 +7764,48 @@ end
             DBGLOG("[SMOKE] smoke_test.rb nao encontrado -- sem smoke test\n");
         }
     }
+
+    /* ── MENUCOMP-GUARD: blindar refresh dos componentes do Voltseon Pause Menu ──
+     * O log mostra call_menu a rebentar SEMPRE com
+     *   TypeError: Object cannot be converted to Integer
+     * dentro de pbRefresh -> @components.each{|c| c.refresh}. Um dos HUD
+     * (SafariHud/BugContestHud/PokemonPartyHud/DateAndTimeHud/NewQuestHud) lanca
+     * a excecao; o MENUGUARD (debug_probe) apanha mas ABORTA o menu inteiro ->
+     * "nao aparece nada" + fundo laranja. Aqui envolvemos o refresh de cada
+     * componente: se um falhar e' IGNORADO e LOGADO (com classe+backtrace, p/
+     * sabermos exatamente qual e onde), e o resto do menu desenha na mesma.
+     * Corre depois dos plugins+probe (classes e MKXPDebug ja' existem).
+     * Idempotente (guarda __mkxp_orig_refresh_guard). */
+    {
+        static const char *menucomp_guard = R"MENUCOMP(
+begin
+  %w[SafariHud BugContestHud PokemonPartyHud DateAndTimeHud NewQuestHud].each do |__cn|
+    next unless Object.const_defined?(__cn.to_sym)
+    __k = Object.const_get(__cn.to_sym)
+    next unless __k.is_a?(Class) && __k.method_defined?(:refresh)
+    next if __k.method_defined?(:__mkxp_orig_refresh_guard)
+    __k.send(:alias_method, :__mkxp_orig_refresh_guard, :refresh)
+    __k.send(:define_method, :refresh) do |*__a, &__b|
+      begin
+        __mkxp_orig_refresh_guard(*__a, &__b)
+      rescue => __re
+        $__mkxp_menucomp_warned ||= {}
+        unless $__mkxp_menucomp_warned[self.class.name]
+          $__mkxp_menucomp_warned[self.class.name] = true
+          (MKXPDebug.log("[MENUCOMP] #{self.class}#refresh rebentou: #{__re.class}: #{__re.message} -> componente ignorado, menu continua") rescue nil)
+          (__re.backtrace || [])[0,8].each_with_index { |__l,__i| (MKXPDebug.log("[MENUCOMP]   bt[#{__i}] #{__l}") rescue nil) }
+        end
+      end
+    end
+  end
+  (MKXPDebug.log("[MENUCOMP] guard de refresh instalado nos componentes do pause menu") rescue nil)
+rescue => __mce
+  (MKXPDebug.log("[MENUCOMP] instalacao falhou: #{__mce.class}: #{__mce.message}") rescue nil)
+end
+)MENUCOMP";
+        mrb_load_string(mrb, menucomp_guard);
+        if (mrb->exc) { mrb->exc = 0; }
+    }
 }
 
 /* base path do jogo (ex.: "sdmc:/mkxp/game"), usado pelo load_data real */
@@ -7513,6 +7839,18 @@ static void mkxp_register_bad_map(const char *fname) {
 int binding_3ds_run(const char *game_path) {
     dbglog_open();
     DBGLOG("binding_3ds_run: %s\n", game_path);
+    /* Resultado do ndspInit() (feito em main.cpp, antes deste log abrir). Se for
+     * R_FAILED, NAO ha som -- o DSP nao processa (no log: "0 buffers reciclados"
+     * + canais de SE sempre cheios). Causa quase sempre: falta o dspfirm.cdc. */
+    {
+        extern s32 g_ndsp_init_result;
+        if (g_ndsp_init_result < 0)
+            DBGLOG("[AUDIO][FALHA] ndspInit rc=0x%08lX -> SEM SOM (falta firmware do DSP / audio off no emulador)\n",
+                   (unsigned long)g_ndsp_init_result);
+        else
+            DBGLOG("[AUDIO] ndspInit rc=0x%08lX OK (DSP disponivel -- se nao ha som, ver volume/output do emulador)\n",
+                   (unsigned long)g_ndsp_init_result);
+    }
     snprintf(g_game_base, sizeof(g_game_base), "%s", game_path ? game_path : "");
 
     /* CRÍTICO: inicializar render targets ANTES de qualquer binding.
@@ -7817,6 +8155,98 @@ end
             return mrb_float_value(mrb2, tick_to_ms(svcGetSystemTick()));
         },
         MRB_ARGS_NONE());
+
+    /* __mkxp_localtime: data/hora REAL do RTC do 3DS via time()/localtime().
+     * CAUSA RAIZ (provada por nm libmruby.a -> 0 simbolos de Time): este build do
+     * mruby NAO tem o gem mruby-time, logo a constante Time cai no const_missing
+     * e devolve MKXP_UNDEF. O jogo faz Time.now.month.to_i -> MKXP_UNDEF e depois
+     * pbGetAbbrevMonthName indexa um array com isso -> "Object cannot be converted
+     * to Integer" (o crash do menu de pausa = DateAndTimeHud). Tambem parte o
+     * ciclo dia/noite e tudo o que use data/hora.
+     * Devolve [ano, mes(1-12), dia, hora, min, seg, wday, yday, epoch]. Aceita um
+     * epoch opcional (p/ Time.at). A classe Time (Ruby) e' construida sobre isto. */
+    mrb_define_method(mrb, mrb->kernel_module,
+        "__mkxp_localtime",
+        [](mrb_state *mrb2, mrb_value) -> mrb_value {
+            mrb_int epoch_arg = -1;
+            mrb_get_args(mrb2, "|i", &epoch_arg);
+            time_t t = (epoch_arg >= 0) ? (time_t)epoch_arg : time(NULL);
+            struct tm *lt = localtime(&t);
+            mrb_value a = mrb_ary_new_capa(mrb2, 9);
+            if (lt) {
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(lt->tm_year + 1900));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(lt->tm_mon + 1));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(lt->tm_mday));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(lt->tm_hour));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(lt->tm_min));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(lt->tm_sec));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(lt->tm_wday));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(lt->tm_yday + 1));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value((mrb_int)t));
+            } else {
+                /* fallback (RTC indisponivel): epoch 0 = 1970-01-01, nao rebenta */
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(1970));
+                for (int i = 0; i < 4; i++) mrb_ary_push(mrb2, a, mrb_fixnum_value(i == 0 ? 1 : (i == 1 ? 1 : 0)));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(0));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(4));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(1));
+                mrb_ary_push(mrb2, a, mrb_fixnum_value(0));
+            }
+            return a;
+        },
+        MRB_ARGS_OPT(1));
+
+    /* Time (Ruby) construido sobre __mkxp_localtime. So' definido se a constante
+     * Time faltar (este build nao tem mruby-time). const_defined? ve a tabela real
+     * (NAO dispara o const_missing/MKXP_UNDEF), por isso o guard e' fiavel.
+     * Corre antes de run_rmxp_scripts -> os scripts do jogo veem o Time. */
+    {
+        static const char *time_class_ruby = R"TIMECLS(
+unless Object.const_defined?(:Time)
+  class ::Time
+    include Comparable
+    attr_reader :year, :month, :day, :hour, :min, :sec, :wday, :yday
+    def initialize(arr = nil)
+      a = arr
+      a = (__mkxp_localtime rescue nil) unless a.is_a?(Array)
+      a = [1970, 1, 1, 0, 0, 0, 4, 1, 0] unless a.is_a?(Array) && a.size >= 9
+      @year = a[0]; @month = a[1]; @day = a[2]; @hour = a[3]; @min = a[4]
+      @sec = a[5]; @wday = a[6]; @yday = a[7]; @epoch = a[8]
+    end
+    def self.now; new; end
+    def self.at(t); new((__mkxp_localtime(t.to_i) rescue nil)); end
+    def to_i; @epoch.to_i; end
+    def to_f; @epoch.to_f; end
+    def mon; @month; end
+    def mday; @day; end
+    def <=>(o); to_i <=> (o.respond_to?(:to_i) ? o.to_i : o); end
+    def -(o); to_i - (o.respond_to?(:to_i) ? o.to_i : o.to_i); end
+    def +(o); Time.at(to_i + o.to_i); end
+    def strftime(fmt)
+      pad2 = lambda { |n| n = n.to_i; n < 10 ? "0#{n}" : n.to_s }
+      h12 = @hour % 12; h12 = 12 if h12 == 0
+      ampm = @hour < 12 ? "AM" : "PM"
+      s = fmt.to_s.dup
+      s = s.gsub("%Y", @year.to_s)
+      s = s.gsub("%m", pad2.call(@month))
+      s = s.gsub("%d", pad2.call(@day))
+      s = s.gsub("%H", pad2.call(@hour))
+      s = s.gsub("%M", pad2.call(@min))
+      s = s.gsub("%S", pad2.call(@sec))
+      s = s.gsub("%I", pad2.call(h12))
+      s = s.gsub("%p", ampm)
+      s
+    end
+    def to_s; strftime("%Y-%m-%d %H:%M:%S"); end
+    def inspect; to_s; end
+  end
+  (MKXPDebug.log("[TIMEFIX] Time definido (mruby-time ausente) via RTC -> data/hora do menu + ciclo dia/noite") rescue nil)
+end
+)TIMECLS";
+        mrb_load_string(mrb, time_class_ruby);
+        if (mrb->exc) { DBGLOG("[TIMEFIX] ERRO ao definir Time\n"); mrb->exc = 0; }
+        else { DBGLOG("[TIMEFIX] classe Time instalada (RTC do 3DS)\n"); }
+    }
 
     /* DEBUG LOG CERTEIRO: contador CUMULATIVO de objetos/buffers NOVOS alocados
      * pelo allocator do mruby (= o "objs_criados" do PROFILE). Os patches Ruby

@@ -444,9 +444,21 @@ static mrb_value build_table_from_dump(mrb_state *mrb, struct RClass *klass, mrb
     int arena=mrb_gc_arena_save(mrb);
     mrb_value arr=mrb_ary_new_capa(mrb,total>0?total:1);
     const unsigned char *cell=p+20;
-    for(int32_t i=0;i<total;i++){
-        int16_t v=le_i16(cell); cell+=2;
-        mrb_ary_set(mrb,arr,i,mrb_int_value(mrb,(mrb_int)v));
+    /* ROBUSTEZ V31: para Tables GRANDES (ex.: passabilidade de tilesets gigantes,
+     * xsize 8144), o preenchimento celula-a-celula com mrb_ary_set podia deixar o
+     * array com comprimento/valores errados no runtime do 3DS (perdiamos as
+     * passabilidades/prioridades de IDs altos -> andar nas paredes + camadas
+     * trocadas). Aqui garantimos o comprimento com mrb_ary_resize UMA vez e depois
+     * escrevemos DIRETAMENTE no buffer (RARRAY_PTR): zero GC durante o fill e zero
+     * realocacao, por isso o ponteiro mantem-se valido. Inteiros sao imediatos
+     * (WORD_BOXING) -> nao precisam de write-barrier. */
+    if(total>0){
+        mrb_ary_resize(mrb,arr,total);
+        mrb_value *ap=RARRAY_PTR(arr);
+        for(int32_t i=0;i<total;i++){
+            int16_t v=le_i16(cell); cell+=2;
+            ap[i]=mrb_int_value(mrb,(mrb_int)v);
+        }
     }
     /* Simbolos das ivars pre-computados UMA vez por sessao (ver declaracao em
      * escopo de ficheiro + reset em marshal_class_cache_reset). build_table_from_dump
@@ -465,9 +477,9 @@ static mrb_value build_table_from_dump(mrb_state *mrb, struct RClass *klass, mrb
     mrb_obj_iv_set(mrb,mrb_obj_ptr(obj),s_tbl_sym_data,arr);
     mrb_gc_arena_restore(mrb,arena);
     s_tbl_built++;
-    if(s_tbl_built<=3)
-        MZLOG("[marshal] Table#%d reconstruido: x=%d y=%d z=%d cells=%d (buf=%d bytes)\n",
-              s_tbl_built,(int)xsize,(int)ysize,(int)zsize,(int)total,(int)len);
+    if(s_tbl_built<=3 || total>4096)
+        MZLOG("[marshal] Table#%d reconstruido: x=%d y=%d z=%d cells=%d len_arr=%d (buf=%d bytes)\n",
+              s_tbl_built,(int)xsize,(int)ysize,(int)zsize,(int)total,(int)RARRAY_LEN(arr),(int)len);
     return obj;
 }
 

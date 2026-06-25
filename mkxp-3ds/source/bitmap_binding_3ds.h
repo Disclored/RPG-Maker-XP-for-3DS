@@ -36,6 +36,14 @@ struct Bitmap3DS {
                                * de 30MB nao cabe; 4444 = 15MB cabe). Quem LE b->pixels
                                * (blt/stretch_blt/get_pixel) tem de expandir via
                                * px_read(). NUNCA e' destino de escrita nem textura. */
+    bool           prefer_vram; /* true = preferir alocar a TEXTURA GPU em VRAM (nao no
+                               * heap linear). Marcado pelo probe nos TILESETS
+                               * COMPACTADOS (512x1024=2MB, estaticos, never_dispose):
+                               * cabem num banco de VRAM (3MB) e sao construidos 1x.
+                               * Po'-los em VRAM tira-os do heap linear -> deixa de o
+                               * fragmentar -> a camada do tilemap (832x704->1024x1024
+                               * =4MB, que NAO cabe em VRAM nem em linear fragmentado)
+                               * passa a caber no linear contiguo. Default false. */
 };
 
 extern const mrb_data_type Bitmap3DSType;

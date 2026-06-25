@@ -400,9 +400,13 @@ static bool extract_color(mrb_state *mrb, mrb_value obj, float *r, float *g, flo
     return true;
 }
 
+/* SUPERDBG: contador de Bitmaps vivos (lido por MKXPDebug.mem_info no SNAP). */
+int g_live_bitmaps = 0;
+
 static void bitmap_free(mrb_state*, void *p) {
     Bitmap3DS *b = (Bitmap3DS*)p;
     if (!b) return;
+    g_live_bitmaps--;   /* SUPERDBG */
     if (b->pixels) {
         if (b->pixels_linear) linearFree(b->pixels);  /* veio de linearAlloc */
         else                  free(b->pixels);
@@ -419,6 +423,7 @@ static Bitmap3DS *bmp_alloc(int w, int h) {
     if (h < 1) h = 1;
     Bitmap3DS *b  = (Bitmap3DS*)calloc(1, sizeof(Bitmap3DS));
     if (!b) return nullptr;                  /* extremo: nem a struct coube */
+    g_live_bitmaps++;   /* SUPERDBG */
     b->width      = w;
     b->height     = h;
     size_t nbytes = (size_t)w * (size_t)h * 4;
@@ -494,6 +499,7 @@ static Bitmap3DS *bmp_alloc_adopt(int w, int h, unsigned char *owned_pixels,
     b->pixels_linear = is_linear;   /* true -> bitmap_free usa linearFree */
     b->tex_dirty  = true;
     b->tex        = nullptr;
+    g_live_bitmaps++;   /* SUPERDBG */
     return b;
 }
 
@@ -524,7 +530,7 @@ void __attribute__((used)) bmp_flush(Bitmap3DS *b) {
         b->tex = nullptr;
     }
     if (b->pixels && b->width > 0 && b->height > 0) {
-        b->tex = display_3ds_create_texture(b->width, b->height, b->pixels);
+        b->tex = display_3ds_create_texture(b->width, b->height, b->pixels, b->prefer_vram);
         if (!b->tex) {
             /* FIX FPS: marcar que falhou p/ nao re-tentar todos os frames (o
              * draw verifica tex_failed). So' se re-tenta quando tex_dirty voltar
@@ -1146,6 +1152,27 @@ mrb_value bmp_init(mrb_state *mrb, mrb_value self) {
         if (mrb_string_p(arg)) {
             const char *req_path = mrb_str_to_cstr(mrb, arg);
             b = bmp_load_file(req_path);
+            /* ── [LOADTRACE] (SUPERDBG): cada load de ficheiro -- pedido, dims,
+             * formato, fallback. UNICO ponto por onde TODOS os loads passam.
+             * Cap 4000 linhas (loads sao cacheados -> nao por-frame). ──────── */
+            {
+                extern FILE *g_dbglog;
+                static int g_loadtrace_n = 0;
+                if (g_dbglog && g_loadtrace_n < 4000) {
+                    g_loadtrace_n++;
+                    if (b && b->pixels) {
+                        bool maybe_magenta = (b->width == 32 && b->height == 32);
+                        fprintf(g_dbglog, "[LOADTRACE] '%s' -> %dx%d 4444=%d%s\n",
+                                req_path ? req_path : "(null)", b->width, b->height,
+                                b->pixels_4444 ? 1 : 0,
+                                maybe_magenta ? " (32x32 -> possivel fallback magenta)" : "");
+                    } else {
+                        fprintf(g_dbglog, "[LOADTRACE] '%s' -> NULL/sem-pixels\n",
+                                req_path ? req_path : "(null)");
+                    }
+                    fflush(g_dbglog);
+                }
+            }
         } else if (mrb_integer_p(arg)) {
             /* Só um inteiro -- usar como dimensão quadrada */
             mrb_int sz = mrb_integer(arg);
@@ -1220,6 +1247,23 @@ static mrb_value bmp_width(mrb_state*, mrb_value s) {
     Bitmap3DS *b = GET_BMP(s); return mrb_fixnum_value(b ? b->width  : 0); }
 static mrb_value bmp_height(mrb_state*, mrb_value s) {
     Bitmap3DS *b = GET_BMP(s); return mrb_fixnum_value(b ? b->height : 0); }
+
+/* [fix #5] prefer_vram=: o probe marca os tilesets compactados (estaticos) p/ a
+ * textura GPU ir para VRAM em vez do heap linear. Se a flag mudar, forca re-flush
+ * (tex_dirty) p/ a textura ser recriada com a nova preferencia. */
+static mrb_value bmp_set_prefer_vram(mrb_state *mrb, mrb_value self) {
+    mrb_value v; mrb_get_args(mrb, "o", &v);
+    Bitmap3DS *b = GET_BMP(self);
+    if (b) {
+        bool nv = mrb_test(v);
+        if (nv != b->prefer_vram) { b->prefer_vram = nv; b->tex_dirty = true; }
+    }
+    return v;
+}
+static mrb_value bmp_get_prefer_vram(mrb_state*, mrb_value self) {
+    Bitmap3DS *b = GET_BMP(self);
+    return mrb_bool_value(b && b->prefer_vram);
+}
 
 static mrb_value bmp_rect(mrb_state *mrb, mrb_value self) {
     Bitmap3DS *b = GET_BMP(self);
@@ -2033,6 +2077,8 @@ void bitmapBindingInit(mrb_state *mrb) {
     mrb_define_method(mrb, k, "disposed?",          bmp_disposed,          MRB_ARGS_NONE());
     mrb_define_method(mrb, k, "width",              bmp_width,             MRB_ARGS_NONE());
     mrb_define_method(mrb, k, "height",             bmp_height,            MRB_ARGS_NONE());
+    mrb_define_method(mrb, k, "prefer_vram=",       bmp_set_prefer_vram,   MRB_ARGS_REQ(1));
+    mrb_define_method(mrb, k, "prefer_vram",        bmp_get_prefer_vram,   MRB_ARGS_NONE());
     mrb_define_method(mrb, k, "rect",               bmp_rect,              MRB_ARGS_NONE());
     mrb_define_method(mrb, k, "clear",              bmp_clear,             MRB_ARGS_NONE());
     mrb_define_method(mrb, k, "fill_rect",          bmp_fill_rect,         MRB_ARGS_REQ(2)|MRB_ARGS_OPT(3));
