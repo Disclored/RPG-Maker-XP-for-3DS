@@ -137,6 +137,28 @@ module RPG
     attr_accessor :name, :volume, :pitch
     def initialize(n='',v=100,p=100); @name=n;@volume=v;@pitch=p; end
   end
+
+  # ── Classes de DADOS RPG (Marshal) ───────────────────────────────────────────
+  # CAUSA-RAIZ provada (analise do seguidor "Giltbert"): estas classes NAO estavam
+  # definidas, por isso o `const_missing` do Essentials resolvia-as para um NullStub.
+  # O Marshal carregava os ivars (@list cheio) MAS o getter `.list` do stub devolvia
+  # nil -> CommonEvents/eventos com `.list=nil` -> comandos nunca corriam (ex.: o
+  # `pbAddDependency` do seguidor). Antes isto era remendado em runtime pela CEWRAP
+  # (debug_probe). Definir as classes REAIS aqui, ANTES de qualquer load_data, corrige
+  # a raiz no motor e dispensa o remendo. So' attr_accessor (o Marshal poe os ivars
+  # direto; NAO definir initialize -- as classes com binding C ja' estao registadas).
+  class CommonEvent; attr_accessor :id, :name, :trigger, :switch_id, :list; end
+  class EventCommand; attr_accessor :code, :indent, :parameters; end
+  class MoveRoute;   attr_accessor :list, :repeat, :skippable; end
+  class MoveCommand; attr_accessor :code, :parameters; end
+  class Event
+    attr_accessor :id, :name, :x, :y, :pages
+    class Page
+      attr_accessor :condition, :graphic, :move_type, :move_speed, :move_frequency,
+                    :move_route, :walk_anime, :step_anime, :direction_fix, :through,
+                    :always_on_top, :trigger, :list
+    end
+  end
 end
 
 =begin
