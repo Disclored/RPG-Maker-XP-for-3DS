@@ -144,4 +144,5 @@ Some Screenshots Progress:
  ---
  
 04/07/2026 - Fixing Menus like Bag, Saves and Loads, Options, Trainer Card, etc
+
 <img width="324" height="238" alt="image" src="https://github.com/user-attachments/assets/1665e82a-b189-41f2-a22c-1a9bd352c199" />
