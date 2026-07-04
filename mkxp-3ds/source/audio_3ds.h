@@ -47,6 +47,15 @@ void audio_3ds_bgs_stop(void);
 void audio_3ds_me_play(const char *name, int volume, int pitch);
 void audio_3ds_me_stop(void);
 
+/* [AUDIO-FADE 2026-07-02] Fade-out REAL (rampa de volume + stop no fim).
+ * 'ms' = duracao em milissegundos (semantica RGSS: Audio.bgm_fade(ms)).
+ * ms<=0 -> stop imediato. Chamar fade num stream parado e' no-op.
+ * A rampa avanca no audio_3ds_update() (1x/frame). Antes era no-op ->
+ * pbBGMFade nunca parava a musica (BGM sobreposta em transicoes). */
+void audio_3ds_bgm_fade(int ms);
+void audio_3ds_bgs_fade(int ms);
+void audio_3ds_me_fade(int ms);
+
 #ifdef __cplusplus
 }
 #endif

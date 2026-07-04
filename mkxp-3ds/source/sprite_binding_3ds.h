@@ -16,9 +16,24 @@ struct Sprite3DS {
                     chave primaria e' (has_vp ? vp_z : z). Sem isto, sprites
                     sem viewport (ex. janela de mensagem com z=99999) caiam
                     atras de qualquer sprite com viewport.z>0 (intro pictures). */
+    unsigned int reg_seq; /* [ZSORT-REGTIE] ordem de criacao (contador monotono,
+                    atribuido no spr_init). Usado SO' como desempate quando a
+                    chave primaria e' >= 99990 (topo: menus vp.z=99999 e janelas
+                    de mensagem no-vp z=99999 empatam). Resolve o menu/roupeiro a
+                    aparecer atras de sprites-fantasma SEM partir a mensagem (que,
+                    criada depois, mantem-se por cima -- comportamento RGSS). */
     mrb_value rb_self; /* DUMP: o objecto Ruby do sprite, para o dump-de-frame
                           (botao Y) poder ler a classe e ivars (@viewport, etc).
                           Preenchido no spr_init. */
+    /* ── FIX-NSYNC: assinatura do @character para o sync nativo de estaticos ──
+     * Tudo calloc'd (0/false) no spr_init: ns_init=false marca a 1a chamada.
+     * Elegibilidade (@reflection/@surfbase) e' verificada a cada chamada na
+     * funcao, nao cachada (o follower so' recebe @reflection apos o initialize). */
+    bool        ns_init;          /* false ate' a 1a chamada de mkxp_static_sync */
+    int         ns_static_frames; /* frames consecutivos em fast-path (refresh forcado) */
+    double      ns_rx, ns_ry;     /* @real_x / @real_y guardados (podem ser float) */
+    int         ns_dir, ns_pat, ns_op, ns_blend, ns_tile, ns_bob, ns_offx, ns_offy, ns_bush;
+    bool        ns_transp;        /* @transparent guardado */
 };
 
 extern const mrb_data_type Sprite3DSType;

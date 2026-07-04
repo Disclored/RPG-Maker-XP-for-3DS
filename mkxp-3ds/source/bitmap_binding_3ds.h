@@ -36,6 +36,20 @@ struct Bitmap3DS {
                                * de 30MB nao cabe; 4444 = 15MB cabe). Quem LE b->pixels
                                * (blt/stretch_blt/get_pixel) tem de expandir via
                                * px_read(). NUNCA e' destino de escrita nem textura. */
+    int            tex_scale; /* FATOR DE DOWNSCALE da textura vs dimensoes reportadas.
+                               * Default 0/1 = textura 1:1 (caso normal, intocado). >1
+                               * = a TEXTURA GPU foi reduzida por este fator (ex: 2 =
+                               * metade) para caber no limite de 1024 do PICA200 e/ou
+                               * poupar RAM, MAS width/height continuam a reportar as
+                               * dimensoes ORIGINAIS ao Ruby (posicionamento/zoom do
+                               * jogo inalterados). O desenho divide o rect de origem
+                               * por este fator (ver sprite_binding). Usado p/ PICTURES
+                               * sobredimensionadas (introPictures 1696px > 1024) que
+                               * de outra forma ficavam magenta. NUNCA p/ tilesets (sao
+                               * fonte de blt em RAM, nao textura). */
+    int            tex_w;     /* largura REAL da textura/buffer quando tex_scale>1
+                               * (= width/tex_scale). 0 se nao aplicavel. */
+    int            tex_h;     /* altura REAL da textura/buffer quando tex_scale>1. */
     bool           prefer_vram; /* true = preferir alocar a TEXTURA GPU em VRAM (nao no
                                * heap linear). Marcado pelo probe nos TILESETS
                                * COMPACTADOS (512x1024=2MB, estaticos, never_dispose):

@@ -10,6 +10,7 @@
 #include <mruby/string.h>
 #include <mruby/variable.h>
 #include <mruby/gc.h>   /* mrb_full_gc: reciclar bitmaps orfaos quando um asset grande nao cabe */
+#include <mruby/array.h>   /* [COMPOSE] RARRAY_LEN/RARRAY_PTR p/ compose_tiles em lote */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -38,6 +39,41 @@
  * Mantido como flag p/ poder desligar sem recompilar a logica toda. */
 static bool g_tileset_4444 = true;
 
+/* Toggle do downscale de PICTURES sobredimensionadas (introPictures 1696px > 1024
+ * do PICA200, e <=1024 mas OOM). true (default) = pictures que nao caberiam numa
+ * textura OU falham por memoria sao decodificadas com box-average para uma textura
+ * <=1024 (dims originais reportadas ao Ruby; o desenho estica). So' toca o caminho
+ * que JA' dava magenta -> no pior caso continua magenta, nunca piora nada bom.
+ * Reverter a false volta ao comportamento antigo (magenta). */
+static bool g_picture_downscale = true;
+
+/* [FIX-TSARENA] (bug 1: casa invisivel) DUAS arenas LINEAR contiguas reservadas
+ * (2x16MB) para tilesets gigantes. Mapas LIGADOS carregam ATE' 3 tilesets gigantes
+ * ao mesmo tempo (ex: Town 15.5MB + Route 14.8MB + Interior 8.5MB ~ 39MB); com UMA
+ * arena so' o 2o falhava (arena OCUPADA -> heap fragmentado, maior bloco 8MB < 14.8MB).
+ * Com DUAS arenas, os dois MAIORES (Town+Route) ficam contiguos garantidos e o
+ * terceiro (menor) cabe no heap ja' aliviado. Reservadas 1x na 1a descodificacao
+ * (heap limpa). Usadas SO' como ultimo recurso e SEM ROUBO (so' uma livre) -> nunca
+ * libertam pixels de um bitmap vivo. Reverter: g_tsarena_enabled=false. */
+static bool   g_tsarena_enabled = true;
+static const int      TS_ARENA_N = 2;                      /* 2 arenas */
+static unsigned char* g_ts_arena[TS_ARENA_N] = { nullptr, nullptr };
+static bool   g_ts_arena_busy[TS_ARENA_N] = { false, false };
+static bool   g_ts_arena_init = false;
+static const size_t TS_ARENA_SIZE = 16u * 1024u * 1024u;   /* 16MB cada: cobre o maior (15.9MB) */
+/* devolve true se 'p' e' UMA das arenas reservadas (p/ bitmap_free nao a libertar) */
+static inline bool ts_arena_owns(const unsigned char* p) {
+    if (!p) return false;
+    for (int i = 0; i < TS_ARENA_N; i++) if (p == g_ts_arena[i]) return true;
+    return false;
+}
+/* marca a arena dona de 'p' como livre; devolve true se encontrou */
+static inline bool ts_arena_release(const unsigned char* p) {
+    if (!p) return false;
+    for (int i = 0; i < TS_ARENA_N; i++) if (p == g_ts_arena[i]) { g_ts_arena_busy[i] = false; return true; }
+    return false;
+}
+
 /* mrb_state global (definido em binding_3ds.cpp). Usado APENAS no caminho de
  * falha de alocacao de assets grandes: forca um mrb_full_gc para libertar
  * bitmaps ORFAOS (tileset do mapa anterior desreferenciado mas nao disposto) e
@@ -47,16 +83,37 @@ static bool g_tileset_4444 = true;
  * pequeno que nunca falha, por isso o GC nunca dispara la'. */
 extern mrb_state *g_mkxp_mrb;
 static int g_gc_oom_calls = 0;
+static int g_gc_oom_skips = 0;
+static int s_live_after_last_gc = -1;
 static bool gc_reclaim_on_oom(const char *who) {
     if (!g_mkxp_mrb) return false;
     int live_before = (int)g_mkxp_mrb->gc.live;
+    /* [FIX-GCOOM-THROTTLE] full_gc numa heap de ~230k objs custa centenas de ms
+     * (PICO de travagem). Quando varios decodes de PERSONAGEM falham SEGUIDOS (carga
+     * de mapa com ficheiros partidos), cada um corria um full_gc INUTIL -> picos.
+     * Throttle SO' no char-decode (frequente): salta se a heap nao cresceu >=8000
+     * objs desde o ultimo GC. CRITICO: o GC do TILESET/4444 (raro, no transfer) NUNCA
+     * e' travado -- e' o unico que liberta o tileset do mapa ANTERIOR da arena de 16MB
+     * (ts_arena_release no bitmap_free); trava-lo agravava o CHAO PRETO (fragmentacao).
+     * Por isso 'is_char' gateia o throttle. */
+    bool is_char = (who && strstr(who, "char"));
+    if (is_char && s_live_after_last_gc >= 0 && live_before < s_live_after_last_gc + 8000) {
+        g_gc_oom_skips++;
+        if (g_dbglog && g_gc_oom_skips <= 5) {
+            fprintf(g_dbglog, "[BMP|GC-OOM-SKIP] #%d (%s): heap so' +%d objs desde o ultimo GC (<8000) -> salta full_gc (evita pico)\n",
+                    g_gc_oom_skips, who ? who : "?", live_before - s_live_after_last_gc);
+            dbg_flush();
+        }
+        return false;
+    }
     mrb_full_gc(g_mkxp_mrb);
     int live_after = (int)g_mkxp_mrb->gc.live;
+    s_live_after_last_gc = live_after;
     g_gc_oom_calls++;
     if (g_dbglog) {
         fprintf(g_dbglog, "[BMP|GC-OOM] #%d (%s): full_gc live %d->%d (libertou %d objs orfaos) -> retry\n",
                 g_gc_oom_calls, who ? who : "?", live_before, live_after, live_before - live_after);
-        fflush(g_dbglog);
+        dbg_flush();
     }
     return (live_after < live_before);   /* houve algo a libertar -> vale a pena retentar */
 }
@@ -104,7 +161,7 @@ static unsigned char* decode_png_libpng(const unsigned char* buf, size_t len,
                     used_linear ? "LINEAR" : "ERR", need / 1024, iw, ih, bitdepth,
                     colortype, interlace, used_linear ? "OK" : "TAMBEM FALHOU",
                     linearSpaceFree() / 1024.0);
-            fflush(g_dbglog);
+            dbg_flush();
         }
         if (!out) {
             /* malloc+linear cheios (ex: introPictures 5.6MB com o tileset da vila
@@ -129,7 +186,7 @@ static unsigned char* decode_png_libpng(const unsigned char* buf, size_t len,
                     "(%ux%u bd=%u ct=%u il=%u) len=%zu\n",
                     (unsigned)image.warning_or_error, image.message,
                     iw, ih, bitdepth, colortype, interlace, len);
-            fflush(g_dbglog);
+            dbg_flush();
         }
         DPL_FREE();
         return nullptr;
@@ -141,7 +198,7 @@ static unsigned char* decode_png_libpng(const unsigned char* buf, size_t len,
             fprintf(g_dbglog, "[BMP|LIBPNG-ERR] tamanho IHDR(%zuKB) != libpng(%zuKB) "
                     "-- abortado sem risco\n", need / 1024,
                     (size_t)PNG_IMAGE_SIZE(image) / 1024);
-            fflush(g_dbglog);
+            dbg_flush();
         }
         png_image_free(&image);
         DPL_FREE();
@@ -156,7 +213,7 @@ static unsigned char* decode_png_libpng(const unsigned char* buf, size_t len,
                     (unsigned)image.warning_or_error, image.message,
                     iw, ih, bitdepth, colortype, interlace, need / 1024,
                     linearSpaceFree() / 1024.0);
-            fflush(g_dbglog);
+            dbg_flush();
         }
         DPL_FREE();
         return nullptr;   /* png_image liberta-se sozinho no finish_read */
@@ -165,7 +222,7 @@ static unsigned char* decode_png_libpng(const unsigned char* buf, size_t len,
     if (g_dbglog) {
         fprintf(g_dbglog, "[BMP|LIBPNG-IHDR] '%ux%u' bd=%u ct=%u il=%u OK heap=%s\n",
                 iw, ih, bitdepth, colortype, interlace, used_linear ? "LINEAR" : "malloc");
-        fflush(g_dbglog);
+        dbg_flush();
     }
     if (out_islinear) *out_islinear = used_linear;
     *out_w = (int)image.width;
@@ -203,9 +260,9 @@ static unsigned char* decode_png_to_4444(const unsigned char* buf, size_t len,
         if (rowbuf) free((void*)rowbuf);
         if (rows) free((void*)rows);
         if (full) { if (full_linear) linearFree((void*)full); else free((void*)full); }
-        if (out) { if (used_linear) linearFree((void*)out); else free((void*)out); }
+        if (out) { if (ts_arena_release((unsigned char*)out)) { } else if (used_linear) linearFree((void*)out); else free((void*)out); }
         png_destroy_read_struct(&png, &info, nullptr);
-        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] libpng longjmp (decode)\n"); fflush(g_dbglog); }
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] libpng longjmp (decode)\n"); dbg_flush(); }
         return nullptr;
     }
 
@@ -217,7 +274,7 @@ static unsigned char* decode_png_to_4444(const unsigned char* buf, size_t len,
     png_get_IHDR(png, info, &w, &h, &bitd, &colort, &interl, nullptr, nullptr);
     if (w == 0 || h == 0) {
         png_destroy_read_struct(&png, &info, nullptr);
-        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] dims invalidas %ux%u (il=%d)\n", (unsigned)w, (unsigned)h, interl); fflush(g_dbglog); }
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] dims invalidas %ux%u (il=%d)\n", (unsigned)w, (unsigned)h, interl); dbg_flush(); }
         return nullptr;
     }
     /* normalizar tudo p/ RGBA 8-bit por linha (estes sao ct=6 bd=8 -> sem-op) */
@@ -240,16 +297,61 @@ static unsigned char* decode_png_to_4444(const unsigned char* buf, size_t len,
      * fragmentacao, ou se falta mesmo. (so' p/ tilesets grandes 4444, nao spam) */
     { extern void mkxp_mem_census(const char*, unsigned);
       mkxp_mem_census("tileset-pre", (unsigned)need4444); }
-    out = (unsigned char*)malloc(need4444);
-    if (!out) { out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr); }
+    /* [FIX-TSARENA] reserva a arena na 1a descodificacao gigante (heap ainda
+     * limpa -> linearAlloc(16MB) contiguo SUCEDE). TEM de ser aqui (cedo): no
+     * fallback de OOM a heap ja' esta' fragmentada e a reserva falharia (catch-22).
+     * Reserva 1x; fica idle depois (custo: 16MB fixos). g_tsarena_enabled=false reverte. */
+    if (g_tsarena_enabled && !g_ts_arena_init) {
+        g_ts_arena_init = true;
+        for (int i = 0; i < TS_ARENA_N; i++) {
+            /* [FIX-MAGENTA] Arena SO' de linearAlloc. A tentativa anterior de cair
+             * para malloc(16MB) roubava 16MB da HEAP no arranque -> o decode dos
+             * sprites de personagem (libpng/stb alocam na heap) ficava sem memoria
+             * -> PNGs validos falhavam a descodificar -> magenta (regressao: o
+             * Gilbert e NPCs ficaram rosa). A arena #1 nem chegava a ser usada (so'
+             * 1 tileset gigante por mapa -> arena #0 basta), logo os 16MB eram
+             * roubados em vao. Linear-only: se nao ha' 2o bloco contiguo, arena #1
+             * fica nula (= 1 arena, como antes) e a heap volta a ter espaco. */
+            g_ts_arena[i] = (unsigned char*)linearAlloc(TS_ARENA_SIZE);
+            if (g_dbglog) { fprintf(g_dbglog, "[FIX-TSARENA] reserva inicial arena #%d %zuMB (linear) -> %s\n", i, TS_ARENA_SIZE/(1024*1024), g_ts_arena[i] ? "OK" : "FALHOU (sem 2o bloco; 1 arena basta p/ 1 tileset gigante)"); dbg_flush(); }
+        }
+    }
+    /* [FIX-NOMEM] Alocacoes GRANDES (tilesets gigantes ~15MB): NUNCA na heap (malloc).
+     * Po-lo em malloc fazia o tileset competir com (a) o decode dos sprites de
+     * personagem -> magenta, e (b) a logica/transicao de cena -> NoMemoryError no fim
+     * da intro -> reinicio -> volta ao titulo. Ordem p/ grandes: ARENA (16MB ja'
+     * reservados, contiguos, SEM gastar linear/heap extra) -> linearAlloc -> (GC/evict).
+     * NUNCA malloc. Pequenas mantem malloc-1o (rapido). Limiar: 8MB. */
+    const bool _big_alloc = (need4444 >= 8u * 1024u * 1024u);
+    if (_big_alloc && g_tsarena_enabled) {
+        for (int i = 0; i < TS_ARENA_N; i++) {
+            if (g_ts_arena[i] && !g_ts_arena_busy[i] && need4444 <= TS_ARENA_SIZE) {
+                out = g_ts_arena[i]; g_ts_arena_busy[i] = true; used_linear = false;
+                if (g_dbglog) { fprintf(g_dbglog, "[FIX-TSARENA] tileset %zuKB -> ARENA #%d (1o recurso p/ grande; heap fica livre)\n", need4444/1024, i); dbg_flush(); }
+                break;
+            }
+        }
+    }
+    if (!out) {
+        if (_big_alloc) {
+            out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr);  /* grande: linear, NUNCA malloc */
+        } else {
+            out = (unsigned char*)malloc(need4444);
+            if (!out) { out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr); }
+        }
+    }
     if (!out) {
         /* malloc+linear cheios. Antes de desistir (magenta), reciclar bitmaps
          * ORFAOS via GC e RETENTAR. E' isto que liberta o tileset do mapa
          * anterior (ex: vila 15.5MB) que ficou desreferenciado mas nao disposto
          * -> o tileset do mapa novo (ex: quarto 8.5MB) passa a caber. */
         if (gc_reclaim_on_oom("4444")) {
-            out = (unsigned char*)malloc(need4444);
-            if (!out) { out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr); }
+            if (_big_alloc) {
+                out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr);
+            } else {
+                out = (unsigned char*)malloc(need4444);
+                if (!out) { out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr); }
+            }
         }
     }
     if (!out) {
@@ -261,20 +363,40 @@ static unsigned char* decode_png_to_4444(const unsigned char* buf, size_t len,
          * blit. O log [TEX|EVICT-LIN] mostra quanto libertou vs o que precisa. */
         extern unsigned display_3ds_evict_linear(unsigned want_bytes);
         if (display_3ds_evict_linear((unsigned)need4444) > 0) {
-            out = (unsigned char*)malloc(need4444);
-            if (!out) { out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr); }
+            if (_big_alloc) {
+                out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr);
+            } else {
+                out = (unsigned char*)malloc(need4444);
+                if (!out) { out = (unsigned char*)linearAlloc(need4444); used_linear = (out != nullptr); }
+            }
+        }
+    }
+    if (!out && g_tsarena_enabled) {
+        /* [FIX-TSARENA] ULTIMO RECURSO: usa a 1a das DUAS arenas que esteja LIVRE e
+         * onde caiba. Sem roubo -> nunca liberta pixels de bitmap vivo. */
+        int _slot = -1;
+        for (int i = 0; i < TS_ARENA_N; i++) {
+            if (g_ts_arena[i] && !g_ts_arena_busy[i] && need4444 <= TS_ARENA_SIZE) { _slot = i; break; }
+        }
+        if (_slot >= 0) {
+            out = g_ts_arena[_slot];
+            g_ts_arena_busy[_slot] = true;
+            used_linear = false;   /* nao e' malloc nem linear-normal: ts_arena_release trata da libertacao */
+            if (g_dbglog) { fprintf(g_dbglog, "[FIX-TSARENA] tileset %zuKB -> ARENA #%d (de %d) | era invisivel, agora carrega\n", need4444 / 1024, _slot, TS_ARENA_N); dbg_flush(); }
+        } else if (g_dbglog) {
+            fprintf(g_dbglog, "[FIX-TSARENA] AMBAS as arenas ocupadas -> este %zuKB cai no fallback normal (4o+ tileset gigante simultaneo)\n", need4444 / 1024); dbg_flush();
         }
     }
     if (!out) {
         png_destroy_read_struct(&png, &info, nullptr);
         { extern void mkxp_mem_census(const char*, unsigned);
           mkxp_mem_census("tileset-FALHOU", (unsigned)need4444); }
-        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] alloc 4444 FALHOU (mesmo apos GC+EVICT) need=%zuKB linear_livre=%.0fKB\n", need4444 / 1024, linearSpaceFree() / 1024.0); fflush(g_dbglog); }
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] alloc 4444 FALHOU (mesmo apos GC+EVICT+ARENA) need=%zuKB linear_livre=%.0fKB\n", need4444 / 1024, linearSpaceFree() / 1024.0); dbg_flush(); }
         return nullptr;
     }
     rowbuf = (png_bytep)malloc((size_t)w * 4u);
     if (!rowbuf) {
-        if (used_linear) linearFree((void*)out); else free((void*)out);
+        if (ts_arena_release((unsigned char*)out)) { } else if (used_linear) linearFree((void*)out); else free((void*)out);
         png_destroy_read_struct(&png, &info, nullptr);
         return nullptr;
     }
@@ -305,16 +427,16 @@ static unsigned char* decode_png_to_4444(const unsigned char* buf, size_t len,
         }
         if (!full) {
             free((void*)rowbuf); rowbuf = nullptr;
-            if (used_linear) linearFree((void*)out); else free((void*)out);
+            if (ts_arena_release((unsigned char*)out)) { } else if (used_linear) linearFree((void*)out); else free((void*)out);
             png_destroy_read_struct(&png, &info, nullptr);
-            if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] alloc RGBA p/ entrelacado FALHOU %ux%u (%zuKB)\n", (unsigned)w, (unsigned)h, fullsz / 1024); fflush(g_dbglog); }
+            if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444-ERR] alloc RGBA p/ entrelacado FALHOU %ux%u (%zuKB)\n", (unsigned)w, (unsigned)h, fullsz / 1024); dbg_flush(); }
             return nullptr;
         }
         rows = (png_bytep*)malloc((size_t)h * sizeof(png_bytep));
         if (!rows) {
             if (full_linear) linearFree((void*)full); else free((void*)full); full = nullptr;
             free((void*)rowbuf); rowbuf = nullptr;
-            if (used_linear) linearFree((void*)out); else free((void*)out);
+            if (ts_arena_release((unsigned char*)out)) { } else if (used_linear) linearFree((void*)out); else free((void*)out);
             png_destroy_read_struct(&png, &info, nullptr);
             return nullptr;
         }
@@ -332,7 +454,7 @@ static unsigned char* decode_png_to_4444(const unsigned char* buf, size_t len,
         }
         free((void*)rows); rows = nullptr;
         if (full_linear) linearFree((void*)full); else free((void*)full); full = nullptr;
-        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444] entrelacado %ux%u OK (%d passes)\n", (unsigned)w, (unsigned)h, n_passes); fflush(g_dbglog); }
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|PNG4444] entrelacado %ux%u OK (%d passes)\n", (unsigned)w, (unsigned)h, n_passes); dbg_flush(); }
     }
     png_read_end(png, nullptr);
     free((void*)rowbuf); rowbuf = nullptr;
@@ -341,11 +463,141 @@ static unsigned char* decode_png_to_4444(const unsigned char* buf, size_t len,
         fprintf(g_dbglog, "[BMP|PNG4444] '%ux%u' bd=%d ct=%d -> RGBA4444 %zuKB heap=%s OK\n",
                 (unsigned)w, (unsigned)h, bitd, colort, need4444 / 1024,
                 used_linear ? "LINEAR" : "malloc");
-        fflush(g_dbglog);
+        dbg_flush();
     }
     if (out_islinear) *out_islinear = (bool)used_linear;
     *out_w = (int)w;
     *out_h = (int)h;
+    return (unsigned char*)out;
+}
+
+/* ── DECODE COM DOWNSCALE PARA 8888 (pictures sobredimensionadas) ───────────
+ * O PICA200 so' suporta texturas ate' 1024x1024. As introPictures sao 1696px
+ * de largura (> 1024) -> impossiveis de meter numa textura -> ficavam magenta.
+ * E mesmo as <=1024 (832x928) nao cabiam na RAM linear esgotada -> magenta.
+ *
+ * Aqui decodificamos o PNG LINHA-A-LINHA (como o 4444, sem nunca segurar a
+ * imagem inteira) e fazemos BOX-AVERAGE de blocos scale*scale -> buffer 8888
+ * reduzido que (a) cabe numa textura <=1024 e (b) ocupa 1/scale^2 da RAM. As
+ * dimensoes ORIGINAIS continuam reportadas ao Ruby (width/height); so' a textura
+ * e' menor e o desenho estica-a (ver tex_scale no blit). NAO funciona em PNG
+ * entrelacado (Adam7) -> devolve nullptr e o chamador cai no caminho normal.
+ * Preenche out_w/out_h (dims REDUZIDAS da textura) e out_scale (fator usado). */
+static unsigned char* decode_png_downscaled(const unsigned char* buf, size_t len,
+                                            int max_dim, size_t budget_bytes,
+                                            int* out_w, int* out_h, int* out_scale,
+                                            bool* out_islinear) {
+    if (out_islinear) *out_islinear = false;
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!png) return nullptr;
+    png_infop info = png_create_info_struct(png);
+    if (!info) { png_destroy_read_struct(&png, nullptr, nullptr); return nullptr; }
+
+    unsigned char* volatile out = nullptr;
+    bool volatile used_linear = false;
+    png_bytep volatile rowbuf = nullptr;       /* 'scale' linhas de origem (w*4 cada) */
+    if (setjmp(png_jmpbuf(png))) {
+        if (rowbuf) free((void*)rowbuf);
+        if (out) { if (ts_arena_release((unsigned char*)out)) { } else if (used_linear) linearFree((void*)out); else free((void*)out); }
+        png_destroy_read_struct(&png, &info, nullptr);
+        if (g_dbglog) { fprintf(g_dbglog, "[FIX-PICDOWN-ERR] libpng longjmp (decode)\n"); dbg_flush(); }
+        return nullptr;
+    }
+
+    PngMemRdr rdr = { buf, len, 0 };
+    png_set_read_fn(png, &rdr, png_mem_read_cb);
+    png_read_info(png, info);
+
+    png_uint_32 w = 0, h = 0; int bitd = 0, colort = 0, interl = 0;
+    png_get_IHDR(png, info, &w, &h, &bitd, &colort, &interl, nullptr, nullptr);
+    if (w == 0 || h == 0) { png_destroy_read_struct(&png, &info, nullptr); return nullptr; }
+    if (interl != PNG_INTERLACE_NONE) {   /* Adam7 -> nao da' linha-a-linha */
+        png_destroy_read_struct(&png, &info, nullptr);
+        if (g_dbglog) { fprintf(g_dbglog, "[FIX-PICDOWN] %ux%u ENTRELACADO -> caminho normal\n", (unsigned)w, (unsigned)h); dbg_flush(); }
+        return nullptr;
+    }
+    /* normalizar tudo p/ RGBA 8-bit por linha (igual ao 4444) */
+    if (colort == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+    if (colort == PNG_COLOR_TYPE_GRAY && bitd < 8) png_set_expand_gray_1_2_4_to_8(png);
+    if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
+    if (bitd == 16) png_set_strip_16(png);
+    if (colort == PNG_COLOR_TYPE_GRAY || colort == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png);
+    if (colort == PNG_COLOR_TYPE_RGB || colort == PNG_COLOR_TYPE_GRAY ||
+        colort == PNG_COLOR_TYPE_PALETTE)
+        png_set_add_alpha(png, 0xFF, PNG_FILLER_AFTER);
+    png_read_update_info(png, info);
+
+    /* fator de downscale: o MINIMO que cabe em max_dim e no budget de RAM */
+    int scale = 1;
+    while (scale < 16) {
+        unsigned tw = (w + (unsigned)scale - 1) / (unsigned)scale;
+        unsigned th = (h + (unsigned)scale - 1) / (unsigned)scale;
+        if ((int)tw <= max_dim && (int)th <= max_dim &&
+            (size_t)tw * (size_t)th * 4u <= budget_bytes) break;
+        scale++;
+    }
+    unsigned ow = (w + (unsigned)scale - 1) / (unsigned)scale;
+    unsigned oh = (h + (unsigned)scale - 1) / (unsigned)scale;
+    size_t need = (size_t)ow * (size_t)oh * 4u;
+
+    out = (unsigned char*)malloc(need);
+    if (!out) { out = (unsigned char*)linearAlloc(need); used_linear = (out != nullptr); }
+    if (!out && gc_reclaim_on_oom("picdown")) {
+        out = (unsigned char*)malloc(need);
+        if (!out) { out = (unsigned char*)linearAlloc(need); used_linear = (out != nullptr); }
+    }
+    if (!out) {
+        extern unsigned display_3ds_evict_linear(unsigned want_bytes);
+        if (display_3ds_evict_linear((unsigned)need) > 0) {
+            out = (unsigned char*)malloc(need);
+            if (!out) { out = (unsigned char*)linearAlloc(need); used_linear = (out != nullptr); }
+        }
+    }
+    if (!out) {
+        png_destroy_read_struct(&png, &info, nullptr);
+        if (g_dbglog) { fprintf(g_dbglog, "[FIX-PICDOWN-ERR] alloc %ux%u (%zuKB) FALHOU\n", ow, oh, need/1024); dbg_flush(); }
+        return nullptr;
+    }
+    rowbuf = (png_bytep)malloc((size_t)scale * (size_t)w * 4u);
+    if (!rowbuf) {
+        if (ts_arena_release((unsigned char*)out)) { } else if (used_linear) linearFree((void*)out); else free((void*)out);
+        png_destroy_read_struct(&png, &info, nullptr);
+        return nullptr;
+    }
+    png_bytep rb = (png_bytep)rowbuf;
+    for (unsigned oy = 0; oy < oh; oy++) {
+        int rows_read = 0;
+        for (int k = 0; k < scale; k++) {
+            if (oy * (unsigned)scale + (unsigned)k >= h) break;
+            png_read_row(png, rb + (size_t)k * (size_t)w * 4u, nullptr);
+            rows_read++;
+        }
+        for (unsigned ox = 0; ox < ow; ox++) {
+            unsigned sr = 0, sg = 0, sb = 0, sa = 0, cnt = 0;
+            for (int kk = 0; kk < rows_read; kk++) {
+                for (int jj = 0; jj < scale; jj++) {
+                    unsigned ix = ox * (unsigned)scale + (unsigned)jj;
+                    if (ix >= w) break;
+                    png_bytep p = rb + (size_t)kk * (size_t)w * 4u + (size_t)ix * 4u;
+                    sr += p[0]; sg += p[1]; sb += p[2]; sa += p[3]; cnt++;
+                }
+            }
+            unsigned char* o = out + ((size_t)oy * (size_t)ow + (size_t)ox) * 4u;
+            if (cnt) { o[0]=(unsigned char)(sr/cnt); o[1]=(unsigned char)(sg/cnt);
+                       o[2]=(unsigned char)(sb/cnt); o[3]=(unsigned char)(sa/cnt); }
+            else { o[0]=o[1]=o[2]=o[3]=0; }
+        }
+    }
+    png_read_end(png, nullptr);
+    free((void*)rowbuf); rowbuf = nullptr;
+    png_destroy_read_struct(&png, &info, nullptr);
+    if (out_islinear) *out_islinear = (bool)used_linear;
+    *out_w = (int)ow; *out_h = (int)oh; *out_scale = scale;
+    if (g_dbglog) {
+        fprintf(g_dbglog, "[FIX-PICDOWN] %ux%u -> textura %ux%u (escala %d, %zuKB, heap=%s)\n",
+                (unsigned)w, (unsigned)h, ow, oh, scale, need/1024, used_linear ? "LINEAR" : "malloc");
+        dbg_flush();
+    }
     return (unsigned char*)out;
 }
 
@@ -408,12 +660,14 @@ static void bitmap_free(mrb_state*, void *p) {
     if (!b) return;
     g_live_bitmaps--;   /* SUPERDBG */
     if (b->pixels) {
-        if (b->pixels_linear) linearFree(b->pixels);  /* veio de linearAlloc */
+        if (ts_arena_release(b->pixels)) { }  /* [FIX-TSARENA] devolve a arena ao pool, nao liberta o bloco reservado */
+        else if (b->pixels_linear) linearFree(b->pixels);  /* veio de linearAlloc */
         else                  free(b->pixels);
     }
     if (b->tex)    display_3ds_free_texture(b->tex);
     free(b);
 }
+extern const mrb_data_type Bitmap3DSType;
 const mrb_data_type Bitmap3DSType = { "Bitmap", bitmap_free };
 
 #define GET_BMP(s) ((Bitmap3DS*)DATA_PTR(s))
@@ -465,13 +719,13 @@ static Bitmap3DS *bmp_alloc(int w, int h) {
                     fprintf(g_dbglog,
                         "[BMP|ALLOC-OOM] bmp_alloc(%dx%d=%uKB): heap normal esgotado -> linearAlloc OK (cartao/overlay salvo)\n",
                         w, h, (unsigned)(nbytes / 1024));
-                    fflush(g_dbglog);
+                    dbg_flush();
                 }
             } else if (g_dbglog) {
                 fprintf(g_dbglog,
                     "[BMP|ALLOC-FATAL] bmp_alloc(%dx%d=%uKB): calloc+GC+linearAlloc+EVICT TODOS falharam -> bitmap sem pixels\n",
                     w, h, (unsigned)(nbytes / 1024));
-                fflush(g_dbglog);
+                dbg_flush();
             }
         }
     }
@@ -480,6 +734,11 @@ static Bitmap3DS *bmp_alloc(int w, int h) {
     b->tex        = nullptr;
     return b;
 }
+
+/* [FIX-UNWRAP] exposto p/ sprite_binding: cria um Bitmap3DS valido minimo, usado
+ * como ultimo recurso quando um BitmapWrapper foi criado sem chamar super (sem
+ * DATA_PTR) -> evita o NULL (sprite sem bitmap) e a falha [BMP|UNWRAP]. */
+Bitmap3DS *bmp_alloc_public(int w, int h) { return bmp_alloc(w, h); }
 
 /* FIX MEMORIA (tilesets gigantes 256x31040 = 30MB que NAO carregavam): o caminho
  * normal era stbi_load (aloca 30MB) + bmp_alloc (aloca OUTROS 30MB) + memcpy ->
@@ -520,24 +779,46 @@ void __attribute__((used)) bmp_flush(Bitmap3DS *b) {
      * todos os frames). Deixamos os pixels em RAM (intactos p/ o blt) e marcamos
      * tex_failed (o draw ignora; se algum dia for desenhado direto, nao re-tenta).
      * Isto resolve os 32 tilesets gigantes do jogo sem tocar nos scripts. */
-    if (b->width > 1024 || b->height > 1024) {
+    /* DIMS DA TEXTURA GPU: por defeito = dims reportadas ao Ruby. Mas para PICTURES
+     * com DOWNSCALE (tex_scale>1) a textura e' menor (tex_w x tex_h, <=1024) embora
+     * width/height reportem o tamanho ORIGINAL (1696x704) ao jogo. Usamos as dims da
+     * textura no guard dos 1024 e na criacao; bitmaps normais (tex_scale 0/1) ficam
+     * exatamente como antes (flush_tw=width). */
+    int flush_tw = (b->tex_scale > 1 && b->tex_w > 0) ? b->tex_w : b->width;
+    int flush_th = (b->tex_scale > 1 && b->tex_h > 0) ? b->tex_h : b->height;
+    if (flush_tw > 1024 || flush_th > 1024) {
         b->tex_failed = true;
         b->tex_dirty  = false;   /* pixels continuam validos em RAM p/ blt */
+        return;
+    }
+    /* [LAYER0-REUSE 2026-07-02] anti-CHAO-PRETO: se ja' existe textura das MESMAS
+     * dimensoes, ATUALIZA-LA em-place (mesmo tex.data, sem free+create) em vez de
+     * libertar e recriar. RAIZ PROVADA (log: 28x CHAO_PRETO, maior_bloco~3.7MB<4MB):
+     * o @layer0 do tilemap (832x928 -> POT 1024x1024 = 4MB) e' re-flushado a CADA
+     * scroll; o free+create deixava a janela em que outra alocacao rouba o bloco de
+     * 4MB -> a recriacao caia em heap FRAGMENTADO -> chao (e copas de arvores) PRETO.
+     * Reusar mantem o bloco de 4MB alocado para sempre = zero fragmentacao, zero
+     * chao preto, e muito menos churn/GC. Generico p/ qualquer bitmap re-flushado
+     * (tilemap, planes). update_texture devolve false se as dims mudarem -> cai no
+     * free+create normal. */
+    if (b->tex && b->pixels && flush_tw > 0 && flush_th > 0 &&
+        display_3ds_update_texture(b->tex, flush_tw, flush_th, b->pixels)) {
+        b->tex_dirty = false;
         return;
     }
     if (b->tex) {
         display_3ds_free_texture(b->tex);
         b->tex = nullptr;
     }
-    if (b->pixels && b->width > 0 && b->height > 0) {
-        b->tex = display_3ds_create_texture(b->width, b->height, b->pixels, b->prefer_vram);
+    if (b->pixels && flush_tw > 0 && flush_th > 0) {
+        b->tex = display_3ds_create_texture(flush_tw, flush_th, b->pixels, b->prefer_vram);
         if (!b->tex) {
             /* FIX FPS: marcar que falhou p/ nao re-tentar todos os frames (o
              * draw verifica tex_failed). So' se re-tenta quando tex_dirty voltar
              * a true (pixels mudaram). Caso tipico: tileset >1024 (POT 1024 nao
              * chega) ou VRAM esgotada. Sem isto, loop de C3D_TexInit -> 2.2 fps. */
             b->tex_failed = true;
-            printf("[BMP] AVISO: create_texture falhou %dx%d\n", b->width, b->height);
+            printf("[BMP] AVISO: create_texture falhou %dx%d\n", flush_tw, flush_th);
         }
         else {
             /* [EVICT] registar o slot do dono para eviccao segura: se esta
@@ -619,6 +900,37 @@ extern "C" int mkxp_native_file_exists(const char *path) {
  * opendir falhar em todas -> 0 (= comportamento antigo, zero regressao). */
 extern "C" int mkxp_native_dir_exists(const char *path) {
     if (!path || path[0] == '\0') return 0;
+    /* [SAVE-DIR-FIX 2026-07-02] Tentar o path TAL-COMO primeiro. Os s_game_roots
+     * servem para paths RELATIVOS do jogo (ex: "Graphics/..."); um path ABSOLUTO
+     * como "sdmc:/mkxp/saves" prefixado por eles vira lixo ("sdmc:/mkxp/game/sdmc:/
+     * mkxp/saves") e o opendir falha SEMPRE -> File.directory?("sdmc:/mkxp/saves")
+     * dava false -> o Auto Multi Save punha SAVE_DIR='.' (raiz do sdmc) em vez de
+     * System.data_directory. Um opendir direto ao path resolve os absolutos sem
+     * afetar os relativos (esses continuam a cair no loop abaixo). */
+    {
+        char abso[512];
+        size_t pl = 0;
+        while (path[pl] && pl < sizeof(abso) - 1) { abso[pl] = path[pl]; pl++; }
+        abso[pl] = '\0';
+        while (pl > 1 && (abso[pl-1] == '/' || abso[pl-1] == '\\')) abso[--pl] = '\0';
+        DIR *d0 = opendir(abso);
+        if (d0) { closedir(d0); return 1; }
+        /* [SAVE-DIR-FIX v2 2026-07-03] opendir falhou mas a pasta pode existir na
+         * mesma (VFS do 3DS/Azahar e' inconsistente entre opendir/stat consoante o
+         * caminho). 2a camada: stat+S_ISDIR. 3a camada (INFALIVEL): tentar criar um
+         * ficheiro-prova dentro -- o fopen e' o unico primitivo 100% fiavel aqui
+         * (os saves de 0 bytes provam que ele escreve). Se conseguir, a pasta
+         * existe E e' gravavel; apaga logo a prova. So' para caminhos com ':' (
+         * absolutos de device, ex. sdmc:/...) para nao criar lixo em relativos. */
+        struct stat st2;
+        if (stat(abso, &st2) == 0 && S_ISDIR(st2.st_mode)) return 1;
+        if (pl > 0 && pl < sizeof(abso) - 16 && strchr(abso, ':')) {
+            char probe[560];
+            snprintf(probe, sizeof(probe), "%s/.mkxp_dirprobe", abso);
+            FILE *pf = fopen(probe, "wb");
+            if (pf) { fclose(pf); remove(probe); return 1; }
+        }
+    }
     for (int ri = 0; s_game_roots[ri] != nullptr; ri++) {
         const char *root = s_game_roots[ri];
         char full[512];
@@ -700,7 +1012,7 @@ static void mark_path_failed(const char* path) {
     extern FILE *g_dbglog;
     if (g_dbglog) {
         fprintf(g_dbglog, "[BMP|NCACHE] '%s' marcado falhado -> proximos pedidos = fallback imediato (cache ON)\n", path);
-        fflush(g_dbglog);
+        dbg_flush();
     }
 }
 /* Nao-static p/ ser chamavel pelo wrapper Ruby (bmp_clear_failed_loads). */
@@ -716,7 +1028,15 @@ static Bitmap3DS *make_fallback_bitmap(const char *path) {
      * O resto (charsets, tilesets...) continua magenta = erro bem visivel. */
     bool transparent = false;
     if (path) {
-        for (const char *p = path; *p; p++) {
+        /* Overlays DECORATIVOS de efeitos em falta -> transparente (invisivel, como
+         * no PC) em vez de magenta: pegadas EBDX ('Characters/steps*'), animacoes de
+         * ataque ('Animations/*') e sombras. Magenta nestes = quadrado rosa no chao/
+         * sobre o sprite. Charsets normais (NPCs) continuam magenta = erro visivel. */
+        if (strstr(path, "/steps") || strstr(path, "Animations/") ||
+            strstr(path, "animations/") || strstr(path, "/Shadows/")) {
+            transparent = true;
+        }
+        for (const char *p = path; !transparent && *p; p++) {
             if ((p[0]=='P'||p[0]=='p') &&
                 (strncmp(p, "Pictures/", 9) == 0 || strncmp(p, "pictures/", 9) == 0)) {
                 transparent = true; break;
@@ -753,6 +1073,36 @@ static Bitmap3DS *bmp_load_file(const char *path) {
         b->tex_dirty = true;
         bmp_flush(b);
         return b;
+    }
+
+    /* [EMPTY-GFX 2026-07-02] basename VAZIO ('Graphics/Characters/', etc.) e' um caso
+     * LEGITIMO do RGSS: "sem grafico". Acontece SEMPRE que um evento e' apagado
+     * (Game_Event#erase -> refresh -> @character_name="" -> Sprite_Character recarrega
+     * 'Graphics/Characters/'+''). No Windows isto da' um bitmap VAZIO (invisivel); aqui
+     * caia no fallback 32x32 MAGENTA OPACO -> a "ESTATUA"/pixel-rosa no lugar do evento
+     * apagado (provado: [STATUE-SPR] char='' bmp=32x32 vis=1, 40x no log 08:39, e o
+     * Gilbert-pixel-rosa). FIX raiz: devolver 32x32 TRANSPARENTE (alpha 0 -> 0 blits),
+     * sem tentativa de IO, sem [BMP|MISS], sem envenenar a NCACHE. Generico p/ qualquer
+     * jogo RMXP. */
+    {
+        const char *base = path;
+        for (const char *p = path; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
+        if (*base == '\0') {
+            Bitmap3DS *b = bmp_alloc(32, 32);
+            /* alpha 0 GARANTIDO: o caminho normal de bmp_alloc e' calloc (zerado),
+             * mas o fallback linearAlloc (OOM) NAO zera -> memset explicito. */
+            if (b && b->pixels) memset(b->pixels, 0, 32 * 32 * 4);
+            b->tex_dirty = true;
+            bmp_flush(b);
+            extern FILE *g_dbglog;
+            static int s_empty_n = 0;
+            if (g_dbglog && s_empty_n < 4) {
+                s_empty_n++;
+                fprintf(g_dbglog, "[BMP|EMPTY-GFX] '%s' basename vazio (evento apagado/sem grafico) -> 32x32 TRANSPARENTE (era magenta=estatua)\n", path);
+                dbg_flush();
+            }
+            return b;
+        }
     }
 
     /* CACHE NEGATIVA: se este caminho ja' falhou neste mapa, devolve o fallback
@@ -927,13 +1277,53 @@ static Bitmap3DS *bmp_load_file(const char *path) {
                                                     q_linear ? "LINEAR" : "malloc",
                                                     (double)gw * gh * 4 / 1048576.0,
                                                     (double)gw * gh * 2 / 1048576.0);
-                                            fflush(g_dbglog);
+                                            dbg_flush();
                                         }
                                         return b;
                                     }
                                     /* 4444 falhou -> segue p/ 8888 normal (magenta) */
                                 }
                             }
+                            /* Dims do header IHDR (p/ decidir downscale e reportar ao Ruby) */
+                            unsigned int pgw = ((unsigned)fbuf[16] << 24) | ((unsigned)fbuf[17] << 16) |
+                                               ((unsigned)fbuf[18] << 8)  |  (unsigned)fbuf[19];
+                            unsigned int pgh = ((unsigned)fbuf[20] << 24) | ((unsigned)fbuf[21] << 16) |
+                                               ((unsigned)fbuf[22] << 8)  |  (unsigned)fbuf[23];
+                            bool pic_is_tileset = (strstr(full, "Tileset") != nullptr) ||
+                                                  (strstr(full, "tileset") != nullptr);
+                            bool pic_over_1024  = (pgw > 1024 || pgh > 1024);
+
+                            /* PICTURE > 1024: o PICA200 nao consegue criar a textura ->
+                             * tentar libpng 8888 daria magenta de certeza. Vai DIRETO p/
+                             * downscale (box-average -> textura <=1024; dims originais
+                             * reportadas ao Ruby, o desenho estica via tex_scale). */
+                            if (g_picture_downscale && fsz >= 29 && !pic_is_tileset &&
+                                pic_over_1024 && pgw <= 8192 && pgh <= 8192) {
+                                int dw = 0, dh = 0, dscale = 1; bool d_linear = false;
+                                unsigned char* dpx = decode_png_downscaled(
+                                    /* [MEM] alvo 512 (nao 1024): o ecra do 3DS e' 400px;
+                                     * pictures grandes a 848px sao 2x o necessario e o POT
+                                     * arredonda 848->1024=2MB. 512 forca escala 4 (424px ->
+                                     * POT 512=0.5MB) -> -4.5MB na cutscene do Gilbert, SEM
+                                     * perda visivel (mostradas a 400px). budget 768KB. */
+                                    fbuf, (size_t)fsz, 512, (size_t)768 * 1024,
+                                    &dw, &dh, &dscale, &d_linear);
+                                if (dpx) {
+                                    free(fbuf);
+                                    Bitmap3DS *b = bmp_alloc_adopt((int)pgw, (int)pgh, dpx, d_linear);
+                                    if (dscale > 1) { b->tex_scale = dscale; b->tex_w = dw; b->tex_h = dh; }
+                                    b->tex_dirty = true;
+                                    bmp_flush(b);
+                                    if (g_dbglog) {
+                                        fprintf(g_dbglog, "[FIX-PICDOWN] '%s' %ux%u >1024 -> textura "
+                                                "%dx%d escala %d\n", full, pgw, pgh, dw, dh, dscale);
+                                        dbg_flush();
+                                    }
+                                    return b;
+                                }
+                                /* falhou (entrelacado?) -> tenta libpng por baixo */
+                            }
+
                             int lw = 0, lh = 0; bool l_linear = false;
                             unsigned char* lpx = decode_png_libpng(fbuf, (size_t)fsz, &lw, &lh, &l_linear);
                             if (lpx) {
@@ -942,17 +1332,44 @@ static Bitmap3DS *bmp_load_file(const char *path) {
                                     fprintf(g_dbglog, "[BMP|LIBPNG] '%s' %dx%d OK via "
                                             "libpng heap=%s\n", full, lw, lh,
                                             l_linear ? "LINEAR" : "malloc");
-                                    fflush(g_dbglog);
+                                    dbg_flush();
                                 }
                                 Bitmap3DS *b = bmp_alloc_adopt(lw, lh, lpx, l_linear);
                                 b->tex_dirty = true;
                                 bmp_flush(b);
                                 return b;
                             }
+                            /* libpng FALHOU para <=1024 (OOM/fragmentacao) -> ULTIMO RECURSO:
+                             * downscale (poupa RAM) antes de cair em magenta. So' nao-tileset. */
+                            if (g_picture_downscale && fsz >= 29 && !pic_is_tileset &&
+                                pgw <= 8192 && pgh <= 8192) {
+                                int dw = 0, dh = 0, dscale = 1; bool d_linear = false;
+                                unsigned char* dpx = decode_png_downscaled(
+                                    /* [MEM] alvo 512 (nao 1024): o ecra do 3DS e' 400px;
+                                     * pictures grandes a 848px sao 2x o necessario e o POT
+                                     * arredonda 848->1024=2MB. 512 forca escala 4 (424px ->
+                                     * POT 512=0.5MB) -> -4.5MB na cutscene do Gilbert, SEM
+                                     * perda visivel (mostradas a 400px). budget 768KB. */
+                                    fbuf, (size_t)fsz, 512, (size_t)768 * 1024,
+                                    &dw, &dh, &dscale, &d_linear);
+                                if (dpx) {
+                                    free(fbuf);
+                                    Bitmap3DS *b = bmp_alloc_adopt((int)pgw, (int)pgh, dpx, d_linear);
+                                    if (dscale > 1) { b->tex_scale = dscale; b->tex_w = dw; b->tex_h = dh; }
+                                    b->tex_dirty = true;
+                                    bmp_flush(b);
+                                    if (g_dbglog) {
+                                        fprintf(g_dbglog, "[FIX-PICDOWN] '%s' %ux%u OOM -> textura "
+                                                "%dx%d escala %d (recurso)\n", full, pgw, pgh, dw, dh, dscale);
+                                        dbg_flush();
+                                    }
+                                    return b;
+                                }
+                            }
                             if (g_dbglog) {
                                 fprintf(g_dbglog, "[BMP|LIBPNG] '%s' libpng FALHOU -> "
                                         "cai no stb (diagnostico abaixo)\n", full);
-                                fflush(g_dbglog);
+                                dbg_flush();
                             }
                         }
                         /* DEBUG CERTEIRO (cracker da contradicao 24MB-livres-mas-falha):
@@ -991,18 +1408,40 @@ static Bitmap3DS *bmp_load_file(const char *path) {
                                                     : "NEM-1 (falta memoria mesmo)");
                                 if (p1) free(p1);
                                 if (p2) free(p2);
-                                fflush(g_dbglog);
+                                dbg_flush();
                             }
                         }
                         unsigned char *mpx = stbi_load_from_memory(fbuf, (int)fsz,
                                                                    &mw, &mh, &mch, 4);
+                        /* [FIX-CHAR-GCRETRY] decode falhou = heap cheia de bitmaps
+                         * ORFAOS do mapa anterior (desreferenciados mas nao dispostos).
+                         * mrb_full_gc liberta-os e, via os destrutores, devolve a heap C
+                         * que o stbi_load_from_memory precisa. Retentar UMA vez com o fbuf
+                         * ainda em memoria -> sprite carrega em vez de magenta. So' na
+                         * falha (raro). Desliga: $MKXP_CHAR_GCRETRY=false. */
+                        if (!mpx) {
+                            bool gcretry_on = true;
+                            if (g_mkxp_mrb) {
+                                mrb_value _v = mrb_gv_get(g_mkxp_mrb, mrb_intern_lit(g_mkxp_mrb, "$MKXP_CHAR_GCRETRY"));
+                                if (mrb_test(_v) == false && !mrb_nil_p(_v)) gcretry_on = false;
+                            }
+                            if (gcretry_on && gc_reclaim_on_oom("char-decode")) {
+                                extern unsigned display_3ds_evict_linear(unsigned want_bytes);
+                                display_3ds_evict_linear(2u * 1024u * 1024u);
+                                mpx = stbi_load_from_memory(fbuf, (int)fsz, &mw, &mh, &mch, 4);
+                                if (mpx && g_dbglog) {
+                                    fprintf(g_dbglog, "[FIX-CHAR-GCRETRY] '%s' %dx%d OK apos full_gc+evict (heap estava apertada por orfaos)\n", full, mw, mh);
+                                    dbg_flush();
+                                }
+                            }
+                        }
                         free(fbuf);
                         if (mpx) {
                             if (g_dbglog) {
                                 fprintf(g_dbglog, "[BMP|M2OK] '%s' %dx%d decodificado de "
                                         "MEMORIA (o IO em stream do stb e' que falhava)\n",
                                         full, mw, mh);
-                                fflush(g_dbglog);
+                                dbg_flush();
                             }
                             Bitmap3DS *b = bmp_alloc_adopt(mw, mh, mpx);
                             b->tex_dirty = true;
@@ -1101,7 +1540,7 @@ static Bitmap3DS *bmp_load_file(const char *path) {
             if (g_dbglog) fprintf(g_dbglog, "[BMP|MISS]   tentou raiz[%d]: '%s' (+ .png/.gif/.PNG/...)\n", ri, shown);
             logged++;
         }
-        if (g_dbglog) fflush(g_dbglog);
+        if (g_dbglog) dbg_flush();
     }
     fflush(stdout);
     /* Marca o caminho como falhado (curto-circuita os proximos pedidos neste
@@ -1154,11 +1593,15 @@ mrb_value bmp_init(mrb_state *mrb, mrb_value self) {
             b = bmp_load_file(req_path);
             /* ── [LOADTRACE] (SUPERDBG): cada load de ficheiro -- pedido, dims,
              * formato, fallback. UNICO ponto por onde TODOS os loads passam.
-             * Cap 4000 linhas (loads sao cacheados -> nao por-frame). ──────── */
+             * [FIX-LOADTRACE-CAP] Cap BAIXADO 4000->120: o PlayerSprites recarrega
+             * centenas de vezes (nao cacheado) e o fprintf+fflush por load DRENA o
+             * FPS (bug 2). 120 chega p/ ver o padrao; depois cala-se -> sem dreno.
+             * Reverter: subir g_loadtrace_cap. ──────────────────────────────── */
             {
                 extern FILE *g_dbglog;
                 static int g_loadtrace_n = 0;
-                if (g_dbglog && g_loadtrace_n < 4000) {
+                static const int g_loadtrace_cap = 120;
+                if (g_dbglog && g_loadtrace_n < g_loadtrace_cap) {
                     g_loadtrace_n++;
                     if (b && b->pixels) {
                         bool maybe_magenta = (b->width == 32 && b->height == 32);
@@ -1170,7 +1613,9 @@ mrb_value bmp_init(mrb_state *mrb, mrb_value self) {
                         fprintf(g_dbglog, "[LOADTRACE] '%s' -> NULL/sem-pixels\n",
                                 req_path ? req_path : "(null)");
                     }
-                    fflush(g_dbglog);
+                    if (g_loadtrace_n == g_loadtrace_cap)
+                        fprintf(g_dbglog, "[FIX-LOADTRACE-CAP] LOADTRACE atingiu %d -> silenciado p/ poupar FPS (bug 2). Sobe g_loadtrace_cap p/ ver mais.\n", g_loadtrace_cap);
+                    dbg_flush();
                 }
             }
         } else if (mrb_integer_p(arg)) {
@@ -1213,6 +1658,23 @@ mrb_value bmp_init(mrb_state *mrb, mrb_value self) {
     return self;
 }
 
+/* ── [FIX-BMPDUP] dup/clone NATIVO (migrado do debug_probe BMPDUP) ─────────────
+ * Em mruby, dup/clone herdados de Object copiam o objeto SEM o DATA_PTR (C-DATA)
+ * -> o Bitmap copiado fica com DATA_PTR=NULL -> 0 blits -> sprite INVISIVEL
+ * ([BMP|UNWRAP] FALHOU type=16 no log; ~2007 falhas num item-get do map3). O
+ * motor ja' corrigia a CLASSE no boot (bitmapBindingReinit) mas dup/clone de
+ * INSTANCIAS voltava a corromper -- e isso era remendado em Ruby a cada dup. Agora
+ * dup/clone DELEGAM ao construtor-copia ja' testado (Bitmap.new(self) -> bmp_init
+ * faz bmp_alloc + memcpy dos pixels). Mesma classe (Bitmap/BitmapWrapper). Fonte
+ * partida/disposed -> bmp_init cai em 1x1 valida (nunca DATA_PTR=NULL). */
+static mrb_value bmp_dup(mrb_state *mrb, mrb_value self) {
+    struct RClass *cls = mrb_obj_class(mrb, self);
+    mrb_value cp = mrb_obj_new(mrb, cls, 1, &self);   /* == self.class.new(self) -> copia real */
+    { extern FILE *g_dbglog; static int n = 0;
+      if (g_dbglog && n < 6) { n++; fprintf(g_dbglog, "[FIX-BMPDUP] dup/clone nativo C++ -> copia real (anti sprite-invisivel)\n"); dbg_flush(); } }
+    return cp;
+}
+
 static mrb_value bmp_dispose(mrb_state*, mrb_value self) {
     Bitmap3DS *b = GET_BMP(self);
     if (b && !b->disposed) {
@@ -1230,7 +1692,8 @@ static mrb_value bmp_dispose(mrb_state*, mrb_value self) {
          * (fallback de OOM em bmp_alloc, ou PNG carregado p/ heap linear): nesse
          * caso free() corrompe o heap linear. Espelha o bitmap_free (GC). */
         if (b->pixels) {
-            if (b->pixels_linear) linearFree(b->pixels);
+            if (ts_arena_release(b->pixels)) { }  /* [FIX-TSARENA] devolve a arena, nao liberta */
+            else if (b->pixels_linear) linearFree(b->pixels);
             else                  free(b->pixels);
             b->pixels = nullptr;
         }
@@ -1298,6 +1761,14 @@ static mrb_value bmp_clear(mrb_state*, mrb_value self) {
 static inline void px_read(const Bitmap3DS *b, int idx,
                            unsigned char &r, unsigned char &g,
                            unsigned char &bl, unsigned char &a) {
+    /* [PICDOWN-GUARD] Bitmaps reduzidos pelo FIX-PICDOWN teem dims LOGICAS (width x
+     * height) MAIORES que o buffer REAL (tex_w x tex_h). Um blt que itere pelas dims
+     * logicas com stride logico lia FORA do buffer -> lixo/corrupcao de heap, e o
+     * professor/sprites da intro saiam invisiveis. Clampar SEMPRE a leitura ao buffer
+     * real (fora -> transparente). Custo: 1 mult + 1 compare por px (desprezavel). */
+    const int __maxpx = (b->tex_scale > 1 && b->tex_w > 0) ? (b->tex_w * b->tex_h)
+                                                           : (b->width * b->height);
+    if (idx < 0 || idx >= __maxpx) { r = g = bl = a = 0; return; }
     if (b->pixels_4444) {
         unsigned short v = ((const unsigned short*)b->pixels)[idx];
         r  = (unsigned char)(((v >> 12) & 0xF) * 17);
@@ -1332,6 +1803,20 @@ static mrb_value bmp_fill_rect(mrb_state *mrb, mrb_value self) {
 
     unsigned char R = (unsigned char)cr, G = (unsigned char)cg,
                   B = (unsigned char)cb, A = (unsigned char)ca;
+    /* [PERF 2026-07-04] fast-path memset quando os 4 canais sao iguais (o caso
+     * dominante e' o fill TRANSPARENTE (0,0,0,0) do tilemap/autotiles): memset
+     * por linha em vez de loop por pixel. Semantica identica. */
+    if (R == G && G == B && B == A) {
+        int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+        int x1 = x + w > b->width  ? b->width  : x + w;
+        int y1 = y + h > b->height ? b->height : y + h;
+        for (int py = y0; py < y1; py++) {
+            if (x1 > x0)
+                memset(b->pixels + ((size_t)py * b->width + x0) * 4, R, (size_t)(x1 - x0) * 4);
+        }
+        b->tex_dirty = true;
+        return mrb_nil_value();
+    }
     for (int py = y; py < y + h && py < b->height; py++) {
         if (py < 0) continue;
         for (int px2 = x; px2 < x + w && px2 < b->width; px2++) {
@@ -1341,6 +1826,123 @@ static mrb_value bmp_fill_rect(mrb_state *mrb, mrb_value self) {
             b->pixels[idx+1] = G;
             b->pixels[idx+2] = B;
             b->pixels[idx+3] = A;
+        }
+    }
+    b->tex_dirty = true;
+    return mrb_nil_value();
+}
+
+/* ── [COMPOSE 2026-07-04] blit cru fatorado de bmp_blt (linhas do clipping ao
+ * loop de pixels, sem mrb e sem diagnosticos). Usado por bmp_blt (via wrapper
+ * inalterado) e por bmp_compose_tiles (lote). Semantica de pixels IDENTICA. */
+static void blt_raw(Bitmap3DS *dst, const Bitmap3DS *src,
+                    int DX, int DY, int sx0, int sy0, int sw, int sh, int op) {
+    const int sW = src->width,  sH = src->height;
+    const int dW = dst->width,  dH = dst->height;
+    int i0 = 0;  if (-sx0 > i0) i0 = -sx0;  if (-DX > i0) i0 = -DX;
+    int i1 = sw; if (sW - sx0 < i1) i1 = sW - sx0;  if (dW - DX < i1) i1 = dW - DX;
+    int j0 = 0;  if (-sy0 > j0) j0 = -sy0;  if (-DY > j0) j0 = -DY;
+    int j1 = sh; if (sH - sy0 < j1) j1 = sH - sy0;  if (dH - DY < j1) j1 = dH - DY;
+    const int sScale = (src->tex_scale > 1) ? src->tex_scale : 1;
+    const int sBufW  = (sScale > 1 && src->tex_w > 0) ? src->tex_w : src->width;
+    unsigned char *dpx = dst->pixels;
+    for (int j = j0; j < j1; j++) {
+        const int srow = ((sy0 + j) / sScale) * sBufW;
+        const int drow = (DY  + j) * dW;
+        for (int i = i0; i < i1; i++) {
+            unsigned char sr, sg, sb, sal;
+            px_read(src, srow + ((sx0 + i) / sScale), sr, sg, sb, sal);
+            if (sal == 0) continue;
+            const int di = (drow + (DX + i)) * 4;
+            if (op >= 255 && sal == 255) {
+                dpx[di] = sr; dpx[di+1] = sg; dpx[di+2] = sb; dpx[di+3] = 255;
+                continue;
+            }
+            const int a  = (op >= 255) ? (int)sal : DIV255((int)sal * op);
+            if (a == 0) continue;
+            const int ia = 255 - a;
+            dpx[di]   = (unsigned char)DIV255(sr * a + dpx[di]   * ia);
+            dpx[di+1] = (unsigned char)DIV255(sg * a + dpx[di+1] * ia);
+            dpx[di+2] = (unsigned char)DIV255(sb * a + dpx[di+2] * ia);
+            dpx[di+3] = (unsigned char)DIV255(a * 255 + dpx[di+3] * ia);
+        }
+    }
+    dst->tex_dirty = true;
+}
+
+/* fill transparente (0,0,0,0) com clipping — memset por linha */
+static void compose_fill_trans(Bitmap3DS *dst, int x, int y, int w, int h) {
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w > dst->width  ? dst->width  : x + w;
+    int y1 = y + h > dst->height ? dst->height : y + h;
+    for (int py = y0; py < y1; py++)
+        if (x1 > x0)
+            memset(dst->pixels + ((size_t)py * dst->width + x0) * 4, 0, (size_t)(x1 - x0) * 4);
+    dst->tex_dirty = true;
+}
+
+/* Bitmap#compose_tiles(src, quads) — compose em LOTE para o tilemap.
+ * quads = Array PLANO de Integers, 6 por entrada: [dx, dy, sx, sy, w, h].
+ * sx == -1 -> fill transparente do rect destino. Substitui ~600-900 travessias
+ * Ruby->C++ de blt (cada uma com 4 interns + 4 iv_get do Rect) por UMA chamada.
+ * Pixels identicos ao blt (usa o mesmo blt_raw, op=255). Nunca levanta:
+ * entradas invalidas sao saltadas. */
+static mrb_value bmp_compose_tiles(mrb_state *mrb, mrb_value self) {
+    Bitmap3DS *dst = GET_BMP(self);
+    mrb_value srco, ary;
+    mrb_get_args(mrb, "oA", &srco, &ary);
+    if (!dst || !dst->pixels || dst->pixels_4444) return mrb_nil_value();
+    Bitmap3DS *src = (Bitmap3DS*)DATA_PTR(srco);
+    if (!src || !src->pixels) return mrb_nil_value();
+    const mrb_int n = RARRAY_LEN(ary);
+    const mrb_value *p = RARRAY_PTR(ary);
+    for (mrb_int i = 0; i + 5 < n; i += 6) {
+        if (!mrb_fixnum_p(p[i])   || !mrb_fixnum_p(p[i+1]) || !mrb_fixnum_p(p[i+2]) ||
+            !mrb_fixnum_p(p[i+3]) || !mrb_fixnum_p(p[i+4]) || !mrb_fixnum_p(p[i+5]))
+            continue;
+        int dx = (int)mrb_fixnum(p[i]),   dy = (int)mrb_fixnum(p[i+1]);
+        int sx = (int)mrb_fixnum(p[i+2]), sy = (int)mrb_fixnum(p[i+3]);
+        int w  = (int)mrb_fixnum(p[i+4]), h  = (int)mrb_fixnum(p[i+5]);
+        if (w <= 0 || h <= 0) continue;
+        if (sx < 0) compose_fill_trans(dst, dx, dy, w, h);
+        else        blt_raw(dst, src, dx, dy, sx, sy, w, h, 255);
+    }
+    return mrb_nil_value();
+}
+
+/* Bitmap#shift_pixels(dx, dy) — desloca o conteudo do bitmap (scroll do buffer
+ * do layer0 sem recompor tudo). Faixas expostas ficam TRANSPARENTES (0).
+ * memmove com ordem segura para overlap; vertical = 1 bloco contiguo. */
+static mrb_value bmp_shift_pixels(mrb_state *mrb, mrb_value self) {
+    Bitmap3DS *b = GET_BMP(self);
+    mrb_int dx, dy; mrb_get_args(mrb, "ii", &dx, &dy);
+    if (!b || !b->pixels || b->pixels_4444) return mrb_nil_value();
+    const int W = b->width, H = b->height;
+    const size_t S = (size_t)W * 4;
+    unsigned char *px = b->pixels;
+    if (dy != 0) {
+        if (dy > 0 && dy < H) {
+            memmove(px + (size_t)dy * S, px, (size_t)(H - dy) * S);
+            memset(px, 0, (size_t)dy * S);
+        } else if (dy < 0 && -dy < H) {
+            memmove(px, px + (size_t)(-dy) * S, (size_t)(H + dy) * S);
+            memset(px + (size_t)(H + dy) * S, 0, (size_t)(-dy) * S);
+        } else {
+            memset(px, 0, (size_t)H * S);
+        }
+    }
+    if (dx != 0) {
+        for (int y = 0; y < H; y++) {
+            unsigned char *row = px + (size_t)y * S;
+            if (dx > 0 && dx < W) {
+                memmove(row + (size_t)dx * 4, row, (size_t)(W - dx) * 4);
+                memset(row, 0, (size_t)dx * 4);
+            } else if (dx < 0 && -dx < W) {
+                memmove(row, row + (size_t)(-dx) * 4, (size_t)(W + dx) * 4);
+                memset(row + (size_t)(W + dx) * 4, 0, (size_t)(-dx) * 4);
+            } else {
+                memset(row, 0, (size_t)W * 4);
+            }
         }
     }
     b->tex_dirty = true;
@@ -1358,7 +1960,7 @@ static mrb_value bmp_blt(mrb_state *mrb, mrb_value self) {
     /* DESTINO 4444 nunca acontece (4444 e' so' fonte/tileset gigante). Falha-seguro:
      * escrever 4444 como 8888 corromperia -> registamos e saimos sem escrever. */
     if (dst->pixels_4444) {
-        if (g_dbglog) { fprintf(g_dbglog, "[BMP|4444-GUARD] blt p/ destino 4444 ignorado (%dx%d)\n", dst->width, dst->height); fflush(g_dbglog); }
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|4444-GUARD] blt p/ destino 4444 ignorado (%dx%d)\n", dst->width, dst->height); dbg_flush(); }
         return mrb_nil_value();
     }
     int sx0 = 0, sy0 = 0, sw = 0, sh = 0;
@@ -1376,14 +1978,23 @@ static mrb_value bmp_blt(mrb_state *mrb, mrb_value self) {
     int j0 = 0;  if (-sy0 > j0) j0 = -sy0;  if (-DY > j0) j0 = -DY;
     int j1 = sh; if (sH - sy0 < j1) j1 = sH - sy0;  if (dH - DY < j1) j1 = dH - DY;
 
+    /* [PICDOWN-BLT] Se a FONTE foi reduzida (FIX-PICDOWN, tex_scale>1), o buffer real
+     * e' tex_w x tex_h e o stride correto e' tex_w (NAO src->width). Itera-se pelas
+     * coords LOGICAS (clipping acima usa as dims logicas) mas a LEITURA mapeia para o
+     * buffer: (sx,sy)_logico -> (sx/scale, sy/scale)_buffer com stride tex_w. Para
+     * scale=1 (caso normal) e' identico ao antigo (divisao por 1, sem custo). Corrige
+     * a intro (professor invisivel/lixo) sem afetar blits normais. */
+    const int sScale = (src->tex_scale > 1) ? src->tex_scale : 1;
+    const int sBufW  = (sScale > 1 && src->tex_w > 0) ? src->tex_w : src->width;
+
     unsigned char *dpx = dst->pixels;
     const int op = (int)opacity;
     for (int j = j0; j < j1; j++) {
-        const int srow = (sy0 + j) * sW;
+        const int srow = ((sy0 + j) / sScale) * sBufW;
         const int drow = (DY  + j) * dW;
         for (int i = i0; i < i1; i++) {
             unsigned char sr, sg, sb, sal;
-            px_read(src, srow + (sx0 + i), sr, sg, sb, sal);
+            px_read(src, srow + ((sx0 + i) / sScale), sr, sg, sb, sal);
             if (sal == 0) continue;                    /* fonte 100% transparente */
             const int di = (drow + (DX + i)) * 4;
             if (op >= 255 && sal == 255) {             /* CAMINHO RAPIDO: copia opaca */
@@ -1425,7 +2036,7 @@ static mrb_value bmp_blt(mrb_state *mrb, mrb_value self) {
                     "-> SUSPEITA das setas (todas as frames de uma vez). dst=%dx%d @(%d,%d)\n",
                     src->width, src->height, sw, sx0,
                     dst->width, dst->height, (int)dx, (int)dy);
-                fflush(g_dbglog);
+                dbg_flush();
             }
         }
     }
@@ -1466,7 +2077,7 @@ static mrb_value bmp_stretch_blt(mrb_state *mrb, mrb_value self) {
     Bitmap3DS *src = (Bitmap3DS*)DATA_PTR(srco);
     if (!src || !src->pixels) return mrb_nil_value();
     if (dst->pixels_4444) {
-        if (g_dbglog) { fprintf(g_dbglog, "[BMP|4444-GUARD] stretch_blt p/ destino 4444 ignorado (%dx%d)\n", dst->width, dst->height); fflush(g_dbglog); }
+        if (g_dbglog) { fprintf(g_dbglog, "[BMP|4444-GUARD] stretch_blt p/ destino 4444 ignorado (%dx%d)\n", dst->width, dst->height); dbg_flush(); }
         return mrb_nil_value();
     }
 
@@ -1526,7 +2137,7 @@ static mrb_value bmp_stretch_blt(mrb_state *mrb, mrb_value self) {
                     "[SHEET?|STRETCH] tira %dx%d esticada INTEIRA (sw=%d, sx0=%d) -> "
                     "SUSPEITA das setas. dst d=(%d,%d,%d,%d)\n",
                     src->width, src->height, sw, sx0, dx, dy, dw, dh);
-                fflush(g_dbglog);
+                dbg_flush();
             }
         }
     }
@@ -1757,6 +2368,12 @@ static void fnt_draw_into_bitmap(Bitmap3DS *b, int x, int y,
  * 0=esq, 1=centro, 2=dir. */
 static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
     Bitmap3DS *b = GET_BMP(self);
+    /* [FIX-FPS] Diagnostico por-draw_text (DIAG-DT/DT-ALL/DIAG-DT-TXT/NAMEBOX-COL)
+     * fazia fprintf+fflush no cartao SD a CADA texto desenhado -> milhares de
+     * escritas sincronas = 322ms/frame e 'freeze'. Desligado por omissao (compilador
+     * remove os blocos). Por em true so' para diagnosticar texto. NAO afeta os FIXES
+     * (NAMEBOX-FIX reanima buffer; desenho real do texto) -- esses ficam sempre. */
+    static const bool DT_DIAG = false;
     /* DIAG-DT (cartao vazio -- SEMPRE ligado): apanha o caso que o early-return
      * '!b->pixels' a seguir engolia SEM deixar rasto. So' bitmaps ALTOS (o
      * overlay do cartao e' 384; exclui o dialogo 96 e os tiles 32). Para CADA
@@ -1770,7 +2387,7 @@ static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
      *     dispara e diz a cor/alpha do texto. */
     {
         static int s_dtn = 0;
-        if (b && b->height >= 200 && s_dtn < 80) {
+        if (DT_DIAG && b && b->height >= 200 && s_dtn < 80) {
             s_dtn++;
             extern FILE *g_dbglog;
             if (g_dbglog) {
@@ -1778,8 +2395,35 @@ static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
                     (void*)b, b->width, b->height,
                     (b->pixels ? "OK" : "NULL"), (b->disposed ? 1 : 0),
                     (b->tex ? "sim" : "nao"));
-                fflush(g_dbglog);
+                dbg_flush();
             }
+        }
+    }
+    /* [DT-ALL] super-debug: TODOS os draw_text (capado), incl. bitmaps PEQUENOS como o
+     * contents da caixa de NOME (368x64) que a [DIAG-DT] (>=200) nunca apanha. Expoe a
+     * causa suspeita (pixels=NULL -> no-op silencioso = caixa vazia). */
+    {
+        extern FILE *g_dbglog;
+        static int s_dtall = 0;
+        if (DT_DIAG && g_dbglog && b && b->height < 200 && s_dtall < 2000) {
+            s_dtall++;
+            fprintf(g_dbglog, "[DT-ALL] b=%p bmp=%dx%d pixels=%s disp=%d tdirty=%d 4444=%d\n",
+                    (void*)b, b->width, b->height, (b->pixels ? "OK" : "NULL"),
+                    b->disposed ? 1 : 0, b->tex_dirty ? 1 : 0, b->pixels_4444 ? 1 : 0);
+            dbg_flush();
+        }
+    }
+    /* [NAMEBOX-FIX] REANIMAR o buffer: se o contents (caixa de nome/janela) perdeu ou
+     * nunca teve pixels (calloc falhou sob pressao de memoria), o draw_text fazia no-op
+     * SILENCIOSO -> texto invisivel = caixa branca VAZIA. Tentar re-alocar da' 2a hipotese. */
+    if (b && !b->pixels && !b->pixels_4444 && !b->disposed && b->width > 0 && b->height > 0) {
+        size_t __nb = (size_t)b->width * b->height * 4;
+        b->pixels = (unsigned char*)calloc(__nb, 1);
+        if (b->pixels) {
+            b->pixels_linear = false;
+            b->tex_dirty = true;
+            extern FILE *g_dbglog;
+            if (g_dbglog) { fprintf(g_dbglog, "[NAMEBOX-FIX] reanimado buffer %dx%d (era pixels=NULL)\n", b->width, b->height); dbg_flush(); }
         }
     }
     if (!b || !b->pixels) return mrb_nil_value();
@@ -1808,6 +2452,33 @@ static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
     }
     if (!str || slen <= 0) return mrb_nil_value();
 
+    /* [DIAG-SPRITE0] "intro da professora mostra '0' em vez do nome": loga
+     * QUALQUER draw_text cujo texto seja so' digitos curtos (ex: "0"), em
+     * qualquer bitmap, com dimensoes/rect -> identifica ONDE o "0" e' escrito.
+     * (A CAUSA do valor ser "0" e' Ruby -- nome/variavel; mas isto confirma que
+     * passa por draw_text e em que bitmap.) Dedup por texto, cap a 40. */
+    if (slen >= 1 && slen <= 4) {
+        bool only_digits = true;
+        for (int i = 0; i < (int)slen; i++) if (str[i] < '0' || str[i] > '9') { only_digits = false; break; }
+        if (only_digits) {
+            static char seen[40][8]; static int seen_n = 0;
+            char key[8]; int kn = (slen < 7) ? (int)slen : 7;
+            for (int i = 0; i < kn; i++) key[i] = str[i]; key[kn] = 0;
+            bool dup = false;
+            for (int i = 0; i < seen_n; i++) if (!strcmp(seen[i], key)) { dup = true; break; }
+            if (!dup && seen_n < 40) {
+                for (int i = 0; i <= kn; i++) seen[seen_n][i] = key[i];
+                seen_n++;
+                extern FILE *g_dbglog;
+                if (g_dbglog) {
+                    fprintf(g_dbglog, "[DIAG-SPRITE0] draw_text digitos='%s' em bmp=%dx%d rect=(%d,%d,%d,%d)\n",
+                        key, b->width, b->height, ax, ay, aw, ah);
+                    dbg_flush();
+                }
+            }
+        }
+    }
+
     /* [DIAG-DT-TXT] Complemento do DIAG-DT: agora que o texto esta' extraido,
      * regista o conteudo (so' bitmaps ALTOS >=200, p/ apanhar o overlay do
      * cartao 512x384 e excluir o dialogo 96). Se ao abrir o cartao virmos aqui
@@ -1815,7 +2486,7 @@ static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
      * a causa do cartao vazio passa a ser composicao/z-order do overlay, nao o
      * texto. Se NUNCA aparecer com o conteudo do cartao -> o texto vai por outro
      * caminho. Cap p/ nao encher o log. */
-    if (b && b->height >= 200) {
+    if (DT_DIAG && b && b->height >= 200) {
         static int s_dttx = 0;
         if (s_dttx < 120) {
             s_dttx++;
@@ -1826,7 +2497,7 @@ static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
             if (g_dbglog) {
                 fprintf(g_dbglog, "[DIAG-DT-TXT] bmp=%dx%d rect=(%d,%d,%d,%d) txt='%s'\n",
                     b->width, b->height, ax, ay, aw, ah, tb);
-                fflush(g_dbglog);
+                dbg_flush();
             }
         }
     }
@@ -1854,6 +2525,22 @@ static mrb_value bmp_draw_text(mrb_state *mrb, mrb_value self) {
     /* baseline vertical: centra a linha (~22px) na altura da celula */
     int lineH = 22;
     int drawY = ay + ((ah > lineH) ? (ah - lineH) / 2 : 0);
+
+    /* [NAMEBOX-COL] CAIXA DE NOME (advisor): o texto desenha (pixels=OK) mas e' INVISIVEL.
+     * Logar a COR + posicao em bitmaps pequenos (269x32). Se cor=255,255,255 e font_nil=1
+     * -> texto BRANCO por defeito (white-on-claro) = a causa. Tambem ve se drawX/Y cabem. */
+    if (DT_DIAG && b->height < 200) {
+        extern FILE *g_dbglog;
+        static int s_nbc = 0;
+        if (g_dbglog && s_nbc < 1500) {
+            s_nbc++;
+            fprintf(g_dbglog, "[NAMEBOX-COL] bmp=%dx%d str='%.24s' cor=%d,%d,%d,%d font_nil=%d "
+                    "rect=(%d,%d,%d,%d) draw=(%d,%d) tw=%d\n",
+                    b->width, b->height, str ? str : "", R, G, B, A, mrb_nil_p(fobj) ? 1 : 0,
+                    ax, ay, aw, ah, drawX, drawY, tw);
+            dbg_flush();
+        }
+    }
 
     fnt_draw_into_bitmap(b, drawX, drawY, str, (int)slen, R, G, B, A);
     b->has_text = true;   /* -> textura usa filtro LINEAR (texto legivel no downscale) */
@@ -2060,7 +2747,7 @@ void bitmapBindingInit(mrb_state *mrb) {
         extern FILE *g_dbglog;
         const char *m = "[BUILD-CHK-J20] bitmap_binding_3ds ATIVO (draw_text/DIAG-DT presentes)\n";
         printf("%s", m);
-        if (g_dbglog) { fprintf(g_dbglog, "%s", m); fflush(g_dbglog); }
+        if (g_dbglog) { fprintf(g_dbglog, "%s", m); dbg_flush(); }
     }
 
     /* Pré-criar BitmapWrapper como subclasse C com MRB_TT_DATA ANTES dos scripts.
@@ -2085,7 +2772,12 @@ void bitmapBindingInit(mrb_state *mrb) {
     mrb_define_method(mrb, k, "clear_rect",         bmp_clear_rect,        MRB_ARGS_REQ(1)|MRB_ARGS_OPT(3));
     mrb_define_method(mrb, k, "gradient_fill_rect", bmp_gradient_fill_rect,MRB_ARGS_REQ(3)|MRB_ARGS_OPT(2));
     mrb_define_method(mrb, k, "blt",                bmp_blt,               MRB_ARGS_REQ(4)|MRB_ARGS_OPT(1));
+    /* [COMPOSE 2026-07-04] compose em lote + shift do buffer (tilemap layer0) */
+    mrb_define_method(mrb, k, "compose_tiles",      bmp_compose_tiles,     MRB_ARGS_REQ(2));
+    mrb_define_method(mrb, k, "shift_pixels",       bmp_shift_pixels,      MRB_ARGS_REQ(2));
     mrb_define_method(mrb, k, "stretch_blt",        bmp_stretch_blt,       MRB_ARGS_REQ(3)|MRB_ARGS_OPT(1));
+    mrb_define_method(mrb, k, "dup",                bmp_dup,               MRB_ARGS_NONE());   /* [FIX-BMPDUP] copia real (C-DATA) */
+    mrb_define_method(mrb, k, "clone",              bmp_dup,               MRB_ARGS_NONE());   /* [FIX-BMPDUP] idem */
     mrb_define_method(mrb, k, "draw_text",          bmp_draw_text,         MRB_ARGS_REQ(2)|MRB_ARGS_OPT(4));
     mrb_define_method(mrb, k, "text_size",          bmp_text_size,         MRB_ARGS_REQ(1));
     mrb_define_method(mrb, k, "get_pixel",          bmp_get_pixel,         MRB_ARGS_REQ(2));
@@ -2132,7 +2824,7 @@ void bitmapBindingReinit(mrb_state *mrb) {
         mrb_define_method(mrb, k, "initialize", bmp_init, MRB_ARGS_ANY());
         if (g_dbglog) {
             fprintf(g_dbglog, "[BMP|REINIT] Bitmap MRB_TT_DATA + bmp_init rebound OK\n");
-            fflush(g_dbglog);
+            dbg_flush();
         }
     }
 
@@ -2147,14 +2839,14 @@ void bitmapBindingReinit(mrb_state *mrb) {
             if (g_dbglog) {
                 fprintf(g_dbglog,
                     "[BMP|REINIT] BitmapWrapper MRB_TT_DATA + bmp_init rebound OK\n");
-                fflush(g_dbglog);
+                dbg_flush();
             }
         }
     } else {
         if (g_dbglog) {
             fprintf(g_dbglog,
                 "[BMP|REINIT] BitmapWrapper nao encontrado (jogo nao usa PE?)\n");
-            fflush(g_dbglog);
+            dbg_flush();
         }
     }
 }

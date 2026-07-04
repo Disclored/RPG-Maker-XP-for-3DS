@@ -57,6 +57,33 @@ static inline void cpad_axis(bool* pressed, bool* released, int n,
     }
 }
 
+/* [FIX-INPUT-RGSS] Variante "estado mantido" do circle pad: a direcao fica
+ * ON enquanto a magnitude > CPAD_ON, e so' sai abaixo de CPAD_OFF (mesma
+ * histerese, mas interpretada como NIVEL, nao flanco). */
+static inline void cpad_held(bool* held, int n, int key, bool* state, int mag) {
+    if (key >= n) return;
+    if (!*state && mag > CPAD_ON)      *state = true;
+    else if (*state && mag < CPAD_OFF) *state = false;
+    if (*state) held[key] = true;
+}
+
+/* [FIX-INPUT-RGSS] Poll do estado MANTIDO (nivel). Ver input_3ds.h.
+ * Nao calcula flancos -- isso passa a ser feito em Input.update (input_binding).*/
+void input_3ds_poll_held(bool* held, int n) {
+    hidScanInput();
+    u32 kh = hidKeysHeld();
+    for (int i = 0; i < MSIZ; i++) {
+        int k = (int)MAP[i].key;
+        if (k < 0 || k >= n) continue;
+        if (kh & MAP[i].btn) held[k] = true;
+    }
+    circlePosition c; hidCircleRead(&c);
+    cpad_held(held, n, RMXP_UP,    &s_cp_up,     (int)c.dy);
+    cpad_held(held, n, RMXP_DOWN,  &s_cp_down,  -(int)c.dy);
+    cpad_held(held, n, RMXP_LEFT,  &s_cp_left,  -(int)c.dx);
+    cpad_held(held, n, RMXP_RIGHT, &s_cp_right,  (int)c.dx);
+}
+
 void input_3ds_poll(bool* pressed, bool* released, int n) {
     hidScanInput();
     u32 dn = hidKeysDown(), up = hidKeysUp();

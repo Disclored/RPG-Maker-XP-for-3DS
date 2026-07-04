@@ -68,4 +68,10 @@ const char* dbg_cat_name(uint32_t cat) {
 
 void dbg_set_mask(uint32_t mask) { g_dbg_mask = mask; }
 uint32_t dbg_get_mask(void)      { return g_dbg_mask; }
-void dbg_set_frame(int frame)    { g_dbg_frame = frame; }
+void dbg_set_frame(int frame)    {
+    g_dbg_frame = frame;
+    /* [TAIL-FLUSH] flush periodico (1 por ~90 frames, barato) para o FIM do log chegar ao
+     * disco apesar do throttle de 256 escritas do DBGLOG/dbg_flush. Sem isto, ao fechar o
+     * jogo perdiam-se as ultimas ~256 linhas (menu/Gilbert de fim de sessao). Nao afeta FPS. */
+    if (g_dbglog && frame >= 0 && (frame % 90) == 0) fflush(g_dbglog);
+}

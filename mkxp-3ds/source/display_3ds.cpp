@@ -2,6 +2,8 @@
 #include "debug_3ds.h"
 #include "audio_3ds.h"
 #include "profile_3ds.h"
+#include <mruby.h>            /* [PERF-SYNCDRAW] ler o kill-switch $MKXP_SYNCDRAW */
+#include <mruby/variable.h>
 #include <cstring>
 #include <stdio.h>
 #include <vector>
@@ -12,7 +14,7 @@ extern FILE *g_dbglog;
  * para evitar I/O sincrono ao cartao SD por frame. Contador global partilhado. */
 extern int g_dbglog_flushc;
 #define printf(fmt, ...) do { if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); \
-    if (++g_dbglog_flushc >= 512) { g_dbglog_flushc = 0; fflush(g_dbglog); } } } while(0)
+    if (++g_dbglog_flushc >= 512) { g_dbglog_flushc = 0; dbg_flush(); } } } while(0)
 
 #define TOP_W 400
 #define TOP_H 240
@@ -137,6 +139,42 @@ static bool evict_idle_textures(DS3Texture* self, unsigned want_bytes, int frame
     return freed > 0;
 }
 
+/* ── [TEXCENSUS] A medicao DECISIVA (advisor): das ~102 texturas vivas, QUAIS sao?
+ * Leak (velhas, cena anterior, idle ha' muito) -> evictar resolve. Working-set vivo
+ * (recentes, desenhadas agora) -> so' REDUZIR resolve. Dump das top 20 por tamanho com
+ * idade (frames desde create) e idle (frames desde ultimo blit). Capado a 1x/120 frames
+ * para nao inundar; chamado quando uma textura grande falha (= o momento do chao preto). */
+static void tex_census(const char* tag) {
+    extern FILE *g_dbglog;
+    static int s_last_census = -1000;
+    if (s_frame_count - s_last_census < 120) return;   /* throttle */
+    s_last_census = s_frame_count;
+    if (!g_dbglog) return;
+    std::vector<DS3Texture*> snap;
+    size_t total_kb = 0; int n_vram = 0; size_t vram_kb = 0;
+    for (size_t i = 0; i < s_live_texs.size(); i++) {
+        DS3Texture* t = s_live_texs[i];
+        if (!t || !t->valid) continue;
+        snap.push_back(t);
+        total_kb += t->pot_bytes / 1024;
+        if (t->in_vram) { n_vram++; vram_kb += t->pot_bytes / 1024; }
+    }
+    std::sort(snap.begin(), snap.end(),
+              [](DS3Texture* a, DS3Texture* b){ return a->pot_bytes > b->pot_bytes; });
+    fprintf(g_dbglog, "[TEXCENSUS:%s] frame=%d vivas=%d total=%uKB | VRAM %d tex %uKB | top20:\n",
+            tag ? tag : "?", s_frame_count, (int)snap.size(), (unsigned)total_kb, n_vram, (unsigned)vram_kb);
+    int lim = (int)snap.size(); if (lim > 20) lim = 20;
+    for (int i = 0; i < lim; i++) {
+        DS3Texture* t = snap[i];
+        int age  = s_frame_count - t->create_frame;
+        int idle = (t->last_blit_frame >= 0) ? (s_frame_count - t->last_blit_frame) : -1;
+        fprintf(g_dbglog, "[TEXCENSUS]   %dx%d %uKB %s age=%df idle=%df dono=%s\n",
+                t->width, t->height, t->pot_bytes / 1024, t->in_vram ? "VRAM" : "lin",
+                age, idle, t->owner_slot ? "sim" : "nao");
+    }
+    dbg_flush();
+}
+
 /* ── [MEM] Maior bloco CONTIGUO de heap linear + censo de memoria ────────────
  * O linearSpaceFree() diz o TOTAL livre, mas o decode de um tileset precisa de
  * um bloco CONTIGUO. Com fragmentacao pode haver 14MB livres e mesmo assim um
@@ -190,7 +228,7 @@ void mkxp_mem_census(const char* tag, unsigned need_bytes) {
         mfree/1024.0, s_tex_alive, s_tex_bytes/1024.0,
         evictable, evict_bytes/1024.0, vramSpaceFree()/1024.0, veredito);
     printf("%s", buf);
-    if (g_dbglog) { fprintf(g_dbglog, "%s", buf); fflush(g_dbglog); }
+    if (g_dbglog) { fprintf(g_dbglog, "%s", buf); dbg_flush(); }
 }
 
 /* ── [EVICT-LIN] Eviccao de EMERGENCIA p/ caber um tileset grande (4444) ──────
@@ -227,6 +265,10 @@ unsigned display_3ds_evict_linear(unsigned want_bytes) {
         if (!t || !t->valid) continue;
         if (!t->owner_slot) continue;          /* sem dono -> seguranca, nao mexer */
         if (t->last_blit_frame < 0) continue;  /* nunca desenhada = mapa NOVO -> poupar */
+        if (t->last_blit_frame == s_frame_count) continue;  /* [ANTI-PRETO] desenhada ESTE
+            frame -> NAO sacrificar: era a causa do chao preto/flicker (a eviccao-forte
+            evictava o @layer0 do tilemap que e' preciso AGORA, depois recriava-o ->
+            thrash). So' evictamos texturas de frames ANTERIORES (fora do ecra atual). */
         snapshot.push_back(t);
     }
     std::sort(snapshot.begin(), snapshot.end(),
@@ -251,7 +293,7 @@ unsigned display_3ds_evict_linear(unsigned want_bytes) {
                 freed, freed_bytes/1024.0, lin_before/1024.0, lin_after/1024.0,
                 (lin_after-lin_before)/1024.0, big_before/1024.0, big_after/1024.0,
                 want_bytes/1024.0, ok);
-        fflush(g_dbglog);
+        dbg_flush();
     }
     return freed_bytes;
 }
@@ -335,7 +377,26 @@ void display_3ds_begin_frame() {
         return;
     }
 
-    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    /* [PERF-SYNCDRAW 2026-07-04] C3D_FRAME_SYNCDRAW esperava um vblank NOVO em
+     * TODOS os frames (C3D_FrameSync no citro3d: loop gspWaitForAnyEvent ate' o
+     * frameCounter dos DOIS ecras avancar) = ~8ms de media, ate' 16.7ms, ANTES
+     * de comecar o render — invisivel ao DIAG-PERF (corre antes do t0) e em
+     * DUPLICADO com o pacing proprio do motor (PACING SEM PRECIPICIO no
+     * graphics_binding). Com flags=0 o swap continua vblank-bound na fila do
+     * citro3d (sem tearing); o pacing do motor continua a mandar no ritmo.
+     * Kill-switch: $MKXP_SYNCDRAW=true repoe o comportamento antigo. */
+    {
+        static int sd_mode = -1;
+        if (sd_mode < 0) {
+            extern mrb_state *g_mkxp_mrb;
+            sd_mode = 0;
+            if (g_mkxp_mrb) {
+                mrb_value sv = mrb_gv_get(g_mkxp_mrb, mrb_intern_lit(g_mkxp_mrb, "$MKXP_SYNCDRAW"));
+                if (!mrb_nil_p(sv) && mrb_test(sv)) sd_mode = 1;
+            }
+        }
+        C3D_FrameBegin(sd_mode == 1 ? C3D_FRAME_SYNCDRAW : 0);
+    }
     s_in_frame = true;
     /* PROFILING: o tempo desde o end_frame anterior ate' aqui foi a LOGICA do
      * jogo (update Ruby: Scene#update, eventos, input). A partir daqui ate' ao
@@ -367,7 +428,7 @@ void display_3ds_end_frame() {
         extern FILE *g_dbglog;
         if (g_dbglog) {
             fprintf(g_dbglog, "[HEARTBEAT] vivo -- frame %d\n", s_frame_count);
-            fflush(g_dbglog);
+            dbg_flush();
         }
     }
 
@@ -462,7 +523,7 @@ void display_3ds_end_frame() {
             (unsigned long long)g_prof_objs_created,
             (unsigned long long)g_prof_frees);
         printf("%s", line);
-        if (g_dbglog) { fprintf(g_dbglog, "%s", line); fflush(g_dbglog); }
+        if (g_dbglog) { fprintf(g_dbglog, "%s", line); dbg_flush(); }
         /* reset das zonas de frame para a media ser dos ULTIMOS 60 frames, nao
          * acumulada desde o boot (senao a media fica "achatada" e nao reflete o
          * estado atual, ex: menu vs mapa). */
@@ -586,6 +647,65 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba, 
         }
     }
 
+    /* [EVICT-FORTE] Anti-CHAO-PRETO: texturas GRANDES (>=1MB; ex.: @layer0 do
+     * tilemap 832x704 -> POT 1024x1024 = 4MB) sao criticas. Se a criacao falha,
+     * o chao do mapa fica PRETO (e' composto em RAM mas sem textura na GPU). O
+     * evict_idle_textures acima so' liberta texturas IDLE (>=120 frames sem blit);
+     * numa cena cheia raramente ha' idle suficiente p/ um bloco CONTIGUO de 4MB,
+     * por isso o layer0 falha repetidamente (log: tex_fail=101 e a crescer). Aqui,
+     * SO' para texturas grandes e SO' depois de tudo falhar, usamos a eviccao FORTE
+     * (display_3ds_evict_linear: evicta tambem texturas JA' desenhadas -- recriadas
+     * do b->pixels no proximo blit, nunca UAF) e retentamos algumas vezes; em ultimo
+     * recurso tentamos VRAM. Trade-off correto: CHAO visivel > manter texturas de
+     * dialogo/sprites em cache. Custo zero no caminho normal (so' corre apos falha). */
+    if (!init_ok && (unsigned)(tw * th * 4) >= 1024u * 1024u) {
+        extern unsigned display_3ds_evict_linear(unsigned want_bytes);
+        unsigned want = (unsigned)(tw * th * 4);
+        /* [TEXDIAG] ISOLAR o chao preto: estado de memoria ANTES de tentar a textura
+         * grande. Mostra se a falha e' VRAM cheia, falta de RAM, ou FRAGMENTACAO
+         * (linear livre alto mas maior_bloco < want). g_dbglog SEMPRE (sem throttle).*/
+        extern FILE *g_dbglog;
+        unsigned vram0 = (unsigned)vramSpaceFree();
+        unsigned lin0  = (unsigned)linearSpaceFree();
+        unsigned big0  = linear_biggest_block();
+        int      tried_vram = 0, evict_rounds = 0;
+        /* VRAM PRIMEIRO: a textura grande do chao (4MB) CABE na VRAM se estiver livre.
+         * [ANTI-PRETO-VRAM] PROVADO pelo [TEXDIAG|BIG]: o layer0 precisa 4096KB, a VRAM
+         * tem 4119KB livres, MAS o check exigia +256KB de KEEP (4352) -> falhava por
+         * 233KB e nunca tentava VRAM (tried_vram=0) -> caia no linear FRAGMENTADO ->
+         * chao preto. Aqui (ultimo recurso, depois do linear ja' ter falhado) DROPAMOS
+         * a margem KEEP: o chao visivel vale mais que 256KB de folga de VRAM. So' p/ a
+         * textura grande critica; se nem 'want' couber, cai na eviccao-forte do linear. */
+        if (vramSpaceFree() >= want) {
+            tried_vram = 1;
+            if (C3D_TexInitVRAM(&tex->tex, (u16)tw, (u16)th, GPU_RGBA8)) {
+                init_ok = true; tex->in_vram = true;
+            }
+        }
+        for (int attempt = 0; attempt < 4 && !init_ok; attempt++) {
+            evict_rounds++;
+            if (display_3ds_evict_linear(want + want / 2u) == 0) break; /* nada mais p/ libertar */
+            init_ok = C3D_TexInit(&tex->tex, (u16)tw, (u16)th, GPU_RGBA8);
+        }
+        unsigned big1 = linear_biggest_block();
+        if (g_dbglog) {
+            fprintf(g_dbglog,
+                "[TEXDIAG|BIG] src=%dx%d POT=%dx%d need=%uKB | ANTES vram=%uKB linear=%uKB maior_bloco=%uKB"
+                " | tried_vram=%d evict_rounds=%d | DEPOIS maior_bloco=%uKB -> %s (%s)\n",
+                w, h, tw, th, want/1024, vram0/1024, lin0/1024, big0/1024,
+                tried_vram, evict_rounds, big1/1024,
+                init_ok ? "OK" : "FALHOU->CHAO_PRETO",
+                init_ok ? (tex->in_vram ? "VRAM" : "linear") :
+                  (vram0 < want ? "VRAM-cheia" : (big0 < want ? "FRAGMENTADO" : "?")));
+            dbg_flush();
+        }
+        if (init_ok)
+            printf("[TEX|EVICT-FORTE] %dx%d criada (%s) anti-chao-preto\n",
+                   tw, th, tex->in_vram ? "VRAM" : "linear apos eviccao");
+        else
+            tex_census("chao-preto");   /* [TEXCENSUS] no momento exato da falha: leak vs working-set */
+    }
+
     if (!init_ok) {
         if ((s_tex_failed % 100) == 0) {
             printf("[TEX|CREATE] ERRO C3D_TexInit FALHOU: src=%dx%d POT=%dx%d (1 em cada 100)\n",
@@ -666,7 +786,25 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba, 
     /* VRAM e' memoria nao-cacheada: o flush de cache de dados nao e' necessario
      * (e GSPGPU_FlushDataCache nem deve ser chamado sobre enderecos de VRAM).
      * So' o caminho do heap linear (cacheado) precisa de flush. */
-    if (!tex->in_vram) C3D_TexFlush(&tex->tex);
+    /* [PERF-TEXFLUSH 2026-07-04] cache-clean por-textura REDUNDANTE: o
+     * C3D_FrameEnd(0) (fim de frame) faz GSPGPU_FlushDataCache do heap linear
+     * INTEIRO antes de o GPU consumir os comandos (citro3d renderqueue.c,
+     * verificado) — a coerencia esta' garantida por ele. Este flush explicito
+     * custava um cache-clean de ate' 4MB por frame animado (layer0/agua).
+     * NAO REMOVER O COMENTARIO: se o FrameEnd mudar para GX_CMDLIST_FLUSH,
+     * repor. Kill-switch: $MKXP_TEXFLUSH=true reativa. */
+    {
+        static int txf_mode = -1;
+        if (txf_mode < 0) {
+            extern mrb_state *g_mkxp_mrb;
+            txf_mode = 0;
+            if (g_mkxp_mrb) {
+                mrb_value tv = mrb_gv_get(g_mkxp_mrb, mrb_intern_lit(g_mkxp_mrb, "$MKXP_TEXFLUSH"));
+                if (!mrb_nil_p(tv) && mrb_test(tv)) txf_mode = 1;
+            }
+        }
+        if (txf_mode == 1 && !tex->in_vram) C3D_TexFlush(&tex->tex);
+    }
 
     tex->valid = true;
     tex->pot_bytes = (unsigned)(tw * th * 4);
@@ -690,6 +828,67 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba, 
     }
 
     return tex;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * display_3ds_update_texture  — [FPS] update IN-PLACE (anti re-upload de 4MB/frame)
+ * ───────────────────────────────────────────────────────────────────────────
+ * CAUSA dos 10-15fps na rua: os autotiles ANIMADOS (agua/FX) re-blitam o @layer0
+ * do tilemap (832x704 -> POT 1024x1024 = 4MB) TODOS os frames -> tex_dirty=true ->
+ * o sprite_binding fazia free_texture + create_texture por frame. E o create
+ * FECHA+REABRE o frame GPU (C3D_FrameEnd/Begin, pq C3D_TexInit nao corre dentro do
+ * frame) + memset de 4MB + swizzle -> ~40ms/frame de render.
+ * AQUI: se a textura ja' existe com as mesmas dims POT, re-swizzlamos os pixels
+ * novos para o buffer tex->tex.data EXISTENTE -- sem TexInit, sem free/evict, SEM
+ * fechar o frame GPU, sem memset (a regiao w x h e' toda reescrita; a borda POT
+ * fica a 0 da criacao e nunca e' desenhada, src_rect limita a w x h). Sobra so' o
+ * swizzle + flush. Swizzle IDENTICO ao do create_texture (mt[8], bswap32). */
+bool display_3ds_update_texture(DS3Texture* tex, int w, int h, const unsigned char* rgba) {
+    if (!tex || !tex->valid || !rgba || w <= 0 || h <= 0) return false;
+    if (tex->width != w || tex->height != h) return false;   /* dims mudaram -> recriar */
+    u8* dst = (u8*)tex->tex.data;
+    if (!dst) return false;
+    int tw = 8, th = 8;
+    while (tw < w) tw <<= 1;
+    while (th < h) th <<= 1;
+    if (tw > 1024) tw = 1024;
+    if (th > 1024) th = 1024;
+    static const int mt[8] = { 0, 1, 4, 5, 16, 17, 20, 21 };
+    const int twb = tw >> 3;
+    const int hh  = (h < th) ? h : th;
+    const int ww  = (w < tw) ? w : tw;
+    for (int y = 0; y < hh; y++) {
+        const int row_base = ((y >> 3) * twb) * 64 + (mt[y & 7] << 1);
+        const u8* srow = rgba + (size_t)y * w * 4;
+        for (int x = 0; x < ww; x++) {
+            const int off = row_base + (x >> 3) * 64 + mt[x & 7];
+            u32 v;
+            __builtin_memcpy(&v, srow + (size_t)x * 4, 4);
+            v = __builtin_bswap32(v);
+            __builtin_memcpy(dst + (size_t)off * 4, &v, 4);
+        }
+    }
+    /* [PERF-TEXFLUSH 2026-07-04] cache-clean por-textura REDUNDANTE: o
+     * C3D_FrameEnd(0) (fim de frame) faz GSPGPU_FlushDataCache do heap linear
+     * INTEIRO antes de o GPU consumir os comandos (citro3d renderqueue.c,
+     * verificado) — a coerencia esta' garantida por ele. Este flush explicito
+     * custava um cache-clean de ate' 4MB por frame animado (layer0/agua).
+     * NAO REMOVER O COMENTARIO: se o FrameEnd mudar para GX_CMDLIST_FLUSH,
+     * repor. Kill-switch: $MKXP_TEXFLUSH=true reativa. */
+    {
+        static int txf_mode = -1;
+        if (txf_mode < 0) {
+            extern mrb_state *g_mkxp_mrb;
+            txf_mode = 0;
+            if (g_mkxp_mrb) {
+                mrb_value tv = mrb_gv_get(g_mkxp_mrb, mrb_intern_lit(g_mkxp_mrb, "$MKXP_TEXFLUSH"));
+                if (!mrb_nil_p(tv) && mrb_test(tv)) txf_mode = 1;
+            }
+        }
+        if (txf_mode == 1 && !tex->in_vram) C3D_TexFlush(&tex->tex);
+    }
+    tex->last_blit_frame = s_frame_count;   /* mantem viva no EVICT */
+    return true;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

@@ -87,6 +87,16 @@ extern uint32_t g_dbg_mask;
 #define DBGV(cat) (0)
 #endif
 
+/* [FPS-FLUSH] Throttle para os fflush(g_dbglog) DIRETOS (fora do macro DBG). Estes
+ * eram por-frame -> I/O de SD cada frame -> 1 FPS/travoes na selecao/roupeiro, apesar
+ * do buffer _IOFBF de 64KB. Usa o mesmo contador do DBG: flush REAL so' a cada 256
+ * escritas. O buffer auto-flush quando enche na mesma; num crash perde-se <=256 linhas.
+ * Substitui todos os `fflush(g_dbglog)` por `dbg_flush()`. static inline: cada .cpp
+ * tem a sua copia (sem erro de linker), contador partilhado g_dbglog_flushc. */
+static inline void dbg_flush(void) {
+    if (g_dbglog && ++g_dbglog_flushc >= 256) { g_dbglog_flushc = 0; fflush(g_dbglog); }
+}
+
 /* Nome curto da categoria (para o prefixo). */
 const char* dbg_cat_name(uint32_t cat);
 

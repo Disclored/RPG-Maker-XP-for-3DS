@@ -10,4 +10,9 @@ enum RmxpKey {
 };
 
 void input_3ds_poll(bool* pressed, bool* released, int key_count);
+/* [FIX-INPUT-RGSS] Poll do ESTADO MANTIDO (nivel, via hidKeysHeld) em vez de
+ * flancos (hidKeysDown). Robusto as ~146 chamadas/frame do grph_update (o nivel
+ * nao se "gasta" como o flanco). Os flancos passam a ser calculados em
+ * Input.update (semantica RGSS correta). held[] deve vir zerado pelo chamador. */
+void input_3ds_poll_held(bool* held, int key_count);
 bool input_3ds_should_quit();

@@ -3,6 +3,7 @@
  * Ver profile_3ds.h para a descricao do sistema.
  * ========================================================================== */
 #include "profile_3ds.h"
+#include "debug_3ds.h"
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -76,7 +77,7 @@ void prof_report(const char *tag) {
         (unsigned long long)g_prof_blits);
     prof_emit(buf);
     prof_emit("==========================================\n\n");
-    if (g_dbglog) fflush(g_dbglog);
+    if (g_dbglog) dbg_flush();
 }
 
 void prof_report_marshal(const char *fname, uint64_t bytes,
@@ -138,7 +139,7 @@ void prof_report_marshal(const char *fname, uint64_t bytes,
         (symbol_ms>=string_ms && symbol_ms>=resto_ms) ? "SYMBOL (mrb_intern -- otimizavel)" :
         (string_ms>=resto_ms) ? "STRING (mrb_str_new)" : "ARRAYS/LEITURA (buffer/arrays/hashes)");
     prof_emit(buf);
-    if (g_dbglog) fflush(g_dbglog);
+    if (g_dbglog) dbg_flush();
 }
 
 /* ============================================================================
@@ -238,5 +239,5 @@ void prof_report_scripts(const char *tag) {
         prof_emit(buf);
     }
     prof_emit("==========================================\n\n");
-    if (g_dbglog) fflush(g_dbglog);
+    if (g_dbglog) dbg_flush();
 }

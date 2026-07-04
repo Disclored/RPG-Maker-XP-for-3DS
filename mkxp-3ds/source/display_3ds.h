@@ -26,6 +26,11 @@ void        display_3ds_init();
 void        display_3ds_begin_frame();
 void        display_3ds_end_frame();
 DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba, bool prefer_vram = false);
+/* [FPS] Atualiza os pixels de uma textura EXISTENTE in-place (sem C3D_TexInit, sem
+ * free/evict, SEM fechar o frame GPU). So' quando as dims (w,h) coincidem. Devolve
+ * true se atualizou; false -> o chamador cai no create_texture normal. Mata o
+ * re-upload de 4MB/frame do @layer0 do tilemap e dos autotiles animados. */
+bool        display_3ds_update_texture(DS3Texture* t, int w, int h, const unsigned char* rgba);
 void        display_3ds_free_texture(DS3Texture* t);
 /* SUPERDBG: contagem/bytes das texturas vivas (out params podem ser NULL). */
 void        display_3ds_tex_stats(size_t* out_count, size_t* out_bytes, size_t* out_vram);

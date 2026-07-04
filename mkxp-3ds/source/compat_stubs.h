@@ -747,7 +747,13 @@ begin
       end
     end
 
-    def self.directory?(p); false; end
+    # [SAVE-DIR-FIX v3 2026-07-03] Este stub INCONDICIONAL corria DEPOIS do
+    # fileBindingInit (compat ~t=0.5 vs nativo t=0.09) e ESMAGAVA o
+    # File.directory? REAL -> o Auto Multi Save via false p/ sdmc:/mkxp/saves
+    # e punha SAVE_DIR='.' (saves na raiz do sdmc). So' em builds sem nativo.
+    unless (File.mkxp_native? rescue false)
+      def self.directory?(p); false; end
+    end
 
     unless respond_to?(:move)
       def self.move(src,dst)
@@ -783,13 +789,23 @@ begin
 rescue; end
 
 # -- Marshal -------------------------------------------------------------------
+# [SAVE-0B-FIX v3 2026-07-03] O stub INCONDICIONAL de dump/load ESMAGAVA o
+# Marshal NATIVO do motor (marshal.cpp, registado antes) -> o jogo "gravava com
+# sucesso" ficheiros de 0 BYTES e o load de saves devolvia nil (sem "Continuar").
+# Nunca se notou porque os DADOS carregam via load_data (C interno). Os stubs
+# ficam SO' para builds sem o binding nativo. restore delega em load (o nativo
+# nao o define e alguns scripts usam-no).
 begin
   module Marshal
-    MAJOR_VERSION = 4
-    MINOR_VERSION = 8
-    def self.dump(obj,io=nil,limit=-1); ""; end
-    def self.load(str,*a); nil; end
-    def self.restore(str); nil; end
+    MAJOR_VERSION = 4 unless const_defined?(:MAJOR_VERSION)
+    MINOR_VERSION = 8 unless const_defined?(:MINOR_VERSION)
+    def self.restore(str, *a); load(str, *a); end
+  end
+  unless (File.mkxp_native? rescue false)
+    module Marshal
+      def self.dump(obj,io=nil,limit=-1); ""; end
+      def self.load(str,*a); nil; end
+    end
   end
 rescue; end
 
@@ -1165,7 +1181,10 @@ begin
     def self.exist?(p);       _try_open(p); end
     def self.exists?(p);      _try_open(p); end
     def self.file?(p);        _try_open(p); end
-    def self.directory?(p);   false; end
+    # [SAVE-DIR-FIX v3] idem File.directory?: nao esmagar o nativo (ver acima).
+    unless (File.mkxp_native? rescue false)
+      def self.directory?(p);   false; end
+    end
     # CRITICO p/ o AUDIO funcionar: o jogo chama audio_exist?("Audio/SE/NOME")
     # SEM extensao. Os ficheiros reais sao NOME.ogg / .wav / .mp3. Se so'
     # tentassemos o caminho exacto, audio_exist? devolvia false e Audio.se_play

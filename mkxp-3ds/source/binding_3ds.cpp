@@ -10,6 +10,7 @@
 #include <mruby/dump.h>
 #include <mruby/irep.h>
 #include <mruby/proc.h>
+#include <mruby/data.h>   /* [FILE-IO] File real (Save/Load) */
 #include <zlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -759,17 +760,25 @@ static void patch_script(std::vector<Bytef> &decomp, uLong dest_sz, const char *
         strcmp(name, "AI_Move_EffectScores_Gen8") == 0 ||
         // Fix 6: SyntaxError em Ruby nao suportado por mruby
         strcmp(name, "EBDX Wrapper Compatibility") == 0 ||
-        // Fix 4: ArgumentError em validate/register -- bloco mruby vs CRuby
-        // Estes scripts apenas registam campos de save; nao sao necessarios para boot
-        strcmp(name, "Game_SaveValues") == 0 ||
+        // [SAVE-VALUES-FIX 2026-07-03] Game_SaveValues DES-SKIPPADO: o skip antigo
+        // ("apenas registam campos de save; nao necessarios p/ boot") era A RAIZ dos
+        // saves de 101 bytes -- sem os 15 registos core (player/switches/map_factory/
+        // bag/...), o compile_save_hash so' tinha os 2 valores de plugins -> save
+        // esqueletico -> load = ecra preto. O ArgumentError historico de validate/
+        // register ja' nao se reproduz (mruby/ambiente amadureceu); validado por
+        // self-run (SELFTEST agora conta os valores registados).
         strcmp(name, "Game_SaveConversions") == 0 ||
         // Fix 6: deprecated_method_alias / deprecate_constant nao existem em mruby
         strcmp(name, "Player_Deprecated") == 0 ||
         strcmp(name, "Pokemon_Deprecated") == 0 ||
         // Fix 7: Sprite_DynamicShadows usa APIs graficas avancadas nao suportadas
         strcmp(name, "Sprite_DynamicShadows") == 0 ||
-        // Fix 8: Game_DependentEvents falha com uninitialized constant no check_entry
-        strcmp(name, "Game_DependentEvents") == 0 ||
+        // Fix 8 REVERTIDO: apagar o script inteiro tirava o addEvent REAL (com push),
+        // initialize, eachEvent, pbEnsureEvent, getEventByName -> o seguidor (Giltbert e
+        // pokemon-seguidor) nunca era adicionado (dep 0->0). Os plugins reabrem a classe mas
+        // so' adicionam pbMove/createEvent, nunca addEvent. Deixamos o 050 carregar (como no
+        // Windows). Se reaparecer "uninitialized constant" no load, o log nomeia-a -> define-se
+        // essa constante antes do 050 em vez de apagar o script todo.
         // Fix 9: FileTests redefine FileTest.exists? com validate interno que chama
         // o binding C nativo com assinatura errada -> ArgumentError em mruby.
         // Os nossos stubs em compat_stubs.h cobrem FileTest completamente.
@@ -1025,6 +1034,7 @@ static void check_entry_methods(mrb_state *mrb, int script_idx, const char *scri
 			"          @tilemap           = nil rescue nil\n"
 			"          @viewport1         = (Viewport.new(0,0,544,416) rescue nil)\n"
 			"          @viewport2         = (Viewport.new(0,0,544,416) rescue nil)\n"
+			"          (@viewport2.z = 200) rescue nil  # [ROUPEIRO-FIX] pictures acima dos personagens\n"
 			"          @viewport3         = (Viewport.new(0,0,544,416) rescue nil)\n"
 			"          @character_sprites = [] rescue nil\n"
 			"          @picture_sprites   = [] rescue nil\n"
@@ -1203,14 +1213,24 @@ mrb_define_module_function(mrb, dbg_mod, "log",
         reg("me_stop", [](mrb_state *m, mrb_value) -> mrb_value {
             (void)m; audio_3ds_me_stop(); return mrb_nil_value();
         });
-        /* metodos sem efeito sonoro mas que o jogo chama: registar no-op leve
-         * (fade/pos) -- evitam method_missing e ficam prontos p/ Fases 2/3. */
+        /* [AUDIO-FADE 2026-07-02] fades REAIS (antes: no-op -> pbBGMFade nunca
+         * parava a musica; BGM sobreposta em transicoes). Semantica RGSS:
+         * Audio.bgm_fade(ms). Rampa de volume 1x/frame + stop no fim (audio_3ds). */
         mrb_define_module_function(mrb, audio_mod, "bgm_fade",
-            [](mrb_state *m, mrb_value) -> mrb_value { (void)m; return mrb_nil_value(); }, MRB_ARGS_ARG(0,1));
+            [](mrb_state *m, mrb_value) -> mrb_value {
+                mrb_int ms = 0; mrb_get_args(m, "|i", &ms);
+                audio_3ds_bgm_fade((int)ms); return mrb_nil_value();
+            }, MRB_ARGS_ARG(0,1));
         mrb_define_module_function(mrb, audio_mod, "bgs_fade",
-            [](mrb_state *m, mrb_value) -> mrb_value { (void)m; return mrb_nil_value(); }, MRB_ARGS_ARG(0,1));
+            [](mrb_state *m, mrb_value) -> mrb_value {
+                mrb_int ms = 0; mrb_get_args(m, "|i", &ms);
+                audio_3ds_bgs_fade((int)ms); return mrb_nil_value();
+            }, MRB_ARGS_ARG(0,1));
         mrb_define_module_function(mrb, audio_mod, "me_fade",
-            [](mrb_state *m, mrb_value) -> mrb_value { (void)m; return mrb_nil_value(); }, MRB_ARGS_ARG(0,1));
+            [](mrb_state *m, mrb_value) -> mrb_value {
+                mrb_int ms = 0; mrb_get_args(m, "|i", &ms);
+                audio_3ds_me_fade((int)ms); return mrb_nil_value();
+            }, MRB_ARGS_ARG(0,1));
         mrb_define_module_function(mrb, audio_mod, "bgm_pos",
             [](mrb_state *m, mrb_value) -> mrb_value { (void)m; return mrb_fixnum_value(0); }, MRB_ARGS_NONE());
         mrb_define_module_function(mrb, audio_mod, "update",
@@ -1913,11 +1933,22 @@ begin
           $__mkxp_tilebmp_map = mid
         end
         return RPG::Cache.tileEx(filename, tile_id, hue, width, height) { |f|
-          ts = $__mkxp_tilebmp_ts[filename]
+          # [TILEBMP v2 2026-07-02] PRIMEIRO o tileset RESIDENTE via pbGetTileset
+          # (TSCACHE, never_dispose) -> ZERO re-decode. RAIZ PROVADA no log 08:39:
+          # este bloco fazia AnimatedBitmap.new(...) RAW p/ o 2o decode do
+          # 'Gen4 Outside Town' (15.5MB) com a arena ja' ocupada -> PNG4444-ERR
+          # -> fallback magenta + NCACHE envenenado + cascata GC/EVICT (3.4 fps).
+          # (Este bloco corre DEPOIS do probe -> e' o dono final de pbGetTileBitmap;
+          # o TSC-PBGET do probe e o [TILEBMP-FIX] antigo eram sobrepostos por ele.)
+          ts = (pbGetTileset(f) rescue nil)
           if ts.nil? || (ts.disposed? rescue true)
-            ts = AnimatedBitmap.new("Graphics/Tilesets/" + filename).deanimate
-            (ts.never_dispose = true) rescue nil   # tileEx vai chamar dispose -> no-op
-            $__mkxp_tilebmp_ts[filename] = ts
+            # fallback antigo (so' se pbGetTileset falhar): cache local por mapa
+            ts = $__mkxp_tilebmp_ts[filename]
+            if ts.nil? || (ts.disposed? rescue true)
+              ts = AnimatedBitmap.new("Graphics/Tilesets/" + filename).deanimate
+              (ts.never_dispose = true) rescue nil   # tileEx vai chamar dispose -> no-op
+              $__mkxp_tilebmp_ts[filename] = ts
+            end
           end
           ts
         }
@@ -2065,7 +2096,22 @@ module Game
     begin; $PokemonTemp  = PokemonTemp.new;  rescue => e; dbg "[Game.init] PokemonTemp: #{e.message}"; end
     begin; $game_temp    = Game_Temp.new;    rescue => e; dbg "[Game.init] Game_Temp: #{e.message}"; end
     begin; $game_system  = Game_System.new;  rescue => e; dbg "[Game.init] Game_System: #{e.message}"; end
-    begin; $data_animations    = load_data('Data/Animations.rxdata');    rescue => e; dbg "[Game.init] Animations: #{e.message}"; end
+    begin
+      $data_animations = load_data('Data/Animations.rxdata')
+    rescue => e
+      # [ANIMRETRY 2026-07-02] o load falhava com 'allocation failure' no boot (heap
+      # fragmentada apos os 376 scripts) -> $data_animations=nil -> pbExclaim/anims
+      # partidos (e um Integer chegava a Sprite#bitmap= -> [BMP|UNWRAP] FALHOU).
+      # Retry unico apos full-GC: no boot o heap recupera o suficiente p/ 43KB.
+      dbg "[Game.init] Animations: #{e.message} -- retry pos-GC"
+      begin
+        GC.start
+        $data_animations = load_data('Data/Animations.rxdata')
+        dbg "[Game.init] Animations: OK na 2a tentativa (pos-GC)"
+      rescue => e2
+        dbg "[Game.init] Animations: 2a tentativa falhou: #{e2.message}"
+      end
+    end
     begin; $data_tilesets      = load_data('Data/Tilesets.rxdata');      rescue => e; dbg "[Game.init] Tilesets: #{e.message}"; end
     begin; $data_common_events = load_data('Data/CommonEvents.rxdata');  rescue => e; dbg "[Game.init] CommonEvents: #{e.message}"; end
     begin; $data_system        = load_data('Data/System.rxdata');        rescue => e; dbg "[Game.init] System: #{e.message}"; end
@@ -2145,6 +2191,33 @@ module Game
       end
     rescue => e
       dbg "[GPS-FIX] falhou em Game.init: #{e.class}: #{e.message}"
+    end
+    # [SAVETIME-FIX 2026-07-02] O jogo FECHAVA no arranque em get_newest_save_slot:
+    # "comparison of Integer with Time". Um slot devolve last_time_saved como Integer
+    # (epoch de um save legado), e SaveData.get_newest_save_slot faz
+    # `save_time > Time.at(0)` -> Integer#> nao conhece a classe Time do motor (este
+    # build nao tem mruby-time) -> ArgumentError -> Scene_Intro morre -> o jogo fecha.
+    # A tentativa no debug_probe.rb NAO pegava: o probe corre a t~3.8s, ANTES de Player
+    # existir, e os seus deferidos so' disparam no 1o frame de Scene_Map (overworld),
+    # que nunca chega porque o crash e' no TITULO. AQUI (Game.init, t~6.7s, Player ja'
+    # definido -- o GPS-FIX acima prova-o -- e ANTES do titulo/closeTitle) normalizamos
+    # o getter: se last_time_saved for numerico devolve Time.at(v) -> a comparacao passa
+    # a Time#> (Comparable, robusto). So' age quando o valor esta' errado -> zero mudanca
+    # no caso bom. Idempotente (guarda pelo alias). Compat com saves que guardaram epoch.
+    begin
+      if defined?(Player) && Player.method_defined?(:last_time_saved) &&
+         !Player.method_defined?(:__mkxp_orig_lts)
+        Player.send(:alias_method, :__mkxp_orig_lts, :last_time_saved)
+        Player.send(:define_method, :last_time_saved) do
+          v = __mkxp_orig_lts
+          (v.is_a?(Integer) || v.is_a?(Float)) ? (Time.at(v) rescue v) : v
+        end
+        dbg "[SAVETIME-FIX] Player#last_time_saved coage epoch->Time (get_newest_save_slot nao rebenta)"
+      else
+        dbg "[SAVETIME-FIX] Player/last_time_saved ausente ou ja' patchado em Game.init (nada a fazer)"
+      end
+    rescue => e
+      dbg "[SAVETIME-FIX] falhou: #{e.class}: #{e.message}"
     end
     dbg "[Game.init] Game.initialize concluido"
   end
@@ -2956,11 +3029,25 @@ begin
           # adicionares a Graphics/Windowskins/, passa a usar a tua.
           begin
             __ws_missing = { "Graphics/Windowskins/speech black" => "Graphics/Windowskins/speech bw 1" }
-            if __ws_missing.key?(noext_ws) && !(safeExists?(noext_ws + ".png") rescue false)
-              __ws_alt = __ws_missing[noext_ws]
-              if (safeExists?(__ws_alt + ".png") rescue false)
-                dbg "[BMP|WSKIN-REDIR] '#{noext_ws}' (em falta no jogo) -> '#{__ws_alt}'"
-                return __ws_alt
+            if __ws_missing.key?(noext_ws)
+              # [WSKIN-CACHE 2026-07-02] memoizar o resultado: isto corre a CADA
+              # mensagem (setSkin do dialogo) e re-fazia stat+log de ~100ms por caixa
+              # (10x no log 08:39). 1a vez resolve e guarda; seguintes = lookup O(1).
+              $__ws_redir_cache ||= {}
+              if $__ws_redir_cache.key?(noext_ws)
+                __c = $__ws_redir_cache[noext_ws]
+                return __c if __c
+              elsif !(safeExists?(noext_ws + ".png") rescue false)
+                __ws_alt = __ws_missing[noext_ws]
+                if (safeExists?(__ws_alt + ".png") rescue false)
+                  dbg "[BMP|WSKIN-REDIR] '#{noext_ws}' (em falta no jogo) -> '#{__ws_alt}' (cacheado)"
+                  $__ws_redir_cache[noext_ws] = __ws_alt
+                  return __ws_alt
+                else
+                  $__ws_redir_cache[noext_ws] = nil
+                end
+              else
+                $__ws_redir_cache[noext_ws] = nil
               end
             end
           rescue
@@ -4449,6 +4536,37 @@ begin
           rescue => e
             dbg "[createSpritesets] $MapFactory.maps CRASH: #{e.class}: #{e.message}"
           end
+          # ===== [DISPOSE-FIRST 2026-07-02] RAIZ dos "2 Gilberts" =====
+          # O createSpritesets do jogo (032_Scene_Map.rb:18) faz `@spritesets = {}`
+          # -> LARGA os Spriteset_Map antigos SEM os dispor. Os Sprite_Character
+          # antigos ficam registados no motor (g_sprites) e continuam a desenhar ->
+          # PROVADO: [GILSPR] TOTAL=2 <<< DUPLICADO com 1 so' evento RIVAL1 vivo.
+          # (O TSFIX do probe devia tratar isto mas nao instalou -- 0 no log.) Aqui,
+          # no wrapper do motor que COMPROVADAMENTE corre, chamamos disposeSpritesets
+          # ANTES de recriar: os sprites antigos sao libertados. So' quando ha'
+          # spritesets antigos nao-vazios (a 1a criacao nao dispoe nada).
+          # [DISPOSE-FIRST v2] robusto: sem respond_to? (nao fiavel neste mruby) e com
+          # log de ESTADO sempre (p/ ver porque nao disparava). Dispoe cada spriteset
+          # antigo diretamente; o disposeSpritesets do jogo so' poe [i]=nil, por isso
+          # chamamos .dispose em cada VALOR nao-nil (liberta os Sprite_Character/texturas
+          # duplicados que causam os 2 Gilberts E o chao preto por 26MB de texturas).
+          begin
+            _ss = @spritesets
+            if _ss.is_a?(Hash) && _ss.size > 0
+              _nd = 0
+              _ss.each_value do |sset|
+                next if sset.nil?
+                (sset.dispose rescue nil)
+                _nd += 1
+              end
+              @spritesets = {}
+              dbg "[DISPOSE-FIRST] dispostos #{_nd}/#{_ss.size} spriteset(s) antigo(s) antes de recriar (anti 2-Gilberts + memoria)"
+            else
+              dbg "[DISPOSE-FIRST] nada a dispor (@spritesets=#{_ss.class} size=#{(_ss.size rescue '?')})"
+            end
+          rescue => _dfe
+            dbg "[DISPOSE-FIRST] falhou: #{_dfe.class}: #{_dfe.message}"
+          end
           begin
             __orig_createSpritesets_3ds
             dbg "[createSpritesets] OK: @spritesets=#{@spritesets.nil? ? 'NIL' : "Hash(#{@spritesets.size})" rescue 'ERR'}"
@@ -4591,6 +4709,42 @@ class Scene_DebugIntro
         end
       rescue => e
         dbg "[SMOKE] smoke test rebentou: #{e.class}: #{e.message}"
+      end
+    end
+
+    # -- [TRY-CONTINUE] (diagnostico, gated): replicar o fluxo REAL do Continuar --
+    # Em vez do titulo, faz exatamente o que o Load Screen faz ao escolher o slot:
+    # read_from_file + Game.load (load_all_values c/ SAVE-REPAIR + load_map +
+    # Scene_Map). Se $MKXP_TRY_CONTINUE for [x,y], teleporta o jogador (para p'or
+    # a camara em cima de um alvo de diagnostico, ex. a arvore do monumento).
+    # Ativa-se no debug_probe.rb; OFF por defeito -> zero efeito no jogo normal.
+    if ($MKXP_TRY_CONTINUE rescue nil) && $__debug_intro_count == 1
+      begin
+        _fp = nil
+        begin
+          _slot = SaveData.get_newest_save_slot
+          _fp = SaveData::SAVE_DIR + "/" + _slot.to_s + ".rxdata" if _slot
+        rescue; end
+        _fp = (SaveData::FILE_PATH rescue nil) if _fp.nil? || !(File.file?(_fp) rescue false)
+        if _fp && (File.file?(_fp) rescue false)
+          dbg "[TRY-CONTINUE] a carregar #{_fp} pelo fluxo real (Game.load)"
+          _sv = SaveData.read_from_file(_fp)
+          Game.load(_sv)
+          if $MKXP_TRY_CONTINUE.is_a?(Array) && $MKXP_TRY_CONTINUE.size == 2
+            _tx, _ty = $MKXP_TRY_CONTINUE
+            ($game_player.moveto(_tx, _ty) rescue nil)
+            ($game_player.center(_tx, _ty) rescue nil)
+            dbg "[TRY-CONTINUE] teleporte diagnostico p/ (#{_tx},#{_ty})"
+          end
+          dbg "[TRY-CONTINUE] Game.load OK: map=#{($game_map.map_id rescue '?')} player=(#{($game_player.x rescue '?')},#{($game_player.y rescue '?')}) scene=#{$scene.class} events=#{($game_map.events.size rescue '?')}"
+          return
+        else
+          dbg "[TRY-CONTINUE] sem save legivel (#{_fp.inspect}) -> fluxo normal"
+        end
+      rescue => e
+        dbg "[TRY-CONTINUE] FALHOU: #{e.class}: #{e.message.to_s[0,120]}"
+        dbg "[TRY-CONTINUE] BT: #{(e.backtrace || [])[0,6].join(' | ')}"
+        # cai para o fluxo normal (titulo) para o arranque nao morrer
       end
     end
 
@@ -5319,6 +5473,14 @@ begin
         @@viewport1.z = 0
       rescue; end
       begin
+        # [ROUPEIRO-FIX] @@viewport2 = viewport das PICTURES. O patch SALTAVA-o -> ficava
+        # z=0, EMPATADO com @@viewport1 (personagens). Os Sprite_Character always_on_top
+        # (z=999) ganhavam o desempate e desenhavam POR CIMA das Pictures do menu (sintoma
+        # do roupeiro). z=200 (default RGSS: pictures acima dos personagens) poe-nas no topo.
+        @@viewport2 = Viewport.new(0, 0, _w, _h)
+        @@viewport2.z = 200
+      rescue; end
+      begin
         @@viewport3 = Viewport.new(0, 0, _w, _h)
         @@viewport3.z = 500
       rescue; end
@@ -5559,16 +5721,26 @@ end
     {
         int before = (int)mrb->gc.live;
         mrb_full_gc(mrb);                       /* 1 limpeza enquanto o heap e' pequeno */
-        /* GC GERACIONAL reativado (era desligado como remendo para a lentidao do
-         * boot -- mas essa lentidao eram os SIMBOLOS O(N^2), ja' corrigidos no
-         * mruby). O modo geracional e' o normal do mruby e e' o ideal para o
-         * jogo: faz GC menor (barato) frequente que limpa o lixo temporario
-         * (~750 objs/frame no mapa) SEM varrer o heap todo, evitando o OOM que
-         * antes enchia a memoria no mapa ([POOL|GROW] FALHOU). */
-        mrb->gc.generational  = TRUE;
-        mrb->gc.interval_ratio = 200;           /* default mruby (so' usado no modo nao-geracional) */
-        DBGLOG("[GC] boot concluido: GERACIONAL reativado (default) "
-               "(full_gc %d -> %d objs vivos) -- evita OOM no mapa\n",
+        /* [GC-FPS v2] Gameplay: GERACIONAL + major automatico TRAVADO.
+         * v1 (NAO-geracional, interval_ratio=150) ficou aquem (update so' 46->40ms,
+         * valvula ainda dispara 50x). Medido: ~6500 allocs/frame de lixo de vida
+         * curtissima (a valvula recupera ~270k em ~41 frames). Em nao-geracional o
+         * ciclo incremental marca o LIVE-SET INTEIRO (~222k base ESTAVEL) quase
+         * todos os frames -> desperdicio puro (re-marca dados que nao sao lixo).
+         * CORRECAO: GERACIONAL. O minor-GC (unica recolha por-frame) so' marca a
+         * young-gen (~1024 objs) + write-barriers old->young; NAO re-marca os 222k
+         * base -> minors baratos (~2-5ms/frame). O que era caro era o MAJOR-GC
+         * automatico (dispara a ~2x live = ~464k e varre tudo); fixamos
+         * majorgc_old_threshold MUITO alto para ele NUNCA disparar no gameplay.
+         * A old-gen e' drenada onde o hitch e' INVISIVEL: mrb_full_gc do grph_freeze
+         * (cada transicao, ecra congelado) + a valvula GC (rede de seguranca).
+         * Reverter: generational=FALSE. (interval_ratio e' irrelevante em geracional:
+         * o minor usa threshold fixo ~1024.) */
+        mrb->gc.generational          = TRUE;
+        mrb->gc.majorgc_old_threshold = 3000000;   /* trava o major automatico in-frame */
+        DBGLOG("[GC] boot concluido: GERACIONAL + majorgc_old_threshold=3000000 "
+               "(minors baratos sobre young-gen; major automatico travado; "
+               "old-gen drenada no freeze/valvula) (full_gc %d -> %d objs)\n",
                before, (int)mrb->gc.live);
     }
 
@@ -6401,6 +6573,803 @@ begin
   end
   # ---- FIM PERF screenfix ----------------------------------------------------
 
+  # ---- [NATMOVE] Game_Character#update_move nativo (miolo do movimento) -------
+  # PERF: o passo real_x/real_y por-frame de TODOS os characters em movimento
+  # custa 9-14ms nos picos (player+seguidor). __gc_native_move_step (C) faz o
+  # miolo; casos raros (salto, ivars por memoizar) devolvem nil -> original.
+  # SPLICE INTELIGENTE: o plugin "Terrain Tag Side Stairs" faz
+  #   alias updatemovestairs update_move ; def update_move (logica escadas + chama o alias)
+  # Se embrulhassemos update_move por FORA, o fast-path saltava as escadas.
+  # Por isso, se updatemovestairs existir, redefinimos ESSE (o apontador p/ a
+  # base original) -> o wrapper das escadas continua a correr por fora, intacto.
+  # Introspecao por instance_methods.include? (respond_to?/method_defined? nao
+  # sao fiaveis neste mruby). Reversivel: $MKXP_PERF_NATMOVE=false.
+  begin
+    $MKXP_PERF_NATMOVE = true if $MKXP_PERF_NATMOVE.nil?
+    if $MKXP_PERF_NATMOVE && Object.const_defined?(:Game_Character)
+      _nk = Object.const_get(:Game_Character)
+      _nim = _nk.instance_methods
+      if _nim.include?(:update_move) && _nim.include?(:__gc_native_move_step) &&
+         !_nim.include?(:__mkxp_natmove_base)
+        _splice = _nim.include?(:updatemovestairs) ? "updatemovestairs" : "update_move"
+        _nk.class_eval(
+          "alias_method :__mkxp_natmove_base, :" + _splice + "\n" +
+          "def " + _splice + "\n" +
+          "  _r = __gc_native_move_step(self)\n" +
+          "  return __mkxp_natmove_base if _r.nil?\n" +
+          "  if _r == 1\n" +
+          "    Events.onStepTakenFieldMovement.trigger(self, self)\n" +
+          "    calculate_bush_depth\n" +
+          "    @stopped_this_frame = true\n" +
+          "    @anime_count += 1 if @walk_anime || @step_anime\n" +
+          "    @moved_this_frame = true\n" +
+          "  elsif _r == 2\n" +
+          "    calculate_bush_depth\n" +
+          "  end\n" +
+          "end")
+        MKXPDebug.log("[NATMOVE] update_move nativo instalado (splice=" + _splice + ")") rescue nil
+      else
+        MKXPDebug.log("[NATMOVE] nao instalado (update_move/__gc_native_move_step ausente)") rescue nil
+      end
+    end
+  rescue => __enm
+    MKXPDebug.log("[NATMOVE] instalacao falhou: #{__enm.class}: #{__enm.message}") rescue nil
+  end
+  # ---- FIM NATMOVE -------------------------------------------------------------
+
+  # ---- [SAVE-NEWEST] get_newest_save_slot ROBUSTO (raiz do "sem Continuar") ----
+  # PROVADO nos logs: o original rebenta com "comparison of Integer with Time"
+  # porque um slot vazio/corrompido da' temp_save_data[:player]=nil e
+  # nil.last_time_saved (via method_missing universal) devolve um Integer -> a
+  # comparacao com Time.at(0) explode -> a rede de seguranca devolvia nil p/
+  # TODOS os slots -> nunca ha' "Continuar" mesmo com um save bom ao lado.
+  # Reimplementacao: salta slots inexistentes/0-bytes/ilegiveis, compara por
+  # to_i (epoch) -- nunca levanta. Corre pos-plugins (SaveData ja' existe).
+  begin
+    if Object.const_defined?(:SaveData)
+      _gsm = (SaveData.singleton_class.instance_methods rescue [])
+      if _gsm.include?(:get_newest_save_slot) && _gsm.include?(:get_full_path) &&
+         !$__mkxp_gnss_robusto
+        $__mkxp_gnss_robusto = true
+        def SaveData.get_newest_save_slot
+          _newest_t = -1
+          _newest = nil
+          begin
+            (SaveData::AUTO_SLOTS + SaveData::MANUAL_SLOTS).each do |_f|
+              _fp = get_full_path(_f)
+              next unless (File.file?(_fp) rescue false)
+              next if (File.size(_fp) rescue 0).to_i <= 0
+              begin
+                _d  = load_save_file(_fp)
+                _pl = _d.is_a?(Hash) ? _d[:player] : nil
+                _t  = _pl ? _pl.last_time_saved : nil
+                _ti = (_t.to_i rescue nil)
+                _ti = 0 unless _ti.is_a?(Integer)
+                if _ti > _newest_t
+                  _newest_t = _ti
+                  _newest = _f
+                end
+              rescue
+                next   # slot corrompido: ignora e segue (nao mata os outros)
+              end
+            end
+          rescue
+          end
+          MKXPDebug.log("[SAVE-NEWEST] slot mais recente: #{_newest.inspect} (t=#{_newest_t})") rescue nil
+          _newest
+        end
+        MKXPDebug.log("[SAVE-NEWEST] get_newest_save_slot robusto instalado (salta 0-bytes/corrompidos; compara to_i)") rescue nil
+      end
+    end
+  rescue => __egn
+    MKXPDebug.log("[SAVE-NEWEST] instalacao falhou: #{__egn.class}: #{__egn.message}") rescue nil
+  end
+  # ---- FIM SAVE-NEWEST ---------------------------------------------------------
+
+  # ---- [SAVE-REPAIR] recuperar saves com mapas class=Object (ecra preto no load) --
+  # PROVADO (raio-X byte a byte do save do user, 2026-07-03): o ficheiro de 179KB
+  # tem EXATAMENTE 1 objeto corrompido -- $MapFactory.@maps[0] gravado com classe
+  # literal "Object" (o resto do grafo, 54 Game_Event + RPG::Map + Game_Player,
+  # esta' perfeito). map_id(metodo)->method_missing->0 -> $game_map=mapa 0 -> preto.
+  # Aqui, apos load_all_values, reconstruimos cada @maps[i] Object num Game_Map REAL
+  # (allocate + copiar ivars) -> os metodos voltam -> o save carrega no sitio certo.
+  # INSTALADO ANTES da bateria SELFTEST/READSAVE para o diagnostico ja' exercitar o
+  # wrapper (na 1a validacao o READSAVE-LOAD correu ANTES da instalacao -> map_id=0).
+  begin
+    # GUARD SEM respond_to?: neste mruby o respond_to? e' NAO-FIAVEL (foi por isso
+    # que este wrapper nunca se instalou na 1a tentativa -- log sem a linha de
+    # instalacao). Padrao fiavel: const_defined? + flag em ivar + alias dentro de
+    # begin/rescue (NameError se o metodo nao existir).
+    if Object.const_defined?(:SaveData) &&
+       !(SaveData.instance_variable_get(:@__mkxp_repair_on) rescue false)
+      class << SaveData
+        alias_method :__mkxp_orig_load_all, :load_all_values
+        def load_all_values(save_data)
+          __mkxp_orig_load_all(save_data)
+          begin
+            # [SAVE-REPAIR v3 2026-07-04] reparacao PROFUNDA. O v2 (so' @maps[i])
+            # deixava fantasmas vivos que PROPAGAVAM pela gravacao seguinte
+            # (raio-X do save novo: mapa Object OUTRA VEZ + 3 eventos Object +
+            # $game_system.@map_interpreter Object -> NPCs a deslizar com a
+            # camara (@map dos eventos aponta ao mapa-fantasma, display=0) e
+            # portas mortas (interpreter zumbi engole os eventos de transfer)).
+            # Agora: mapas + eventos + @map dos eventos re-apontado + interpreter
+            # (e child) + $game_player. Tudo por allocate+ivars (padrao provado).
+            _fx = []
+            _mk = lambda do |_o, _ks|
+              _kk = Object.const_get(_ks)
+              _n = _kk.allocate
+              _o.instance_variables.each { |_iv| _n.instance_variable_set(_iv, _o.instance_variable_get(_iv)) }
+              _n
+            end
+            _mf = ($MapFactory rescue nil)
+            _mps = _mf ? (_mf.instance_variable_get(:@maps) rescue nil) : nil
+            if _mps.is_a?(Array) && Object.const_defined?(:Game_Map)
+              _mps.each_with_index do |_m, _i|
+                next if _m.nil?
+                if _m.class == Object
+                  _m = _mk.call(_m, :Game_Map)
+                  _mps[_i] = _m
+                  _fx << "map#{(_m.instance_variable_get(:@map_id) rescue '?')}"
+                end
+                # eventos: reconstruir os Object e RE-APONTAR @map de TODOS ao
+                # mapa (reparado) a que pertencem — mata o "deslizar com a camara"
+                _evs = (_m.instance_variable_get(:@events) rescue nil)
+                if _evs.is_a?(Hash) && Object.const_defined?(:Game_Event)
+                  _evs.keys.each do |_k2|
+                    _e = _evs[_k2]
+                    next if _e.nil?
+                    if _e.class == Object
+                      _e = _mk.call(_e, :Game_Event)
+                      _evs[_k2] = _e
+                      _fx << "ev#{_k2}"
+                    end
+                    _em = (_e.instance_variable_get(:@map) rescue nil)
+                    if !_em.nil? && !_em.equal?(_m)
+                      _e.instance_variable_set(:@map, _m)
+                      _fx << "ev#{_k2}@map"
+                    end
+                  end
+                end
+              end
+            end
+            # interpreter zumbi (portas/eventos mortos) + child
+            _gs = ($game_system rescue nil)
+            if _gs && Object.const_defined?(:Interpreter)
+              _ip = (_gs.instance_variable_get(:@map_interpreter) rescue nil)
+              if _ip && _ip.class == Object
+                _ip = _mk.call(_ip, :Interpreter)
+                _gs.instance_variable_set(:@map_interpreter, _ip)
+                _fx << "interp"
+              end
+              _ci = (_ip ? _ip.instance_variable_get(:@child_interpreter) : nil rescue nil)
+              if _ci && _ci.class == Object
+                (_ip.instance_variable_set(:@child_interpreter, _mk.call(_ci, :Interpreter)) rescue nil)
+                _fx << "interp.child"
+              end
+            end
+            _fixed = _fx.size
+            if _fixed > 0
+              MKXPDebug.log("[SAVE-REPAIR] v3 profundo: #{_fixed} reparacoes -> #{_fx.first(12).join(',')}#{_fx.size > 12 ? '...' : ''}") rescue nil
+            end
+            if _mps.is_a?(Array)
+              # [TSC-REVERT 2026-07-04] RAIZ da "arvore cortada" no Continuar:
+              # o TSC (compactacao de tilesets) remapeia os IDs DENTRO de @map.data
+              # e o save persiste isso (@__tsc_data_done + tabelas compactas). No
+              # load, o TSC reconstroi o atlas a partir dos dados JA remapeados ->
+              # tiles altos (copa da arvore, casas) desenham arte das posicoes
+              # ORIGINAIS baixas = transparente/errada (provado: TSC-PIXDBG so viu
+              # ids<=754 quando o mapa original vai ate 7865+). Fix: repor o
+              # RPG::Map pristino do disco + tabelas originais do tileset e limpar
+              # a flag -> o TSC desta sessao compacta de fresco e fica consistente.
+              _mps.each do |_m|
+                next if _m.nil?
+                begin
+                  next unless (_m.instance_variable_get(:@__tsc_data_done) rescue nil)
+                  _mid2 = _m.instance_variable_get(:@map_id)
+                  next unless _mid2.is_a?(Integer) && _mid2 > 0
+                  _rpg = (load_data(sprintf("Data/Map%03d.rxdata", _mid2)) rescue nil)
+                  next unless _rpg
+                  _m.instance_variable_set(:@map, _rpg)
+                  _ts2 = ($data_tilesets[_rpg.tileset_id] rescue nil)
+                  if _ts2
+                    _m.instance_variable_set(:@passages,     _ts2.passages)
+                    _m.instance_variable_set(:@priorities,   _ts2.priorities)
+                    _m.instance_variable_set(:@terrain_tags, _ts2.terrain_tags)
+                  end
+                  _m.instance_variable_set(:@__tsc_data_done, nil)
+                  MKXPDebug.log("[SAVE-REPAIR] TSC-REVERT map=#{_mid2}: dados/tabelas pristinos repostos (o save trazia tiles remapeados)") rescue nil
+                rescue => _rte
+                  MKXPDebug.log("[SAVE-REPAIR] TSC-REVERT falhou num mapa: #{_rte.class}: #{_rte.message.to_s[0,70]}") rescue nil
+                end
+              end
+            end
+            # reconstruir tambem $game_player se vier Object (metodos do jogador)
+            if Object.const_defined?(:Game_Player) && ($game_player rescue nil) && $game_player.class != Game_Player
+              _op = $game_player; _np = Game_Player.allocate
+              (_op.instance_variables.each { |_iv| _np.instance_variable_set(_iv, _op.instance_variable_get(_iv)) } rescue nil)
+              $game_player = _np
+              MKXPDebug.log("[SAVE-REPAIR] $game_player Object -> Game_Player reconstruido") rescue nil
+            end
+          rescue => _re
+            MKXPDebug.log("[SAVE-REPAIR] erro: #{_re.class}: #{_re.message.to_s[0,80]}") rescue nil
+          end
+        end
+      end
+      SaveData.instance_variable_set(:@__mkxp_repair_on, true)
+      MKXPDebug.log("[SAVE-REPAIR] wrapper de reparacao instalado (Object->Game_Map/Game_Player no load)") rescue nil
+    end
+  rescue => _esr
+    MKXPDebug.log("[SAVE-REPAIR] instalacao falhou: #{_esr.class}: #{_esr.message}") rescue nil
+  end
+  # ---- FIM SAVE-REPAIR -------------------------------------------------------------
+
+  # ---- [SELFTEST-SAVE] bateria de arranque (valida o pipeline SEM jogar) --------
+  # Corre pos-plugins e prova no log, a cada boot: (1) que SAVE_DIR do Auto Multi
+  # Save apanhou a pasta certa (era '.' por causa do File.directory? envenenado);
+  # (2) que Marshal.dump->ficheiro escreve BYTES REAIS (era 0 por causa do stub);
+  # (3) que o round-trip load devolve os dados. Se algo falhar, o log diz ONDE,
+  # sem precisar de gravar dentro do jogo.
+  begin
+    _sd_dir   = (System.data_directory rescue nil)   # a versao dos SCRIPTS do jogo (<game>/Save)
+    _dir_ok   = (File.directory?(_sd_dir) rescue false)
+    _sd_const = (SaveData::SAVE_DIR rescue "(sem plugin)")
+    MKXPDebug.log("[SELFTEST-SAVE] data_dir=#{_sd_dir.inspect} File.directory?=#{_dir_ok} SaveData::SAVE_DIR=#{_sd_const.inspect} #{_sd_const == _sd_dir ? '(OK: plugin apanhou a pasta certa)' : '(PROBLEMA: plugin vai gravar fora de saves/)'}") rescue nil
+    _tp = (_sd_dir || ".") + "/__selftest.bin"
+    _payload = { "n" => 123, "s" => "selftest", "a" => [1, 2.5, "x"] }
+    File.open(_tp, "wb") { |_f| Marshal.dump(_payload, _f) }
+    _sz = (File.size(_tp) rescue -1)
+    _back = nil
+    File.open(_tp, "rb") { |_f| _back = Marshal.load(_f) }
+    (File.delete(_tp) rescue nil)
+    _ok = _sz.to_i > 0 && _back.is_a?(Hash) && _back["n"] == 123 && _back["a"].is_a?(Array) && _back["a"][1] > 2
+    MKXPDebug.log("[SELFTEST-SAVE] round-trip dump->ficheiro->load: bytes=#{_sz} load=#{_back.class} => #{_ok ? 'PASS' : 'FALHOU'}") rescue nil
+    # [SAVE-VALUES-FIX] contar os registos do SaveData: 17 (15 core + 2 plugins) = OK;
+    # 2 = a seccao Game_SaveValues nao correu (saves esqueleticos de 101 bytes).
+    _nv = (SaveData.instance_variable_get(:@values).size rescue -1)
+    MKXPDebug.log("[SELFTEST-SAVE] SaveData valores registados: #{_nv} #{_nv.to_i >= 15 ? '(OK: core presente)' : '(PROBLEMA: registos core em falta -> save esqueletico)'}") rescue nil
+    # [PERF 2026-07-04] Bateria PROFUNDA (IVAR/TABLE/FILE/READSAVE/GMCLASS) gateada:
+    # a raiz do save foi FECHADA (SAVE-REPAIR + TSC-REVERT provados) e o READSAVE
+    # fazia Marshal.load do save REAL inteiro (179KB, ~1-2s de boot no 3DS) em
+    # TODOS os arranques. Opt-in: $MKXP_DIAG_SAVE=true reativa tudo tal-e-qual.
+    if ($MKXP_DIAG_SAVE == true)
+    # [SELFTEST-IVAR 2026-07-03] O load restaura o mapa ERRADO (map=0) porque o
+    # $MapFactory.@mapIndex volta a 0. Testar se o marshal preserva os IVARS de um
+    # objeto com varios ivars + hash aninhado (a estrutura do PokemonMapFactory).
+    # Se @mapIndex nao sobreviver ao round-trip -> bug do marshal a caçar.
+    begin
+      Object.const_set(:MkxpIvarProbe, Class.new do
+        attr_accessor :mapIndex, :maps, :a, :b, :c
+      end) unless Object.const_defined?(:MkxpIvarProbe)
+      _o = MkxpIvarProbe.new
+      _o.mapIndex = 43; _o.a = "x"; _o.b = 999; _o.c = [1,2,3]
+      _o.maps = { 43 => "map43data", 44 => "map44data" }
+      _s2 = Marshal.dump(_o)
+      _o2 = Marshal.load(_s2)
+      _mi = (_o2.mapIndex rescue nil)
+      _mk = (_o2.maps.is_a?(Hash) ? _o2.maps.keys.sort : nil)
+      _okv = (_mi == 43 && _mk == [43,44] && _o2.b == 999)
+      MKXPDebug.log("[SELFTEST-IVAR] objeto c/ ivars+hash: mapIndex=#{_mi.inspect} maps.keys=#{_mk.inspect} b=#{(_o2.b rescue nil).inspect} => #{_okv ? 'PASS' : 'FALHOU (marshal perde ivars -> RAIZ do map=0 no load!)'}") rescue nil
+    rescue => _ei
+      MKXPDebug.log("[SELFTEST-IVAR] EXCECAO: #{_ei.class}: #{_ei.message.to_s[0,80]}") rescue nil
+    end
+    # [SELFTEST-TABLE 2026-07-03] O caso REAL: um objeto com uma Table GIGANTE (como
+    # Game_Map#@data 65x70x3) SEGUIDA de um ivar (como @mapIndex). Se o marshal ler
+    # mal os bytes da Table, o offset desliza e o ivar seguinte fica corrompido/0 ->
+    # e' EXATAMENTE o "map=0 no load" ($MapFactory.@mapIndex volta a 0). PROVA direta.
+    begin
+      Object.const_set(:MkxpTableProbe, Class.new do
+        attr_accessor :data, :mapIndex, :tail
+      end) unless Object.const_defined?(:MkxpTableProbe)
+      _tp = MkxpTableProbe.new
+      _t = Table.new(65, 70, 3)   # mesmas dims do Map043
+      _t[10, 20, 1] = 7851; _t[0, 0, 0] = 384; _t[64, 69, 2] = 999
+      _tp.data = _t; _tp.mapIndex = 43; _tp.tail = "APOS_TABLE"
+      _s3 = Marshal.dump(_tp)
+      _tp2 = Marshal.load(_s3)
+      _mi3 = (_tp2.mapIndex rescue nil)
+      _tl3 = (_tp2.tail rescue nil)
+      _tv  = (_tp2.data[10,20,1] rescue nil)
+      _okt = (_mi3 == 43 && _tl3 == "APOS_TABLE" && _tv == 7851)
+      MKXPDebug.log("[SELFTEST-TABLE] ivar APOS Table gigante: mapIndex=#{_mi3.inspect} tail=#{_tl3.inspect} table[10,20,1]=#{_tv.inspect} => #{_okt ? 'PASS' : 'FALHOU (offset da Table desliza -> RAIZ do map=0 no load!)'}") rescue nil
+    rescue => _et
+      MKXPDebug.log("[SELFTEST-TABLE] EXCECAO: #{_et.class}: #{_et.message.to_s[0,80]}") rescue nil
+    end
+    # [SELFTEST-FILE 2026-07-03] O caminho EXATO do save real: um HASH {chave=>objeto
+    # com Table+ivar} escrito e lido por FICHEIRO (nao string). E' a unica diferenca
+    # entre os testes que passam e o save real que perde o @mapIndex. Se o @mapIndex
+    # sobreviver a' STRING mas NAO ao FICHEIRO -> o bug esta' no port read/write.
+    begin
+      _fp2 = (_sd_dir || ".") + "/__selftest_map.bin"
+      _mo = MkxpTableProbe.new
+      _mt = Table.new(65, 70, 3); _mt[10, 20, 1] = 7851
+      _mo.data = _mt; _mo.mapIndex = 43; _mo.tail = "TAIL"
+      _payload2 = { :map_factory => _mo, :game_player => "player_stub", :switches => [true, false, true] }
+      File.open(_fp2, "wb") { |_f| Marshal.dump(_payload2, _f) }
+      _szf = (File.size(_fp2) rescue -1)
+      _back2 = nil
+      File.open(_fp2, "rb") { |_f| _back2 = Marshal.load(_f) }
+      (File.delete(_fp2) rescue nil)
+      _mf2 = _back2.is_a?(Hash) ? _back2[:map_factory] : nil
+      _mif = (_mf2.mapIndex rescue nil)
+      _tlf = (_mf2.tail rescue nil)
+      _swf = (_back2.is_a?(Hash) ? _back2[:switches].inspect : "?") rescue "?"
+      _okf = (_mif == 43 && _tlf == "TAIL")
+      MKXPDebug.log("[SELFTEST-FILE] hash{map_factory:obj+Table} por FICHEIRO (#{_szf}B): mapIndex=#{_mif.inspect} tail=#{_tlf.inspect} switches=#{_swf} => #{_okf ? 'PASS' : 'FALHOU (port read/write perde ivars apos Table -> RAIZ do map=0!)'}") rescue nil
+    rescue => _ef
+      MKXPDebug.log("[SELFTEST-FILE] EXCECAO: #{_ef.class}: #{_ef.message.to_s[0,80]}") rescue nil
+    end
+    # [READSAVE 2026-07-03] DECISIVO: abrir o SAVE REAL com o marshal do motor (que
+    # os 4 selftests provaram bom) e ver que map_id ele contem. Se @maps tiver o mapa
+    # 43 e @mapIndex apontar la' -> o load parte-o. Se ja' tiver map_id=0 -> o SAVE
+    # foi feito partido (transfer TRANSFERFIX). Nao carrega o jogo; so' inspeciona.
+    begin
+      _rsp = (_sd_dir || ".") + "/File 01.rxdata"
+      if (File.file?(_rsp) rescue false) && (File.size(_rsp) rescue 0) > 4096
+        _sv = nil
+        File.open(_rsp, "rb") { |_f| _sv = Marshal.load(_f) }
+        if _sv.is_a?(Hash)
+          _mf = _sv[:map_factory]
+          _gp = _sv[:game_player]
+          _mi = (_mf.instance_variable_get(:@mapIndex) rescue nil)
+          _mps = (_mf.instance_variable_get(:@maps) rescue nil)
+          _ids = (_mps.is_a?(Array) ? _mps.map { |_m| _m ? (_m.instance_variable_get(:@map_id) rescue '?') : nil } : '?') rescue '?'
+          _px = (_gp.instance_variable_get(:@x) rescue '?'); _py = (_gp.instance_variable_get(:@y) rescue '?')
+          MKXPDebug.log("[READSAVE] save REAL: chaves=#{_sv.size} | map_factory.@mapIndex=#{_mi.inspect} @maps.map_ids=#{_ids.inspect} | player@(#{_px},#{_py})") rescue nil
+          # [READSAVE-GM] isolar o Game_Map: metodo map_id vs ivar @map_id. Se diferirem
+          # -> bug de interning de simbolos (o marshal escreve num @map_id que o metodo
+          # attr_accessor nao le'). Testa tb outro ivar (@display_x) p/ ver se e' geral.
+          if _mps.is_a?(Array) && _mps[0]
+            _gm0 = _mps[0]
+            _meth = (_gm0.map_id rescue 'ERRO'); _ivar = (_gm0.instance_variable_get(:@map_id) rescue 'ERRO')
+            _ivnames = (_gm0.instance_variables.inspect rescue '?')
+            MKXPDebug.log("[READSAVE-GM] Game_Map: map_id(metodo)=#{_meth.inspect} @map_id(ivar)=#{_ivar.inspect} class=#{_gm0.class} | instance_variables=#{_ivnames}") rescue nil
+            MKXPDebug.log("[READSAVE-GM] VEREDITO: se metodo!=ivar -> INTERNING de simbolos (o marshal grava ivars num simbolo que o codigo nao le)") rescue nil
+          end
+          # [READSAVE-CLS] Game_Map esta' DEFINIDA no momento do load? Se nao ->
+          # class_from_path falha -> Object. Confirma timing vs bug de resolucao.
+          MKXPDebug.log("[READSAVE-CLS] no load: const_defined?(:Game_Map)=#{Object.const_defined?(:Game_Map)} const_defined?(:PokemonMapFactory)=#{Object.const_defined?(:PokemonMapFactory)} Game_Map.class=#{(Game_Map.class rescue 'ERRO')}") rescue nil
+          # [READSAVE-LOAD] DESLIGADO por defeito ($MKXP_TRY_LOAD): o load_all_values
+          # muda estado E pode envenenar a cache de classes do marshal. So' diagnostico.
+          if ($MKXP_TRY_LOAD == true) && (defined?(SaveData) && SaveData.respond_to?(:load_all_values) rescue false)
+            _m0 = ($game_map.map_id rescue '?')
+            begin
+              SaveData.load_all_values(_sv)
+              _mf3 = ($MapFactory rescue nil)
+              _same = (_mf3.equal?(_sv[:map_factory]) rescue false)   # $MapFactory É o do save?
+              _mi3 = (_mf3.instance_variable_get(:@mapIndex) rescue '?')
+              _mps3 = (_mf3.instance_variable_get(:@maps) rescue nil)
+              _ids3 = (_mps3.is_a?(Array) ? _mps3.map { |_m| _m ? (_m.instance_variable_get(:@map_id) rescue '?') : nil } : '?') rescue '?'
+              _m1 = ($MapFactory.map.map_id rescue '?')
+              MKXPDebug.log("[READSAVE-LOAD] $MapFactory===save? #{_same} | @mapIndex=#{_mi3} @maps.map_ids=#{_ids3.inspect} | map().map_id=#{_m1}") rescue nil
+              MKXPDebug.log("[READSAVE-LOAD] VEREDITO: same=false -> :map_factory NAO foi atribuido (validacao/exception saltou-o); same=true mas map_id=0 -> map() ou @maps quebrou") rescue nil
+            rescue => _el
+              MKXPDebug.log("[READSAVE-LOAD] load_all_values REBENTOU: #{_el.class}: #{_el.message.to_s[0,90]}") rescue nil
+            end
+          end
+        else
+          MKXPDebug.log("[READSAVE] save real nao e' Hash: #{_sv.class}") rescue nil
+        end
+      else
+        MKXPDebug.log("[READSAVE] sem save real >4KB para inspecionar") rescue nil
+      end
+    rescue => _ers
+      MKXPDebug.log("[READSAVE] EXCECAO ao ler save real: #{_ers.class}: #{_ers.message.to_s[0,80]}") rescue nil
+    end
+    # [SELFTEST-GMCLASS 2026-07-03] DECISIVO: round-trip de um Game_Map REAL agora.
+    # Se voltar como Object -> o MARSHAL mangla a classe (bug write ou read/cache).
+    # Se voltar Game_Map com map_id=77 -> marshal OK e o save nasceu ja' partido.
+    begin
+      if Object.const_defined?(:Game_Map)
+        _rgm = Game_Map.new
+        _rgm.instance_variable_set(:@map_id, 77)
+        _dd2 = Marshal.dump(_rgm)
+        _ll2 = Marshal.load(_dd2)
+        MKXPDebug.log("[SELFTEST-GMCLASS] Game_Map round-trip: classe_volta=#{_ll2.class} map_id(metodo)=#{(_ll2.map_id rescue 'ERRO')} @map_id(ivar)=#{(_ll2.instance_variable_get(:@map_id) rescue '?')} => #{(_ll2.class.to_s == 'Game_Map' && (_ll2.map_id rescue nil) == 77) ? 'PASS (marshal OK, save nasceu partido)' : 'FALHOU: marshal mangla a classe -> RAIZ!'}") rescue nil
+      end
+    rescue => _egc
+      MKXPDebug.log("[SELFTEST-GMCLASS] EXCECAO: #{_egc.class}: #{_egc.message.to_s[0,80]}") rescue nil
+    end
+    end   # fim do gate $MKXP_DIAG_SAVE (bateria profunda opt-in)
+  rescue => _est
+    MKXPDebug.log("[SELFTEST-SAVE] EXCECAO: #{_est.class}: #{_est.message.to_s[0, 80]}") rescue nil
+  end
+  # ---- FIM SELFTEST-SAVE ---------------------------------------------------------
+
+  # ---- [NEIGHBOR-REFRESH] estatua do Gilbert (evento fantasma no mapa vizinho) --
+  # RAIZ (provada por analise estatica dos scripts): TODOS os pontos do jogo fazem
+  # `$game_map.need_refresh = true` -- SO' o mapa atual. Com MapFactory (mapas
+  # ligados), o VIZINHO nunca recebe need_refresh -> os eventos dele mantem a
+  # pagina antiga (ex: ev7 RIVAL1 continua com o grafico do Gilbert em vez de
+  # refrescar para vazio) -> "estatua" duplicada ao lado do Gilbert real.
+  # FIX: propagar need_refresh=true a todos os mapas do factory. Custo: so'
+  # quando need_refresh muda p/ true (raro). Gate: $MKXP_FIX_NEIGHBOR_REFRESH.
+  begin
+    $MKXP_FIX_NEIGHBOR_REFRESH = true if $MKXP_FIX_NEIGHBOR_REFRESH.nil?
+    if $MKXP_FIX_NEIGHBOR_REFRESH && Object.const_defined?(:Game_Map) &&
+       Game_Map.instance_methods.include?(:need_refresh=) &&
+       !Game_Map.instance_methods.include?(:__mkxp_orig_set_nr)
+      class Game_Map
+        alias_method :__mkxp_orig_set_nr, :need_refresh=
+        def need_refresh=(v)
+          __mkxp_orig_set_nr(v)
+          if v && $MapFactory
+            begin
+              _ms = $MapFactory.maps
+              if _ms.is_a?(Array)
+                _ms.each do |_m|
+                  next if _m.nil? || _m.equal?(self)
+                  (_m.__mkxp_orig_set_nr(true) rescue nil)
+                end
+              end
+            rescue
+            end
+          end
+          v
+        end
+      end
+      MKXPDebug.log("[NEIGHBOR-REFRESH] need_refresh propaga a todos os mapas do factory (anti-estatua)") rescue nil
+    end
+  rescue => __enr
+    MKXPDebug.log("[NEIGHBOR-REFRESH] falhou: #{__enr.class}: #{__enr.message}") rescue nil
+  end
+  # ---- FIM NEIGHBOR-REFRESH ------------------------------------------------------
+
+  # ---- [FOLLOWER-LEAK] anti-orfaos de Sprite_Character (estatua do Gilbert) -----
+  # RAIZ (provada nos scripts): (1) o Spriteset_Map#dispose do jogo (065+066) morre
+  # a MEIO se um bitmap ja' foi disposto -> os @usersprites (DependentEventSprites,
+  # que seguram o sprite do SEGUIDOR) nunca sao dispostos -> sprite imortal no
+  # viewport = estatua. (2) createSingleSpriteset faz restoreAnimations(temp) que
+  # SUBSTITUI @usersprites acabados de criar sem os dispor -> DES orfao (o
+  # Sprite_Character#initialize faz update -> ja' nasce visivel) = estatua.
+  # FIX A: dispose blindado -- se rebentar, varre usersprites+chars na mesma.
+  # FIX B: restoreAnimations preserva DES (dono continua o spriteset) e dispoe o
+  # resto que ia ser descartado. Ambos no-op no fluxo saudavel.
+  begin
+    if Object.const_defined?(:Spriteset_Map)
+      if Spriteset_Map.method_defined?(:dispose) &&
+         !Spriteset_Map.method_defined?(:__mkxp_safe_dispose)
+        class Spriteset_Map
+          alias_method :__mkxp_safe_dispose, :dispose
+          def dispose
+            begin
+              __mkxp_safe_dispose
+            rescue => _ed
+              MKXPDebug.log("[FOLLOWER-LEAK] dispose rebentou a meio (#{_ed.class}: #{_ed.message.to_s[0,60]}) -> varredura de seguranca") rescue nil
+              ((@usersprites || []).each { |_u| (_u.dispose rescue nil) } rescue nil)
+              ((@character_sprites || []).each { |_c| (_c.dispose rescue nil) } rescue nil)
+              (@usersprites.clear rescue nil)
+              (@character_sprites.clear rescue nil)
+            end
+          end
+        end
+      end
+      if Spriteset_Map.method_defined?(:restoreAnimations) &&
+         !Spriteset_Map.method_defined?(:__mkxp_orig_restanims)
+        class Spriteset_Map
+          alias_method :__mkxp_orig_restanims, :restoreAnimations
+          def restoreAnimations(anims)
+            _cur = @usersprites
+            __mkxp_orig_restanims(anims)
+            begin
+              if _cur.is_a?(Array) && !_cur.equal?(@usersprites)
+                _cur.each do |_u|
+                  next if _u.nil?
+                  next if @usersprites.is_a?(Array) && @usersprites.any? { |_k| _k.equal?(_u) }
+                  if _u.class.to_s == "DependentEventSprites"
+                    @usersprites.push(_u) if @usersprites.is_a?(Array)   # preservar o dono
+                  else
+                    (_u.dispose rescue nil)   # animacao descartada -> dispor (anti-orfao)
+                  end
+                end
+              end
+            rescue; end
+          end
+        end
+      end
+      MKXPDebug.log("[FOLLOWER-LEAK] dispose blindado + restoreAnimations anti-orfao instalados") rescue nil
+    end
+  rescue => _efl
+    MKXPDebug.log("[FOLLOWER-LEAK] instalacao falhou: #{_efl.class}: #{_efl.message}") rescue nil
+  end
+  # ---- FIM FOLLOWER-LEAK -----------------------------------------------------------
+
+  # ---- [EVSC] cache de compilacao de scripts de evento (picos do interpreter) ----
+  # PROVADO (auditoria 2026-07-04): Interpreter#execute_script faz eval(script)
+  # puro (mruby-eval SEM cache: parse+codegen completos por chamada) e os
+  # chamadores quentes reavaliam POR FRAME — Conditional Branch [script] em
+  # eventos paralelos (command_111 caso 12), Script command (command_355) e os
+  # switches "s:" (switchIsOn?). Resultado: 1-N compilacoes mruby POR FRAME =
+  # os picos de 26-87ms do interpreter + o churn que levou o GC a 887k vivos.
+  # FIX: memoizar o Proc compilado por string e correr com instance_exec (self
+  # identico ao eval). FAIL-OPEN: falha de compilacao OU de execucao cai no
+  # caminho original -> erro/report 100% identico ao Essentials.
+  begin
+    _ie_ok = (Object.new.instance_exec { 42 } == 42 rescue false)
+    if _ie_ok && Object.const_defined?(:Interpreter) &&
+       Interpreter.instance_methods.include?(:execute_script) &&
+       !Interpreter.instance_methods.include?(:__evsc_orig_execute_script)
+      $__evsc_cache = {}
+      $__evsc_fail  = {}
+      class Interpreter
+        # compilar num scope LIMPO onde o unico local e' `script` — exatamente o
+        # mesmo ambiente lexical que o eval(script) original via.
+        def self.__evsc_compile(script)
+          eval("Proc.new {\n" + script + "\n}")
+        end
+        alias_method :__evsc_orig_execute_script, :execute_script
+        def execute_script(script)
+          return __evsc_orig_execute_script(script) if $__evsc_fail[script]
+          _pr = $__evsc_cache[script]
+          if _pr.nil?
+            begin
+              _pr = Interpreter.__evsc_compile(script)
+            rescue Exception
+              _pr = nil
+            end
+            if _pr.nil?
+              $__evsc_fail[script.dup] = true
+              return __evsc_orig_execute_script(script)
+            end
+            $__evsc_cache[script.dup] = _pr
+          end
+          begin
+            instance_exec(&_pr)
+          rescue Exception
+            # re-corre pelo caminho original: erro identico + report do Essentials
+            __evsc_orig_execute_script(script)
+          end
+        end
+      end
+      MKXPDebug.log("[EVSC] cache de compilacao de scripts de evento instalada (fail-open)") rescue nil
+    else
+      MKXPDebug.log("[EVSC] NAO instalada (instance_exec=#{_ie_ok})") rescue nil
+    end
+  rescue => _ee
+    MKXPDebug.log("[EVSC] instalacao falhou: #{_ee.class}: #{_ee.message}") rescue nil
+  end
+  # ---- FIM EVSC ----------------------------------------------------------------------
+
+  # ---- [SSW] cache dos switches por script "s:" (refresh de eventos) --------------
+  # Game_Event#switchIsOn? e Game_CommonEvent#switchIsOn? fazem eval($~.post_match)
+  # por condicao de pagina em CADA refresh de mapa — e command_122 (variaveis)
+  # marca need_refresh em QUALQUER escrita -> em cutscene isto recompila os
+  # switches "s:" de todos os eventos POR FRAME. Mesma tecnica do EVSC: Proc
+  # memoizado + instance_exec(self=evento), fail-open para o caminho original.
+  begin
+    _ie_ok2 = (Object.new.instance_exec { 42 } == 42 rescue false)
+    if _ie_ok2
+      $__ssw_cache = {}
+      [:Game_Event, :Game_CommonEvent].each do |_kn|
+        next unless Object.const_defined?(_kn)
+        _k = Object.const_get(_kn)
+        next unless _k.instance_methods.include?(:switchIsOn?)
+        next if _k.instance_methods.include?(:__ssw_orig_switchIsOn?)
+        _k.class_eval do
+          alias_method :__ssw_orig_switchIsOn?, :switchIsOn?
+          def switchIsOn?(id)
+            _sw = $data_system.switches[id]
+            return false if !_sw
+            if _sw[/^s\:/]
+              _code = $~.post_match
+              _pr = $__ssw_cache[_code]
+              if _pr.nil?
+                _pr = (Interpreter.__evsc_compile(_code) rescue :bad)
+                $__ssw_cache[_code.dup] = _pr
+              end
+              if _pr != :bad
+                begin
+                  return instance_exec(&_pr)
+                rescue Exception
+                  return __ssw_orig_switchIsOn?(id)   # erro identico pelo original
+                end
+              end
+              return __ssw_orig_switchIsOn?(id)
+            end
+            return $game_switches[id]
+          end
+        end
+        MKXPDebug.log("[SSW] cache de switches s: instalada em #{_kn}") rescue nil
+      end
+    end
+  rescue => _es2
+    MKXPDebug.log("[SSW] instalacao falhou: #{_es2.class}: #{_es2.message}") rescue nil
+  end
+  # ---- FIM SSW -------------------------------------------------------------------
+
+  # ---- [CHARBATCH] seam do update nativo do Sprite_Character ----------------------
+  # O corpo vanilla (061) custa ~45-55 dispatches + 10-12 setters C++ POR SPRITE POR
+  # FRAME; o batch nativo (__mkxp_char_batch, sprite_binding) trata o caso comum em
+  # 1 chamada. Seam no 'shadow_update' (a alias MAIS INTERIOR da cadeia de wrappers
+  # 067<-0004<-0028<-0037<-0557): os plugins (bolhas/sombras/pegadas/followingpkmn)
+  # continuam TODOS a correr por cima; so' o corpo vanilla e' substituido; fallback
+  # = o proprio vanilla via alias (zero replica). DEFAULT OFF ate' o modo verify
+  # passar limpo num self-run: $MKXP_NATIVE_CHAR_BATCH = 1 liga, 2 = verify
+  # (corre o vanilla E compara — zero mudanca de comportamento, loga [CHARBATCH|DIFF]).
+  begin
+    # [2026-07-04c] GUARD FINAL: a reflexao (instance_method/instance_methods) e'
+    # envenenada neste engine por um method_missing universal dos stubs (provado
+    # em self-run: instance_method de metodo INEXISTENTE nao levanta -> guards
+    # todos "true" e por_instalar sempre false). Sonda fiavel = o proprio
+    # alias_method (NameError real se shadow_update nao existir — e' o padrao de
+    # todos os fixes que funcionam) + flag em ivar de classe p/ idempotencia
+    # (padrao SAVE-REPAIR). O batch nativo nao se testa: se faltar em runtime,
+    # o rescue do seam desliga o modo e cai no vanilla.
+    # [2026-07-04d] shadow_update NAO existe no runtime: Sprite_DynamicShadows
+    # esta' na SKIP-LIST do motor (linha ~775). A cadeia real de aliases e':
+    #   vanilla(061) <- water_buble_update(0004) <- sh_update(0028)
+    #                <- footsteps_update(0037) <- __followingpkmn__update(0557)
+    # O seam tem de agarrar a alias MAIS INTERIOR EXISTENTE (interior->exterior;
+    # agarrar uma exterior saltaria plugins = mudanca de comportamento). O
+    # alias_method dentro de rescue e' a sonda (NameError real, provado).
+    _cb_on = (Sprite_Character.instance_variable_get(:@__mkxp_cb_on) rescue false)
+    if Object.const_defined?(:Sprite_Character) && !_cb_on
+      _seam = nil
+      [:shadow_update, :water_buble_update, :sh_update,
+       :footsteps_update, :__followingpkmn__update].each do |_cand|
+        break if _seam
+        begin
+          Sprite_Character.class_eval { alias_method :__mkxp_vanilla_upd, _cand }
+          _seam = _cand
+        rescue Exception
+        end
+      end
+      if _seam
+        Sprite_Character.class_eval(<<-MKXPSEAM)
+        def #{_seam}
+          _m = $MKXP_NATIVE_CHAR_BATCH
+          if _m == 1 || _m == true
+            begin
+              _r = __mkxp_char_batch(1)
+              return if _r == 2
+              if _r == 1
+                SpriteAnimation.clear
+                return
+              end
+            rescue Exception
+              unless $__cb_err
+                $__cb_err = true
+                MKXPDebug.log("[CHARBATCH] excecao -> desligado (fallback permanente)") rescue nil
+              end
+              $MKXP_NATIVE_CHAR_BATCH = false
+            end
+          elsif _m == 2
+            __mkxp_vanilla_upd
+            (__mkxp_char_batch(2) rescue nil)
+            return
+          end
+          __mkxp_vanilla_upd
+        end
+        MKXPSEAM
+        Sprite_Character.instance_variable_set(:@__mkxp_cb_on, true)
+        MKXPDebug.log("[CHARBATCH] seam instalado em '#{_seam}' (modo=#{$MKXP_NATIVE_CHAR_BATCH.inspect}; 1=on 2=verify nil/false=off)") rescue nil
+      else
+        MKXPDebug.log("[CHARBATCH] NENHUMA ancora de alias encontrada -> nao instalado (vanilla intacto)") rescue nil
+      end
+    else
+      MKXPDebug.log("[CHARBATCH] seam ja' instalado ou Sprite_Character ausente") rescue nil
+    end
+  rescue Exception => _cbe
+    MKXPDebug.log("[CHARBATCH] seam falhou: #{_cbe.class}: #{_cbe.message.to_s[0,80]} (shadow_update ausente?)") rescue nil
+  end
+  # ---- FIM CHARBATCH ---------------------------------------------------------------
+
+  # ---- [AUTOFADE-CACHE] transicao de mapa: load_data redundante do autofade -------
+  # PROVADO no log (t=332-334): cada transicao carrega o MESMO Map###.rxdata 2-3x;
+  # um deles e' o Scene_Map#autofade, que faz load_data COMPLETO (60-90ms mesmo em
+  # cache) so' para ler autoplay_bgm/bgs + nomes. Memo por map_id (dados estaticos
+  # do mapa) -> 1 load por mapa por sessao. Semantica identica (mesmas decisoes de
+  # fade). Fail-open: qualquer erro -> caminho original.
+  begin
+    if Object.const_defined?(:Scene_Map) &&
+       Scene_Map.instance_methods.include?(:autofade) &&
+       !Scene_Map.instance_methods.include?(:__mkxp_orig_autofade)
+      $__af_cache = {}
+      class Scene_Map
+        alias_method :__mkxp_orig_autofade, :autofade
+        def autofade(mapid)
+          begin
+            playingBGM = $game_system.playing_bgm
+            playingBGS = $game_system.playing_bgs
+            return if !playingBGM && !playingBGS
+            _c = $__af_cache[mapid]
+            if _c.nil?
+              _map = load_data(sprintf("Data/Map%03d.rxdata", mapid))
+              _c = [_map.autoplay_bgm, (_map.bgm.name rescue ""),
+                    _map.autoplay_bgs, (_map.bgs.name rescue "")]
+              $__af_cache[mapid] = _c
+            end
+            if playingBGM && _c[0]
+              if (PBDayNight.isNight? rescue false)
+                pbBGMFade(0.8) if playingBGM.name != _c[1] && playingBGM.name != _c[1] + "_n"
+              else
+                pbBGMFade(0.8) if playingBGM.name != _c[1]
+              end
+            end
+            if playingBGS && _c[2]
+              pbBGSFade(0.8) if playingBGS.name != _c[3]
+            end
+            Graphics.frame_reset
+          rescue Exception
+            __mkxp_orig_autofade(mapid)   # fail-open: comportamento original
+          end
+        end
+      end
+      MKXPDebug.log("[AUTOFADE-CACHE] autofade com memo por map_id (1 load_data por mapa/sessao)") rescue nil
+    end
+  rescue => _eaf
+    MKXPDebug.log("[AUTOFADE-CACHE] falhou: #{_eaf.class}: #{_eaf.message}") rescue nil
+  end
+  # ---- FIM AUTOFADE-CACHE ------------------------------------------------------------
+
+  # ---- [SAVE-CLEAN] quarentena automatica de saves 0-byte (anti-crash do menu) --
+  # PROVADO no log 20:07: o ecra de gravar le TODOS os slots p/ mostrar a info
+  # (pbSaveScreen -> getSaveInfoBoxContents -> read_from_file -> Marshal.load) e um
+  # save de 0 BYTES (lixo da era do Marshal-stub) leva o load nativo a levantar
+  # "dump format error (EOF)" -> menu de save rebenta. Aqui, no boot, qualquer
+  # *.rxdata de tamanho 0 nos sitios de save e' RENOMEADO para .vazio (nao ha'
+  # perda: 0 bytes = sem dados). O menu volta a abrir.
+  begin
+    _dirs = []
+    _dirs.push((System.data_directory rescue nil))
+    _dirs.push((SaveData::SAVE_DIR rescue nil)) if Object.const_defined?(:SaveData)
+    _dirs.push("sdmc:")   # raiz do sdmc (onde o SAVE_DIR='.' antigo os deixou)
+    _limpos = 0
+    _dirs.compact.uniq.each do |_dd|
+      ["File 01", "File 02", "File 03", "File 04", "File 05", "File 06",
+       "File 07", "File 08", "File 09", "Game", "Backup"].each do |_slot|
+        _fp = _dd + "/" + _slot + ".rxdata"
+        next unless (File.file?(_fp) rescue false)
+        _s = (File.size(_fp) rescue -1)
+        # [SAVE-CLEAN v2 2026-07-03] limiar 0 -> 4096. Um save REAL do Essentials tem
+        # ~50-200KB (player+mapa+bag+pokedex...); QUALQUER coisa < 4KB e' esqueletico
+        # (era o bug do Game_SaveValues skippado: so' 2 valores de plugin = 101 bytes)
+        # e ESSES CRASHAM o ecra de carregar no arranque (raise mal-formado na conversao
+        # -> TypeError -> Scene_Intro morre -> jogo fecha). Pomos de lado; nao ha' perda
+        # (um save de 101 bytes nao tem progresso jogavel).
+        if _s >= 0 && _s < 4096
+          if (File.rename(_fp, _fp + ".esqueleto") rescue false)
+            _limpos += 1
+            MKXPDebug.log("[SAVE-CLEAN] save esqueletico (#{_s}B < 4KB) posto de lado: #{_fp} -> .esqueleto") rescue nil
+          end
+        end
+      end
+    end
+    MKXPDebug.log("[SAVE-CLEAN] varrimento: #{_limpos} save(s) 0-byte em quarentena") rescue nil
+  rescue => __esc
+    MKXPDebug.log("[SAVE-CLEAN] falhou: #{__esc.class}: #{__esc.message}") rescue nil
+  end
+  # ---- FIM SAVE-CLEAN --------------------------------------------------------------
+
+  # ---- [SAVELOAD-TRACE] qual valor do load falha (map=0 no Continuar) -----------
+  # PROVADO: o save e' perfeito (@maps=[map43], player@(29,25)) e o marshal le'-o
+  # bem, MAS depois do load o $game_map e' o mapa 0. O SaveData::Value#load faz
+  # validate_value ANTES do @load_proc -> se a validacao rebentar, o $MapFactory
+  # NUNCA e' atribuido e fica no default (mapa 0). Este wrapper loga, por valor,
+  # se o load correu OU rebentou (com a mensagem) -> nomeia o culpado exato.
+  begin
+    _svc = (defined?(SaveData::Value) ? SaveData::Value : nil)
+    if _svc && _svc.instance_methods.include?(:load) && !_svc.instance_methods.include?(:__mkxp_orig_valload)
+      _svc.class_eval do
+        alias_method :__mkxp_orig_valload, :load
+        def load(value)
+          _id = (@id rescue '?')
+          begin
+            __mkxp_orig_valload(value)
+            MKXPDebug.log("[SAVELOAD] valor '#{_id}' OK (classe=#{value.class})") rescue nil
+          rescue => _e
+            MKXPDebug.log("[SAVELOAD] valor '#{_id}' REBENTOU: #{_e.class}: #{_e.message.to_s[0,90]} (classe recebida=#{value.class}) -> NAO atribuido!") rescue nil
+            raise
+          end
+        end
+      end
+      MKXPDebug.log("[SAVELOAD-TRACE] wrapper instalado em SaveData::Value#load (nomeia o valor que falha no Continuar)") rescue nil
+    end
+  rescue => _esl
+    MKXPDebug.log("[SAVELOAD-TRACE] falhou: #{_esl.class}: #{_esl.message}") rescue nil
+  end
+  # ---- FIM SAVELOAD-TRACE ----------------------------------------------------------
+
   # ---- FIX menu Voltseon: menu_icon_width chama load_bitmap com 1 arg --------
   # O CALLMENU-DIAG capturou o backtrace do crash do menu de pausa:
   #   quicksave_update -> call_menu -> ... -> new -> initialize -> menu_icon_width
@@ -6510,6 +7479,94 @@ begin
     end
   rescue => __eod
     MKXPDebug.log("[OUTFITDIAG] falhou: #{__eod.class}: #{__eod.message}") rescue nil
+  end
+
+  # [GILBERTDIAG] Diagnostico do seguidor (instalado no padrao que FUNCIONA, ao
+  # contrario do ADDDEP do debug_probe que nunca instalava). O seguidor e' adicionado
+  # por um comando de Script (code 355) 'pbAddDependency2(7,"Giltbert",3)' no evento do
+  # mapa, mas nao havia instrumentacao nos Scripts de eventos de mapa. Logamos (a) os
+  # Scripts que mencionam Dependency/Follow/addEvent, e (b) a entrada/saida de addEvent.
+  # SEM regex (mruby do mkxp-3ds nao tem Regexp nativo) -> usa String#include?.
+  begin
+    if Object.const_defined?(:Interpreter) && Interpreter.method_defined?(:command_355) &&
+       !Interpreter.method_defined?(:__mkxp_orig_command_355)
+      Interpreter.send(:alias_method, :__mkxp_orig_command_355, :command_355)
+      Interpreter.send(:define_method, :command_355) do
+        begin
+          # LAZY-INSTALL dos hooks que precisam de classes TARDIAS (DependentEvents so'
+          # existe a t~17s; o bloco do binding corre a t~4s -> o hook one-shot nunca
+          # instalava). command_355 so' dispara em runtime, por isso instalamos aqui.
+          unless $__gilbert_late_done
+            if Object.const_defined?(:DependentEvents) && (DependentEvents.method_defined?(:addEvent) rescue false) &&
+               !(DependentEvents.method_defined?(:__g_orig_addEvent) rescue true)
+              DependentEvents.send(:alias_method, :__g_orig_addEvent, :addEvent)
+              DependentEvents.send(:define_method, :addEvent) do |*aa|
+                __b = ($PokemonGlobal.dependentEvents.size rescue -1)
+                (MKXPDebug.log("[GILBERTDIAG] addEvent CHAMADO args=#{aa.size} dep_antes=#{__b}") rescue nil)
+                __r = (__g_orig_addEvent(*aa) rescue (MKXPDebug.log("[GILBERTDIAG] addEvent REBENTOU") rescue nil; nil))
+                (MKXPDebug.log("[GILBERTDIAG] addEvent FIM dep_depois=#{$PokemonGlobal.dependentEvents.size rescue -1}") rescue nil)
+                __r
+              end
+              (MKXPDebug.log("[GILBERTDIAG] hook addEvent instalado (lazy via command_355)") rescue nil)
+              $__gilbert_late_done = true
+            end
+          end
+          __sc = (@parameters[0].to_s rescue '')
+          $__g355 = ($__g355 || 0) + 1
+          # LOG TODOS os Script(355) (cap 60) -> ver o que o evento do Gilbert corre.
+          # Dependency/Follow/addEvent SEMPRE (mesmo apos o cap).
+          if $__g355 <= 60 || __sc.include?('Dependency') || __sc.include?('Follow') || __sc.include?('addEvent') || __sc.include?('Partner') || __sc.include?('Register')
+            MKXPDebug.log("[GILBERTDIAG] Script(355) ##{$__g355} m=#{($game_map.map_id rescue '?')}: #{__sc[0,140]}") rescue nil
+          end
+        rescue; end
+        # [GILBERTDIAG] CAPTURAR a excecao do Script (decisivo): se pbRegisterPartner
+        # ou pbAddDependency2 rebentar, o evento do seguidor aborta antes de adicionar.
+        # Logamos a causa EXATA + o script, e re-lancamos (sem mudar comportamento).
+        begin
+          __mkxp_orig_command_355
+        rescue => __s355
+          (MKXPDebug.log("[GILBERTDIAG] Script(355) REBENTOU: #{__s355.class}: #{__s355.message.to_s[0,140]} | sc='#{(@parameters[0].to_s[0,90] rescue '?')}'") rescue nil)
+          raise
+        end
+      end
+      MKXPDebug.log("[GILBERTDIAG] hook command_355 instalado") rescue nil
+    end
+    # command_655: linhas de CONTINUACAO de um Script multi-linha. O pbAddDependency
+    # pode estar numa 655, nao na 355 -> sem isto perdiamos o texto.
+    if Object.const_defined?(:Interpreter) && Interpreter.method_defined?(:command_655) &&
+       !Interpreter.method_defined?(:__mkxp_orig_command_655)
+      Interpreter.send(:alias_method, :__mkxp_orig_command_655, :command_655)
+      Interpreter.send(:define_method, :command_655) do
+        begin
+          __sc6 = (@parameters[0].to_s rescue '')
+          $__g655 = ($__g655 || 0) + 1
+          if $__g655 <= 60 || __sc6.include?('Dependency') || __sc6.include?('Follow')
+            MKXPDebug.log("[GILBERTDIAG] Script(655) ##{$__g655}: #{__sc6[0,140]}") rescue nil
+          end
+        rescue; end
+        __mkxp_orig_command_655
+      end
+      MKXPDebug.log("[GILBERTDIAG] hook command_655 instalado") rescue nil
+    end
+  rescue => __egd
+    MKXPDebug.log("[GILBERTDIAG] command_355 falhou: #{__egd.class}: #{__egd.message}") rescue nil
+  end
+  begin
+    if Object.const_defined?(:DependentEvents) && DependentEvents.method_defined?(:addEvent) &&
+       !DependentEvents.method_defined?(:__mkxp_orig_addEvent2)
+      DependentEvents.send(:alias_method, :__mkxp_orig_addEvent2, :addEvent)
+      DependentEvents.send(:define_method, :addEvent) do |*aa|
+        __b = ($PokemonGlobal.dependentEvents.size rescue -1)
+        (MKXPDebug.log("[GILBERTDIAG] addEvent CHAMADO args=#{aa.size} dep_antes=#{__b}") rescue nil)
+        __rr = (__mkxp_orig_addEvent2(*aa) rescue (MKXPDebug.log("[GILBERTDIAG] addEvent REBENTOU") rescue nil; nil))
+        __a = ($PokemonGlobal.dependentEvents.size rescue -1)
+        (MKXPDebug.log("[GILBERTDIAG] addEvent FIM dep_depois=#{__a} (#{__a > __b ? '>>> SEGUIDOR ADICIONADO' : 'NAO adicionou'})") rescue nil)
+        __rr
+      end
+      MKXPDebug.log("[GILBERTDIAG] hook addEvent instalado") rescue nil
+    end
+  rescue => __ead
+    MKXPDebug.log("[GILBERTDIAG] addEvent falhou: #{__ead.class}: #{__ead.message}") rescue nil
   end
 
   def self.__mkxp_hook_scene(klass_name)
@@ -7114,6 +8171,356 @@ static bool mkxp_plugin_compile_dump_run(mrb_state* mrb, const char* cache_path,
 #endif /* MKXP_PLUGIN_CACHE */
 
 
+/* ============================================================================
+ * [FILE-IO 2026-07-02] File/FileTest REAIS + System.data_directory (SAVE/LOAD)
+ * ----------------------------------------------------------------------------
+ * PRIORIDADE 1 (Save/Load). AUDITORIA PROVOU que gravar era um NO-OP silencioso:
+ *   - rgss_stubs.rb `class File` e' FAKE: open{ yield nil }, read->"", write->0
+ *     (por isso o motor ja' precisava do remendo eof?->true p/ file=nil).
+ *   - SaveData.save_to_file faz File.open('wb'){|f| Marshal.dump(dados, f)} ->
+ *     com o File fake nada e' escrito; o load nunca ve' um save.
+ *   - System.data_directory nao existia -> FILE_PATH caia em './Game.rxdata'.
+ * FIX motor: classe File REAL (fopen no sdmc), FileTest real, e
+ * System.data_directory = sdmc:/mkxp/saves (mkdir na init). O rgss_stubs passa a
+ * NAO sobrepor o File quando o nativo esta' presente (gate File.mkxp_native?).
+ * API minima que o Essentials v19 usa: open/close/write/read/eof?/pos/pos=/seek/
+ * size/gets + file?/exist?/directory?/delete/rename/move/mtime/binread/binwrite.
+ * ============================================================================ */
+struct MkxpFileH { FILE *fp; bool closed; size_t wrote; char path[256]; };
+static void mkxp_fileh_free(mrb_state *mrb, void *p) {
+    MkxpFileH *h = (MkxpFileH*)p;
+    if (h) { if (h->fp && !h->closed) fclose(h->fp); mrb_free(mrb, h); }
+}
+static const mrb_data_type MkxpFileType = { "File", mkxp_fileh_free };
+
+/* [SAVE-PROVA 2026-07-02] loga qualquer ESCRITA de ficheiro que terminou (>0 bytes)
+ * -> prova irrefutavel no debug_binding.log de que o Save gravou, e onde. Barato
+ * (1 linha por ficheiro fechado que foi escrito, nao por byte). */
+static void mkxp_file_log_write(MkxpFileH *h) {
+    if (!h || h->wrote == 0) return;
+    extern FILE *g_dbglog;
+    if (g_dbglog) {
+        fprintf(g_dbglog, "[SAVE-PROVA] gravado '%s' (%zu bytes)\n", h->path, h->wrote);
+        fflush(g_dbglog);
+    }
+}
+static MkxpFileH *mkxp_file_get(mrb_state *mrb, mrb_value self, bool need_open) {
+    MkxpFileH *h = (MkxpFileH*)mrb_data_get_ptr(mrb, self, &MkxpFileType);
+    if (need_open && (!h || !h->fp || h->closed))
+        mrb_raise(mrb, E_RUNTIME_ERROR, "ficheiro fechado");
+    return h;
+}
+/* modo Ruby -> fopen: garante 'b' (o 3DS/newlib distingue; saves sao binarios) */
+static void mkxp_file_mode(const char *in, char *out /*>=8*/) {
+    size_t n = 0; bool has_b = false;
+    for (const char *p = in; *p && n < 6; p++) { if (*p == 'b') has_b = true; out[n++] = *p; }
+    if (!has_b) out[n++] = 'b';
+    out[n] = '\0';
+    if (n == 1) { out[0] = 'r'; out[1] = 'b'; out[2] = '\0'; }
+}
+/* [FILE-RESOLVE 2026-07-02] REGRESSAO CORRIGIDA: o jogo abre caminhos RELATIVOS
+ * do diretorio do jogo e sem extensao (ex: getPlayTime2 -> File.open("Audio/BGM/
+ * TITLE_MD")). No Windows resolve porque o CWD e' a pasta do jogo; aqui o fopen
+ * cru falhava -> RuntimeError -> Scene_Intro morria -> o jogo FECHAVA sozinho.
+ * Resolver como o resto do motor (mesmas raizes do bmp_load_file) + extensoes de
+ * audio em LEITURA (o consumidor conhecido de caminhos sem extensao e' o audio).
+ * Escrita relativa: determinista para a pasta do jogo (sdmc), nunca romfs (RO). */
+static bool mkxp_file_is_abs(const char *p) {
+    return p && (p[0] == '/' || strstr(p, ":/") != nullptr);
+}
+static bool mkxp_file_resolve(const char *path, bool for_read, bool want_dir,
+                              char *out, size_t outsz) {
+    static const char *roots[] = { "", "sdmc:/mkxp/game/", "sdmc:/mkxp/", "romfs:/", nullptr };
+    static const char *exts[]  = { "", ".ogg", ".wav", ".mp3", nullptr };
+    const bool is_abs = mkxp_file_is_abs(path);
+    for (int ri = 0; roots[ri] != nullptr; ri++) {
+        if (is_abs && roots[ri][0] != '\0') continue;   /* absoluto: so' como esta' */
+        char base[512];
+        snprintf(base, sizeof(base), "%s%s", roots[ri], path);
+        for (int ei = 0; exts[ei] != nullptr; ei++) {
+            if ((!for_read || want_dir) && ei > 0) break;   /* sem magia de ext p/ escrita/dirs */
+            char cand[520];
+            snprintf(cand, sizeof(cand), "%s%s", base, exts[ei]);
+            struct stat st;
+            if (::stat(cand, &st) == 0 &&
+                (want_dir ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode))) {
+                snprintf(out, outsz, "%s", cand);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+static mrb_value mkxp_file_s_open(mrb_state *mrb, mrb_value self) {
+    const char *path; const char *mode = "r"; mrb_value blk = mrb_nil_value();
+    mrb_get_args(mrb, "z|z&", &path, &mode, &blk);
+    char m[8]; mkxp_file_mode(mode, m);
+    const bool for_read = (m[0] == 'r');
+    FILE *fp = fopen(path, m);
+    if (!fp) {
+        char full[520];
+        if (for_read) {
+            /* leitura: resolver raizes+extensoes como o resto do motor */
+            if (mkxp_file_resolve(path, true, false, full, sizeof(full)))
+                fp = fopen(full, m);
+        } else if (!mkxp_file_is_abs(path)) {
+            /* escrita relativa: determinista p/ a pasta do jogo no sdmc */
+            snprintf(full, sizeof(full), "sdmc:/mkxp/game/%s", path);
+            fp = fopen(full, m);
+        }
+    }
+    if (!fp) mrb_raisef(mrb, E_RUNTIME_ERROR, "File.open falhou: %s (modo %s)", path, m);
+    MkxpFileH *h = (MkxpFileH*)mrb_malloc(mrb, sizeof(MkxpFileH));
+    h->fp = fp; h->closed = false; h->wrote = 0;
+    snprintf(h->path, sizeof(h->path), "%s", path);
+    mrb_value obj = mrb_obj_value(mrb_data_object_alloc(mrb, mrb_class_ptr(self), h, &MkxpFileType));
+    if (!mrb_nil_p(blk)) {
+        mrb_value res = mrb_yield(mrb, blk, obj);
+        /* fecho garantido no fim do bloco (se o bloco levantar, o GC fecha via free) */
+        if (!h->closed && h->fp) {
+            fclose(h->fp); h->fp = nullptr; h->closed = true;
+            mkxp_file_log_write(h);
+        }
+        return res;
+    }
+    return obj;
+}
+static mrb_value mkxp_file_write(mrb_state *mrb, mrb_value self) {
+    MkxpFileH *h = mkxp_file_get(mrb, self, true);
+    mrb_value s; mrb_get_args(mrb, "o", &s);
+    if (!mrb_string_p(s)) s = mrb_funcall(mrb, s, "to_s", 0);
+    size_t n = fwrite(RSTRING_PTR(s), 1, (size_t)RSTRING_LEN(s), h->fp);
+    /* [SAVE-PROVA] contabiliza bytes escritos p/ o log de close saber se gravou */
+    h->wrote += n;
+    return mrb_int_value(mrb, (mrb_int)n);
+}
+static mrb_value mkxp_file_read(mrb_state *mrb, mrb_value self) {
+    MkxpFileH *h = mkxp_file_get(mrb, self, true);
+    mrb_int want = -1; mrb_get_args(mrb, "|i", &want);
+    long pos = ftell(h->fp);
+    if (want < 0) {                        /* ler ate' ao fim */
+        fseek(h->fp, 0, SEEK_END);
+        long end = ftell(h->fp);
+        fseek(h->fp, pos, SEEK_SET);
+        want = (mrb_int)(end - pos);
+        if (want < 0) want = 0;
+    }
+    if (want == 0) return mrb_str_new_lit(mrb, "");
+    std::vector<char> buf((size_t)want);
+    size_t rd = fread(buf.data(), 1, (size_t)want, h->fp);
+    if (rd == 0) return mrb_nil_value();   /* EOF com n pedido -> nil (CRuby) */
+    return mrb_str_new(mrb, buf.data(), (mrb_int)rd);
+}
+static mrb_value mkxp_file_eof(mrb_state *mrb, mrb_value self) {
+    MkxpFileH *h = mkxp_file_get(mrb, self, true);
+    int c = fgetc(h->fp);
+    if (c == EOF) return mrb_true_value();
+    ungetc(c, h->fp);
+    return mrb_false_value();
+}
+static mrb_value mkxp_file_close(mrb_state *mrb, mrb_value self) {
+    MkxpFileH *h = mkxp_file_get(mrb, self, false);
+    if (h && h->fp && !h->closed) {
+        fclose(h->fp); h->fp = nullptr; h->closed = true;
+        mkxp_file_log_write(h);
+    }
+    return mrb_nil_value();
+}
+static mrb_value mkxp_file_closed(mrb_state *mrb, mrb_value self) {
+    MkxpFileH *h = mkxp_file_get(mrb, self, false);
+    return mrb_bool_value(!h || h->closed || !h->fp);
+}
+static mrb_value mkxp_file_pos(mrb_state *mrb, mrb_value self) {
+    MkxpFileH *h = mkxp_file_get(mrb, self, true);
+    return mrb_int_value(mrb, (mrb_int)ftell(h->fp));
+}
+static mrb_value mkxp_file_pos_set(mrb_state *mrb, mrb_value self) {
+    MkxpFileH *h = mkxp_file_get(mrb, self, true);
+    mrb_int n; mrb_get_args(mrb, "i", &n);
+    fseek(h->fp, (long)n, SEEK_SET);
+    return mrb_int_value(mrb, n);
+}
+static mrb_value mkxp_file_seek(mrb_state *mrb, mrb_value self) {
+    MkxpFileH *h = mkxp_file_get(mrb, self, true);
+    mrb_int n; mrb_int whence = 0; mrb_get_args(mrb, "i|i", &n, &whence);
+    int w = (whence == 1) ? SEEK_CUR : (whence == 2) ? SEEK_END : SEEK_SET;
+    fseek(h->fp, (long)n, w);
+    return mrb_int_value(mrb, 0);
+}
+static mrb_value mkxp_file_isize(mrb_state *mrb, mrb_value self) {
+    MkxpFileH *h = mkxp_file_get(mrb, self, true);
+    long pos = ftell(h->fp);
+    fseek(h->fp, 0, SEEK_END);
+    long end = ftell(h->fp);
+    fseek(h->fp, pos, SEEK_SET);
+    return mrb_int_value(mrb, (mrb_int)end);
+}
+static mrb_value mkxp_file_gets(mrb_state *mrb, mrb_value self) {
+    MkxpFileH *h = mkxp_file_get(mrb, self, true);
+    std::vector<char> line;
+    int c;
+    while ((c = fgetc(h->fp)) != EOF) {
+        line.push_back((char)c);
+        if (c == '\n') break;
+    }
+    if (line.empty()) return mrb_nil_value();
+    return mrb_str_new(mrb, line.data(), (mrb_int)line.size());
+}
+/* ---- class-methods de caminho (partilhados com FileTest) ----
+ * [FILE-RESOLVE] usam o MESMO resolver do open: um guard (safeExists?/file?) e o
+ * open subsequente teem de CONCORDAR, senao o guard passa e o open rebenta. */
+static mrb_value mkxp_file_s_file(mrb_state *mrb, mrb_value) {
+    const char *p; mrb_get_args(mrb, "z", &p);
+    char full[520];
+    return mrb_bool_value(mkxp_file_resolve(p, true, false, full, sizeof(full)));
+}
+/* [DIR-OPENDIR 2026-07-02] stat()+S_ISDIR e' POUCO FIAVEL no 3DS/libctru (devolve
+ * false para pastas reais) -> File.directory?("sdmc:/mkxp/saves") dava false ->
+ * o Auto Multi Save punha SAVE_DIR='.' e gravava na RAIZ do sdmc (file "01.rxdata",
+ * 0 bytes fora do sitio). mkxp_native_dir_exists usa opendir (fiavel). */
+extern "C" int mkxp_native_dir_exists(const char *path);
+static mrb_value mkxp_file_s_dir(mrb_state *mrb, mrb_value) {
+    const char *p; mrb_get_args(mrb, "z", &p);
+    return mrb_bool_value(mkxp_native_dir_exists(p) != 0);
+}
+static mrb_value mkxp_file_s_exist(mrb_state *mrb, mrb_value) {
+    const char *p; mrb_get_args(mrb, "z", &p);
+    char full[520];
+    return mrb_bool_value(mkxp_file_resolve(p, true, false, full, sizeof(full)) ||
+                          mkxp_native_dir_exists(p) != 0);
+}
+static mrb_value mkxp_file_s_size(mrb_state *mrb, mrb_value) {
+    const char *p; mrb_get_args(mrb, "z", &p);
+    char full[520];
+    if (!mkxp_file_resolve(p, true, false, full, sizeof(full))) return mrb_int_value(mrb, 0);
+    struct stat st;
+    return mrb_int_value(mrb, (::stat(full, &st) == 0) ? (mrb_int)st.st_size : 0);
+}
+static mrb_value mkxp_file_s_delete(mrb_state *mrb, mrb_value) {
+    /* CRuby levanta ENOENT; aqui NAO levantamos (SaveData.delete_file chama sem
+     * verificar -> um raise partiria o fluxo; devolver a contagem e' suficiente). */
+    const mrb_value *argv; mrb_int argc; mrb_get_args(mrb, "*", &argv, &argc);
+    int n = 0;
+    for (mrb_int i = 0; i < argc; i++)
+        if (mrb_string_p(argv[i]) && ::remove(RSTRING_CSTR(mrb, argv[i])) == 0) n++;
+    return mrb_int_value(mrb, n);
+}
+static mrb_value mkxp_file_s_rename(mrb_state *mrb, mrb_value) {
+    const char *a, *b; mrb_get_args(mrb, "zz", &a, &b);
+    if (::rename(a, b) != 0) {
+        /* fallback copia+apaga (rename pode falhar entre dirs nalguns FS) */
+        FILE *fi = fopen(a, "rb");
+        if (!fi) return mrb_int_value(mrb, -1);
+        FILE *fo = fopen(b, "wb");
+        if (!fo) { fclose(fi); return mrb_int_value(mrb, -1); }
+        char buf[4096]; size_t rd;
+        while ((rd = fread(buf, 1, sizeof(buf), fi)) > 0) fwrite(buf, 1, rd, fo);
+        fclose(fi); fclose(fo); ::remove(a);
+    }
+    return mrb_int_value(mrb, 0);
+}
+static mrb_value mkxp_file_s_mtime(mrb_state *mrb, mrb_value) {
+    const char *p; mrb_get_args(mrb, "z", &p);
+    char full[520];
+    struct stat st;
+    mrb_int secs = 0;
+    if (mkxp_file_resolve(p, true, false, full, sizeof(full)) && ::stat(full, &st) == 0)
+        secs = (mrb_int)st.st_mtime;
+    /* Time.at se existir (o Essentials mostra a hora do save); senao Integer */
+    struct RClass *tc = mrb_class_defined(mrb, "Time") ? mrb_class_get(mrb, "Time") : NULL;
+    if (tc) {
+        mrb_value t = mrb_funcall(mrb, mrb_obj_value(tc), "at", 1, mrb_int_value(mrb, secs));
+        if (!mrb->exc) return t;
+        mrb->exc = 0;
+    }
+    return mrb_int_value(mrb, secs);
+}
+static mrb_value mkxp_file_s_binread(mrb_state *mrb, mrb_value) {
+    const char *p; mrb_get_args(mrb, "z", &p);
+    FILE *fp = fopen(p, "rb");
+    if (!fp) {
+        char full[520];
+        if (mkxp_file_resolve(p, true, false, full, sizeof(full)))
+            fp = fopen(full, "rb");
+    }
+    if (!fp) mrb_raisef(mrb, E_RUNTIME_ERROR, "File.binread falhou: %s", p);
+    fseek(fp, 0, SEEK_END); long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
+    std::vector<char> buf((size_t)(sz > 0 ? sz : 0));
+    size_t rd = (sz > 0) ? fread(buf.data(), 1, (size_t)sz, fp) : 0;
+    fclose(fp);
+    return mrb_str_new(mrb, buf.data(), (mrb_int)rd);
+}
+static mrb_value mkxp_file_s_binwrite(mrb_state *mrb, mrb_value) {
+    const char *p; mrb_value s; mrb_get_args(mrb, "zS", &p, &s);
+    FILE *fp = fopen(p, "wb");
+    if (!fp) mrb_raisef(mrb, E_RUNTIME_ERROR, "File.binwrite falhou: %s", p);
+    size_t n = fwrite(RSTRING_PTR(s), 1, (size_t)RSTRING_LEN(s), fp);
+    fclose(fp);
+    return mrb_int_value(mrb, (mrb_int)n);
+}
+static mrb_value mkxp_file_s_native(mrb_state*, mrb_value) { return mrb_true_value(); }
+
+static const char *MKXP_SAVE_DIR = "sdmc:/mkxp/saves";
+static mrb_value mkxp_system_data_dir(mrb_state *mrb, mrb_value) {
+    return mrb_str_new_cstr(mrb, MKXP_SAVE_DIR);
+}
+
+static void fileBindingInit(mrb_state *mrb) {
+    mkdir("sdmc:/mkxp", 0777);          /* idempotente */
+    mkdir(MKXP_SAVE_DIR, 0777);
+    /* [SAVE-DIR-FIX v4 2026-07-03, provado pelo SELFTEST em self-run] Os SCRIPTS
+     * do jogo redefinem System.data_directory para "<game>/Save" (layout Windows)
+     * DEPOIS deste init -> e' ESSA a pasta que o Auto Multi Save valida ao
+     * carregar (t=4.2). Se nao existir, directory?=false -> SAVE_DIR='.' -> saves
+     * na raiz do sdmc. Criamo-la ja' aqui (antes de scripts e plugins). */
+    mkdir("sdmc:/mkxp/game/Save", 0777);
+    /* [SAVE-DIR-FIX v2] AUTOTESTE no boot: o Auto Multi Save decide SAVE_DIR com
+     * File.directory?(data_directory) no load dos plugins. Se isto der 0, os saves
+     * vao parar a' RAIZ do sdmc (SAVE_DIR='.'). Loga o veredito de cada camada
+     * para o proximo log dizer exatamente qual primitivo funciona neste VFS. */
+    {
+        extern int mkxp_native_dir_exists(const char *path);
+        int ok = mkxp_native_dir_exists(MKXP_SAVE_DIR);
+        DBGLOG("[FILE-IO] autoteste dir_exists('%s') = %d %s\n",
+               MKXP_SAVE_DIR, ok, ok ? "(saves vao p/ a pasta certa)"
+                                     : "(PROBLEMA: SAVE_DIR vai cair em '.')");
+    }
+    struct RClass *f = mrb_define_class(mrb, "File", mrb->object_class);
+    MRB_SET_INSTANCE_TT(f, MRB_TT_DATA);
+    mrb_define_class_method(mrb, f, "open",         mkxp_file_s_open,    MRB_ARGS_ARG(1,1)|MRB_ARGS_BLOCK());
+    mrb_define_class_method(mrb, f, "file?",        mkxp_file_s_file,    MRB_ARGS_REQ(1));
+    mrb_define_class_method(mrb, f, "directory?",   mkxp_file_s_dir,     MRB_ARGS_REQ(1));
+    mrb_define_class_method(mrb, f, "exist?",       mkxp_file_s_exist,   MRB_ARGS_REQ(1));
+    mrb_define_class_method(mrb, f, "exists?",      mkxp_file_s_exist,   MRB_ARGS_REQ(1));
+    mrb_define_class_method(mrb, f, "size",         mkxp_file_s_size,    MRB_ARGS_REQ(1));
+    mrb_define_class_method(mrb, f, "delete",       mkxp_file_s_delete,  MRB_ARGS_ANY());
+    mrb_define_class_method(mrb, f, "rename",       mkxp_file_s_rename,  MRB_ARGS_REQ(2));
+    mrb_define_class_method(mrb, f, "move",         mkxp_file_s_rename,  MRB_ARGS_REQ(2));
+    mrb_define_class_method(mrb, f, "mtime",        mkxp_file_s_mtime,   MRB_ARGS_REQ(1));
+    mrb_define_class_method(mrb, f, "binread",      mkxp_file_s_binread, MRB_ARGS_REQ(1));
+    mrb_define_class_method(mrb, f, "binwrite",     mkxp_file_s_binwrite,MRB_ARGS_REQ(2));
+    mrb_define_class_method(mrb, f, "mkxp_native?", mkxp_file_s_native,  MRB_ARGS_NONE());
+    mrb_define_method(mrb, f, "write",   mkxp_file_write,   MRB_ARGS_REQ(1));
+    mrb_define_method(mrb, f, "read",    mkxp_file_read,    MRB_ARGS_OPT(1));
+    mrb_define_method(mrb, f, "eof?",    mkxp_file_eof,     MRB_ARGS_NONE());
+    mrb_define_method(mrb, f, "close",   mkxp_file_close,   MRB_ARGS_NONE());
+    mrb_define_method(mrb, f, "closed?", mkxp_file_closed,  MRB_ARGS_NONE());
+    mrb_define_method(mrb, f, "pos",     mkxp_file_pos,     MRB_ARGS_NONE());
+    mrb_define_method(mrb, f, "pos=",    mkxp_file_pos_set, MRB_ARGS_REQ(1));
+    mrb_define_method(mrb, f, "seek",    mkxp_file_seek,    MRB_ARGS_ARG(1,1));
+    mrb_define_method(mrb, f, "size",    mkxp_file_isize,   MRB_ARGS_NONE());
+    mrb_define_method(mrb, f, "gets",    mkxp_file_gets,    MRB_ARGS_NONE());
+    struct RClass *ft = mrb_define_module(mrb, "FileTest");
+    mrb_define_module_function(mrb, ft, "file?",      mkxp_file_s_file,  MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, ft, "directory?", mkxp_file_s_dir,   MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, ft, "exist?",     mkxp_file_s_exist, MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, ft, "exists?",    mkxp_file_s_exist, MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, ft, "size",       mkxp_file_s_size,  MRB_ARGS_REQ(1));
+    struct RClass *sys = mrb_define_module(mrb, "System");
+    mrb_define_module_function(mrb, sys, "data_directory", mkxp_system_data_dir, MRB_ARGS_NONE());
+    DBGLOG("[FILE-IO] File/FileTest REAIS (fopen) + System.data_directory=%s (Save/Load ativo)\n", MKXP_SAVE_DIR);
+}
+
 /* =========================================================
  * CARREGADOR DE PLUGINS (PluginScripts.rxdata)
  * ---------------------------------------------------------
@@ -7475,6 +8882,29 @@ static void run_rmxp_scripts(mrb_state* mrb, const char* game_path) {
 		show_error(mrb, "compat_stubs");
 		mrb->exc = 0;
 	}
+	/* [OLDRAND-FIX] O motor ja' define oldRand (R maiusculo) mas SO' pos-scripts
+	 * (check_entry_methods, tarde demais). Varios plugins do Essentials chamam
+	 * oldrand (minusculo) JA' durante o load dos Scripts.rxdata -> NoMethodError
+	 * no boot (t~3.2s, "Marin's Scripting Utilities"). Definimos AQUI, ANTES do
+	 * loop de Scripts.rxdata, oldrand minusculo (Kernel module_function + global),
+	 * delegando ao __native_rand__ (ja' registado em C neste ponto). Se um plugin
+	 * fizer 'alias oldrand rand' por cima, sobrepoe-se sem problema. Tudo em
+	 * begin/rescue p/ nunca partir o boot. */
+	mrb_load_string(mrb,
+	    "begin\n"
+	    "  module Kernel\n"
+	    "    def oldrand(*a)\n"
+	    "      a.empty? ? __native_rand__ : __native_rand__(a[0])\n"
+	    "    end\n"
+	    "    module_function :oldrand\n"
+	    "  end\n"
+	    "  def oldrand(*a)\n"
+	    "    a.empty? ? __native_rand__ : __native_rand__(a[0])\n"
+	    "  end\n"
+	    "rescue => e\n"
+	    "end\n");
+	if (mrb->exc) { mrb->exc = 0; }
+	DBGLOG("[OLDRAND-FIX] oldrand (minusculo) definido antes dos Scripts.rxdata\n");
 	/* NOTA: BitmapWrapper NÃO existe aqui ainda -- é criado pelos scripts do jogo.
 	 * O fix MRB_TT_DATA tem de ser aplicado DEPOIS de run_rmxp_scripts(). */
     for (int i = 0; i < num_scripts; i++) {
@@ -7725,6 +9155,108 @@ end
 )CMDIAG");
     if (mrb->exc) { mrb->exc = 0; }
 
+    /* [TILEBMP-FIX] (2026-07-01) REMOVIDO: era um duplicado morto. O log 08:39 provou
+     * que o dono FINAL de pbGetTileBitmap e' o bloco [TILEBMP] do proprio motor
+     * (check_entry_methods, corre DEPOIS do probe) que sobrepunha esta injecao.
+     * O fix real (usar o tileset residente via pbGetTileset) foi feito LA' ([TILEBMP v2],
+     * ~linha 1920) em vez de manter dois sistemas paralelos. */
+
+    /* ── [MENU-FLUSH] mata o auto-Bag: flush de flancos a' entrada de call_menu ──
+     * RAIZ (provada: [USE-TRIG] f=5517 press=0 held=0 was_held=0 held_any=1 na
+     * abertura do menu): o menu de pausa Voltseon abre IN-PLACE (sem Graphics.freeze),
+     * por isso o flush automatico de flancos (que so' corre em grph_freeze) nao limpa
+     * um held_any STALE de USE deixado por um toque anterior. A 1a leitura de
+     * trigger?(USE) do menu apanha esse fantasma -> abre a Bag sozinha -> loop de
+     * reabertura -> "menu congela". FIX: envolver Scene_Map#call_menu e chamar
+     * Input.flush_edges (motor) a' ENTRADA -> o menu comeca sem flancos pendentes
+     * (semantica RGSS correcta: e' preciso premir DE NOVO p/ selecionar). Injetado
+     * pelo MOTOR (nao pela sonda); idempotente ($__mkxp_menuflush). */
+    mrb_load_string(mrb, R"MENUFLUSH(
+begin
+  if defined?(Scene_Map) && Scene_Map.method_defined?(:call_menu) && !$__mkxp_menuflush
+    $__mkxp_menuflush = true
+    class Scene_Map
+      alias_method :__mkxp_orig_call_menu_flush, :call_menu
+      def call_menu(*a, &b)
+        (Input.begin_menu_diag(120) rescue nil)   # [MENUDIAG] Bug 4: captura input CRU a' abertura (120 frames)
+        (Input.flush_edges rescue nil) if $MKXP_MENU_FLUSH == true   # fix DESLIGADO por defeito (raiz nao provada)
+        __mkxp_orig_call_menu_flush(*a, &b)
+      end
+    end
+    (MKXPDebug.log("[MENU-FLUSH] call_menu envolvido: [MENUDIAG] arma sempre; flush_edges SO' se $MKXP_MENU_FLUSH==true (default OFF ate' raiz provada)") rescue nil)
+  end
+rescue => __mfe
+  (MKXPDebug.log("[MENU-FLUSH] instalacao falhou: #{__mfe.class}: #{__mfe.message}") rescue nil)
+end
+
+# ── [BAGTRACE] Bug 4 (auto-Bag): identificar QUEM abre a Bag ──────────────────
+# PROVADO no log 08:39: a Bag abre (PokemonBag_Scene#pbStartScene t=355.516) SEM
+# NENHUMA leitura de Input.trigger? (o [MENUDIAG] nativo loga TODAS; a 1a leitura
+# so' vem DEPOIS, f=7346) -> NAO e' input nem fantasma: alguem chama pbStartScreen
+# programaticamente (e re-chama a cada ~0.87s p/ sempre = o "congelado"). O proprio
+# probe nunca identificou o caller (FIX-BAGREOPEN bloqueia as CHAMADAS SEGUINTES no
+# pbStartScreen "catch-all" sem saber a origem). Estes wrappers logam o BACKTRACE
+# (tecnica raise/rescue ja' provada pelo CALLMENU-DIAG) na 1a-6a chamada de cada um
+# -> o proximo log da' o ficheiro:linha exato do caller. So' diagnostico; zero
+# mudanca de comportamento; caps baixos.
+begin
+  [[:PokemonBag_Scene, :pbStartScene, "SCENE"],
+   [:PokemonBagScreen, :pbStartScreen, "SCREEN"],
+   [:MenuEntryBag,     :selected,      "ENTRY"]].each do |klass_sym, meth, tag|
+    next unless (Object.const_defined?(klass_sym) rescue false)
+    _k = Object.const_get(klass_sym)
+    next unless (_k.method_defined?(meth) rescue false)
+    _orig = "__bagtrace_orig_#{meth}".to_sym
+    next if (_k.method_defined?(_orig) rescue false)
+    _k.class_eval do
+      alias_method _orig, meth
+      define_method(meth) do |*a, &b|
+        begin
+          if ($__bagtrace_n ||= 0) < 18
+            $__bagtrace_n += 1
+            _bt = []
+            begin; raise RuntimeError, "bagtrace"; rescue => _bte; _bt = (_bte.backtrace || []); end
+            (MKXPDebug.log("[BAGTRACE-#{tag}] #{klass_sym}##{meth} chamado (##{$__bagtrace_n})") rescue nil)
+            _bt[1, 8].each_with_index { |_ln, _i| (MKXPDebug.log("[BAGTRACE-#{tag}]   bt[#{_i}] #{_ln}") rescue nil) }
+          end
+        rescue; end
+        send(_orig, *a, &b)
+      end
+    end
+  end
+  (MKXPDebug.log("[BAGTRACE] wrappers instalados (Scene/Screen/Entry) -- proximo log da' o caller da auto-Bag") rescue nil)
+rescue => __bte2
+  (MKXPDebug.log("[BAGTRACE] instalacao falhou: #{__bte2.class}: #{__bte2.message}") rescue nil)
+end
+)MENUFLUSH");
+    if (mrb->exc) { mrb->exc = 0; }
+
+    /* ── VWrap (pokemon_tilemap_fix.rb): corrige o "QUARTO PRETO" ──────────────
+     * CAUSA RAIZ (provada: banner VWRAP=false): tilesets de interiores 256x1280
+     * (>1024 do PICA200) nunca eram embrulhados -> create_texture falha -> chao
+     * preto. O VWrap reparte-os em colunas de 1024 (sem remapear ids, ao
+     * contrario do TSC que so trata gigantes h>8192). O ficheiro existia em
+     * source/ mas NUNCA era carregado por ninguem. Carregar AQUI: depois dos
+     * scripts do jogo (CustomTilemap ja existe) e ANTES do debug_probe, para o
+     * TSC encadear por cima (giant->TSC; resto->__tsc_orig_tileset_eq->VWrap),
+     * sem partir os mapas gigantes que ja funcionavam. sdmc tem prioridade
+     * (iteracao); romfs e' o baked-in. Confirmar no log: banner VWRAP=true e
+     * [TMDBG] @tileset=512x1024 nos interiores. Desactivar: renomear o ficheiro. */
+    {
+        FILE *vf = fopen("sdmc:/mkxp/pokemon_tilemap_fix.rb", "rb");
+        if (!vf) vf = fopen("romfs:/pokemon_tilemap_fix.rb", "rb");
+        if (vf) {
+            fseek(vf, 0, SEEK_END); long vsz = ftell(vf); fseek(vf, 0, SEEK_SET);
+            char *vbuf = (char*)malloc(vsz + 1);
+            fread(vbuf, 1, vsz, vf); fclose(vf); vbuf[vsz] = 0;
+            mrb_load_string(mrb, vbuf); free(vbuf);
+            if (mrb->exc) { show_error(mrb, "pokemon_tilemap_fix"); mrb->exc = 0; }
+            else DBGLOG("[VWRAP] pokemon_tilemap_fix.rb carregado (VWrap instalado)\n");
+        } else {
+            DBGLOG("[VWRAP] pokemon_tilemap_fix.rb nao encontrado -- quarto preto continua\n");
+        }
+    }
+
     /* Carregar debug_probe.rb DEPOIS dos scripts do jogo.
      * CRITICO: tem de ser aqui. Scene_Map, mainFunctionDebug e todas as
      * classes do jogo so existem depois dos 376 scripts terem sido
@@ -7735,6 +9267,12 @@ end
      * Para desactivar: apagar ou renomear para debug_probe.rb.off      */
     {
         FILE *sf = fopen("sdmc:/mkxp/debug_probe.rb", "rb");
+        /* Fixes do porting (render/tilemap, menu, input, perf, etc.) EMBEBIDOS no
+         * binario via romfs -- mesmo mecanismo do rgss_stubs.rb / ios_compat_3ds.rb.
+         * Assim os fixes nao dependem de um ficheiro externo em sdmc: ficam compilados
+         * no .3dsx/.cia. O sdmc continua a ter prioridade (override para debug/iteracao);
+         * se nao existir em sdmc, carrega o do romfs (a versao baked-in). */
+        if (!sf) sf = fopen("romfs:/debug_probe.rb", "rb");
         if (sf) {
             fseek(sf, 0, SEEK_END); long ssz = ftell(sf); fseek(sf, 0, SEEK_SET);
             char *sbuf = (char*)malloc(ssz + 1);
@@ -7976,6 +9514,13 @@ int binding_3ds_run(const char *game_path) {
            gc_saved_interval, mrb->gc.interval_ratio, (int)gc_saved_gen);
 
     inputBindingInit(mrb);
+    fileBindingInit(mrb);    /* [FILE-IO] File real ANTES do rgss_stubs (que agora respeita o nativo) */
+    /* [SAVE-0B-FIX v4 2026-07-03 — A RAIZ FINAL] marshalBindingInit estava definido
+     * (marshal.cpp:1004) mas NUNCA era chamado: o Marshal.dump/load NATIVOS nunca
+     * existiram no Ruby — so' os stubs (""/nil) dos compat/rgss_stubs. TODOS os
+     * saves de 0 bytes vieram daqui. (load_data sempre funcionou porque vai direto
+     * ao C por outra funcao — por isso nunca se notou.) */
+    marshalBindingInit(mrb);
     graphicsBindingInit(mrb);
 
     /* Registar aliases _3ds_internal para freeze e transition,

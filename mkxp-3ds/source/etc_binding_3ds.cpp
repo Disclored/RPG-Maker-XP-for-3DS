@@ -22,6 +22,24 @@ static const mrb_data_type RectType  = { "Rect",  dfree };
 #define GET_TONE(s)  ((Tone*) DATA_PTR(s))
 #define GET_RECT(s)  ((Rect*) DATA_PTR(s))
 
+/* [CHARBATCH 2026-07-04] acesso TYPE-CHECKED aos structs C de Rect/Tone a partir
+ * de outros ficheiros (o batch nativo do Sprite_Character escreve-os direto —
+ * regra do projeto: NUNCA ivars em TT_DATA). Devolve NULL se o objeto nao for
+ * um Rect/Tone nativo (ex: Rect Ruby-puro do compat) -> o chamador cai no
+ * fallback Ruby. Layout: Rect{int x,y,w,h}; Tone{float r,g,b,gray}. */
+extern "C" void *mkxp_etc_rect_ptr(mrb_state *mrb, mrb_value v) {
+    (void)mrb;
+    if (mrb_type(v) != MRB_TT_DATA) return NULL;
+    if (DATA_TYPE(v) != &RectType) return NULL;
+    return DATA_PTR(v);
+}
+extern "C" void *mkxp_etc_tone_ptr(mrb_state *mrb, mrb_value v) {
+    (void)mrb;
+    if (mrb_type(v) != MRB_TT_DATA) return NULL;
+    if (DATA_TYPE(v) != &ToneType) return NULL;
+    return DATA_PTR(v);
+}
+
 static inline float clampf(float v,float lo,float hi){return v<lo?lo:v>hi?hi:v;}
 
 /* Color */

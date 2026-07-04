@@ -176,6 +176,14 @@ struct ObjLinkBuf {
     int  lookupIdx(mrb_value v)      { return map[v]; }
     mrb_value lookup(size_t i)       { return vec[i]; }
     int  add(mrb_value v){ int i=(int)vec.size(); map[v]=i; vec.push_back(v); return i; }
+    /* [UCLASS] troca o ULTIMO slot (a base recem-registada) pelo objeto promovido,
+     * para TYPE_LINKs subsequentes apontarem a subclasse e nao a base descartada. */
+    void replace_last(mrb_value oldv, mrb_value newv){
+        if(!vec.empty() && MrbVEq()(vec.back(), oldv)){
+            int i=(int)vec.size()-1;
+            map.erase(oldv); map[newv]=i; vec[i]=newv;
+        }
+    }
 };
 
 /* ---- Type tags --------------------------------------------------- */
@@ -195,6 +203,7 @@ struct ObjLinkBuf {
 #define TYPE_LINK    '@'
 #define TYPE_SYMBOL  ':'
 #define TYPE_SYMLINK ';'
+#define TYPE_UCLASS  'C'   /* [UCLASS 2026-07-02] subclasse de String/Array/Hash (PkmnAnimations) */
 
 static char gpbuf[512];
 
@@ -232,15 +241,31 @@ static int read_fixnum(ReadCtx *c){
     if(len>=4){ n4=c->readByte(); }
     return (uint8_t)n1|((uint8_t)n2<<8)|((uint8_t)n3<<16)|((uint8_t)n4<<24);
 }
+/* [SANITY 2026-07-02] comprimentos lidos do stream teem de caber no que RESTA do
+ * ficheiro. Sem isto, um stream desalinhado (ex: type-tag desconhecido engolido)
+ * produzia um len gigante -> mrb_malloc enorme -> raise 'allocation failure' via
+ * longjmp que SALTAVA o catch C++ (o 'Animations: allocation failure' do log).
+ * Com o guard, vira MarshalException limpa com posicao exata. */
+static void check_len(ReadCtx *c, long n, const char *what){
+    long rem = (long)(c->rb->size - c->rb->pos);
+    if(n < 0 || n > rem)
+        throw MarshalException(MarshalException::MKXPError,
+            "%s: length insano %ld (restam %ld bytes) -- stream desalinhado", what, n, rem);
+}
 static float read_float(ReadCtx *c){
-    int len=read_fixnum(c); c->readData(gpbuf,len); gpbuf[len]='\0';
+    int len=read_fixnum(c); check_len(c,len,"float");
+    if(len>(int)sizeof(gpbuf)-1) throw MarshalException(MarshalException::MKXPError,"float: len>%d",(int)sizeof(gpbuf)-1);
+    c->readData(gpbuf,len); gpbuf[len]='\0';
     return strtof(gpbuf,0);
 }
 static char *read_str_raw(ReadCtx *c){
-    int len=read_fixnum(c); c->readData(gpbuf,len); gpbuf[len]='\0'; return gpbuf;
+    int len=read_fixnum(c); check_len(c,len,"str_raw");
+    if(len>(int)sizeof(gpbuf)-1) throw MarshalException(MarshalException::MKXPError,"str_raw: len>%d",(int)sizeof(gpbuf)-1);
+    c->readData(gpbuf,len); gpbuf[len]='\0'; return gpbuf;
 }
 static mrb_value read_str_val(ReadCtx *c){
     mrb_state *mrb=c->mrb; int len=read_fixnum(c);
+    check_len(c,len,"string");
     PROF_BEGIN(PROF_MARSHAL_STRING);
     mrb_value s=mrb_str_new(mrb,0,len);
     c->readData(RSTR_PTR(RSTRING(s)),len); RSTR_PTR(RSTRING(s))[len]='\0';
@@ -250,24 +275,62 @@ static mrb_value read_str_val(ReadCtx *c){
 /* Lê string sem registar no object pool — usado por read_ivar que regista o slot */
 static mrb_value read_str_val_notrack(ReadCtx *c){
     mrb_state *mrb=c->mrb; int len=read_fixnum(c);
+    check_len(c,len,"string(ivar)");
     mrb_value s=mrb_str_new(mrb,0,len);
     c->readData(RSTR_PTR(RSTRING(s)),len); RSTR_PTR(RSTRING(s))[len]='\0';
     return s;
 }
 static mrb_value read_value(ReadCtx *c);
+static struct RClass *class_from_path(mrb_state *mrb, mrb_value path);   /* [UCLASS] fwd */
 static mrb_value read_array(ReadCtx *c){
     mrb_state *mrb=c->mrb; int len=read_fixnum(c);
+    check_len(c,len,"array");   /* cada elemento ocupa >=1 byte */
     mrb_value a=mrb_ary_new_capa(mrb,len); c->objects.add(a);
     for(int i=0;i<len;i++) mrb_ary_set(mrb,a,i,read_value(c));
     return a;
 }
 static mrb_value read_hash(ReadCtx *c){
     mrb_state *mrb=c->mrb; int len=read_fixnum(c);
+    check_len(c,len,"hash");
     mrb_value h=mrb_hash_new_capa(mrb,len); c->objects.add(h);
     for(int i=0;i<len;i++){
         mrb_value k=read_value(c), v=read_value(c); mrb_hash_set(mrb,h,k,v);
     }
     return h;
+}
+/* [UCLASS 2026-07-02] TYPE_UCLASS 'C': instancia de SUBCLASSE de String/Array/Hash
+ * (ex: PBAnimations < Array em PkmnAnimations.rxdata -- o load falhava com
+ * "IVAR: inner type desconhecido 'C'" e $data_animations/BattleAnims ficavam nil,
+ * o que por sua vez fazia chegar um Integer a Sprite#bitmap= ([BMP|UNWRAP])).
+ * Layout CRuby: 'C' <symbol classe> <valor base>. Estrategia: ler a base e TENTAR
+ * promover para a subclasse via Classe.new + concat/merge!/replace; se a classe
+ * nao existir ou o initialize exigir args, devolve a BASE (Array/Hash/String) --
+ * suficiente para consumidores que so' iteram. Pool: a base regista-se a si
+ * propria (read_array/read_hash/read_str_val fazem add) tal como no CRuby o
+ * objeto UCLASS ocupa 1 slot. */
+static mrb_value read_uclass(ReadCtx *c){
+    mrb_state *mrb=c->mrb;
+    mrb_value klass_path=read_value(c);            /* symbol ou symlink */
+    int8_t base_t=c->readByte();
+    mrb_value base;
+    switch(base_t){
+        case TYPE_ARRAY:  base=read_array(c);   break;
+        case TYPE_HASH:   base=read_hash(c);    break;
+        case TYPE_STRING: base=read_str_val(c); c->objects.add(base); break;
+        default:
+            throw MarshalException(MarshalException::MKXPError,
+                "UCLASS: base type inesperado '\\x%02x'", (unsigned char)base_t);
+    }
+    /* [UCLASS] NAO promovemos para a subclasse. Tentar mrb_obj_new(subclasse) era
+     * PERIGOSO: se o initialize da subclasse (ou um ivar da subclasse-de-Array)
+     * rebentar com "cannot set instance variable" (MRB_TT_ARRAY nao tem iv_tbl
+     * neste mruby), o raise faz LONGJMP e salta este codigo C++ -> o erro escapa
+     * ate' ao load do jogo (provado: BattleAnims 'cannot set instance variable').
+     * A base (Array/Hash/String) ja' contem TODOS os dados; os consumidores de
+     * PkmnAnimations iteram a colecao, por isso a base crua chega. (klass_path e'
+     * lido e descartado -> so' perdemos o TIPO exato da subclasse, nunca os dados.) */
+    (void)klass_path;
+    return base;
 }
 static mrb_sym read_symbol(ReadCtx *c){
     char *raw=read_str_raw(c);
@@ -306,6 +369,11 @@ static mrb_value read_ivar(ReadCtx *c){
     } else if(inner_type==TYPE_HASH){
         /* read_hash ja chama c->objects.add() internamente */
         obj=read_hash(c);
+        already_tracked=true;
+    } else if(inner_type==TYPE_UCLASS){
+        /* [UCLASS] IVAR(UCLASS(...)) e' exatamente o topo do PkmnAnimations.rxdata
+         * (I C :PBAnimations [...]). read_uclass regista no pool internamente. */
+        obj=read_uclass(c);
         already_tracked=true;
     } else {
         switch(inner_type){
@@ -367,11 +435,14 @@ static mrb_value read_object(ReadCtx *c){
     struct RClass *klass=class_from_path(mrb,class_path);
     PROF_END(PROF_MARSHAL_CLASS);
     if(!klass){
-        /* Classe nao definida — usa Object como fallback e loga aviso */
+        /* [SAVE-CLASS-BUG 2026-07-03] Classe nao resolvida -> fallback Object =
+         * objeto com ivars certos mas SEM metodos (Game_Map.map_id -> method_missing
+         * -> 0 -> mapa 0 no load, ecra preto). O aviso ia p/ printf (consola,
+         * INVISIVEL). Agora vai para o LOG com a classe exata que falha. */
         const char *cname="<unknown>";
         if(mrb_symbol_p(class_path))      cname=mrb_sym_name(mrb,mrb_symbol(class_path));
         else if(mrb_string_p(class_path)) cname=RSTRING_PTR(class_path);
-        printf("[Marshal] WARN: classe '%s' nao definida -- a usar Object como fallback\n", cname);
+        MZLOG("[Marshal] CLASSE-NAO-RESOLVIDA: '%s' -> Object (metodos partidos! raiz do load preto)\n", cname);
         klass=mrb->object_class;
     }
     PROF_BEGIN(PROF_MARSHAL_ALLOC);
@@ -562,6 +633,7 @@ static mrb_value read_value(ReadCtx *c){
         case TYPE_OBJECT:  v=read_object(c); break;
         case TYPE_IVAR:    v=read_ivar(c);   break;
         case TYPE_LINK:    v=read_link(c);   break;
+        case TYPE_UCLASS:  v=read_uclass(c); break;   /* [UCLASS] regista-se internamente */
         case TYPE_USERDEF: v=read_userdef(c); c->objects.add(v); break;
         default:
             MZLOG("[marshal] ERRO: tipo nao suportado '%c' (0x%02x) @pos=%d/%d\n",
@@ -765,12 +837,22 @@ static void write_value(WriteCtx *c, mrb_value v){
                 break;
             }
             /* Tipo nao-serializavel (outro MRB_TT_DATA). O write nao sabe
-             * grava-lo, por isso o ficheiro de cache ficaria INCOMPLETO -> EOF
-             * ao reler. Marcamos o dump como sujo para o chamador NAO gravar
-             * cache deste objeto; lê-se sempre da fonte (correto). */
+             * grava-lo. Marcamos o dump como sujo (o cache de rxdata ignora) MAS
+             * [MARSHAL-PORT 2026-07-02] escrevemos NIL no lugar: antes nao se
+             * escrevia NADA -> o stream ficava mal-formado e um SAVE que contivesse
+             * um destes objetos (ex: um TT_DATA esquecido dentro de $PokemonGlobal)
+             * ficava corrompido/ilegivel. Com nil, o save perde SO' esse campo mas
+             * carrega -- e o log diz exatamente que tipo foi. */
             s_dump_incomplete = 1;
-            printf("Marshal: unwritable type %d (cache deste ficheiro sera' ignorado)\n",
-                   (int)mrb_type(v));
+            /* [SAVE-DIAG 2026-07-03] printf ia so' p/ a consola (INVISIVEL no log!)
+             * -> os saves esqueleticos de 101 bytes nunca mostraram porque. MZLOG
+             * poe no debug_binding.log a CLASSE exata que nao serializa. */
+            {
+                const char *cn2 = mrb_obj_classname(mrb, v);
+                MZLOG("[marshal] AVISO: tipo nao-serializavel tt=%d classe=%s -> escrito nil (save fica incompleto)\n",
+                      (int)mrb_type(v), cn2 ? cn2 : "?");
+            }
+            c->writeByte(TYPE_NIL);
             break;
         }
     }
@@ -853,16 +935,91 @@ mrb_value marshalLoadInt(mrb_state *mrb, FILE *fp){
 static mrb_value mrb_marshal_dump(mrb_state *mrb, mrb_value /*self*/){
     mrb_value val, port=mrb_nil_value(); mrb_int limit=100;
     mrb_get_args(mrb,"o|oi",&val,&port,&limit);
+    /* [MARSHAL-PORT 2026-07-02] semantica CRuby: dump(obj, limit) OU dump(obj, io, limit).
+     * O SaveData do Essentials grava com File.open('wb'){|f| Marshal.dump(dados, f)} --
+     * antes o port era IGNORADO (devolvia so' a string) -> o save ficava VAZIO. */
+    if(mrb_integer_p(port)){ limit=mrb_integer(port); port=mrb_nil_value(); }
     WriteBuf wb; WriteCtx c; c.wb=&wb; c.mrb=mrb; c.limit=limit;
     try{ write_header(&c); write_value(&c,val); }
     catch(const MarshalException &e){ raiseMrbExc(mrb,e); }
-    return mrb_str_new(mrb,wb.data.data(),(mrb_int)wb.data.size());
+    mrb_value str = mrb_str_new(mrb,wb.data.data(),(mrb_int)wb.data.size());
+    if(!mrb_nil_p(port)){
+        /* [SAVE-0B-FIX 2026-07-03] NAO usar mrb_respond_to: neste ambiente o
+         * respond_to? e' NAO-FIAVEL (ja' partiu varios fixes; aqui fazia o dump
+         * levantar "port sem #write" DEPOIS do File.open('wb') ter truncado o
+         * ficheiro -> save de 0 bytes -> load rebenta -> sem "Continuar").
+         * Chamada DIRETA com guarda de excecao: se port.write nao existir, o
+         * mrb_funcall poe mrb->exc e nos convertemos em erro claro no log. */
+        mrb_funcall(mrb,port,"write",1,str);
+        if(mrb->exc){
+            mrb_value exc = mrb_obj_value(mrb->exc); mrb->exc = 0;
+            mrb_value m = mrb_funcall(mrb, exc, "message", 0);
+            MZLOG("[marshal] ERRO dump->port.write falhou: %s (save ficaria 0 bytes)\n",
+                  mrb_string_p(m) ? RSTRING_PTR(m) : "?");
+            mrb_raise(mrb,mrb_class_get(mrb,"ArgumentError"),
+                      "Marshal.dump: port.write falhou");
+        }
+        MZLOG("[marshal] dump->port OK (%d bytes escritos no IO)\n",(int)wb.data.size());
+        /* [SAVE-DIAG] raio-X do save: se o topo e' um Hash (compile_save_hash do
+         * Essentials), listar CHAVE=CLASSE de cada valor. Um save de 101 bytes com
+         * valores nil/em falta aponta imediatamente a peca que nao serializa. */
+        if(mrb_hash_p(val) && wb.data.size() < 65536){
+            mrb_value keys = mrb_hash_keys(mrb, val);
+            mrb_int n = RARRAY_LEN(keys);
+            char kb[512]; int ko = 0;
+            for(mrb_int i = 0; i < n && ko < (int)sizeof(kb) - 64; i++){
+                mrb_value k = mrb_ary_ref(mrb, keys, i);
+                mrb_value v2 = mrb_hash_get(mrb, val, k);
+                mrb_value ks = mrb_funcall(mrb, k, "to_s", 0);
+                if(mrb->exc){ mrb->exc = 0; continue; }
+                ko += snprintf(kb + ko, sizeof(kb) - ko, " %s=%s",
+                               mrb_string_p(ks) ? RSTRING_PTR(ks) : "?",
+                               mrb_obj_classname(mrb, v2));
+            }
+            MZLOG("[marshal] SAVE-RAIOX: %d chaves:%s\n",(int)n, kb);
+        }
+        return port;                       /* CRuby devolve o proprio port */
+    }
+    /* [SAVE-TRACE] dumps grandes SEM porta = provavel caminho de save via
+     * File.write(path, Marshal.dump(data)). Loga p/ mapear o fluxo real. */
+    if (wb.data.size() > 4096)
+        MZLOG("[marshal] dump->STRING %d bytes (sem porta; caller grava por File.write?)\n",
+              (int)wb.data.size());
+    return str;
 }
 
 static mrb_value mrb_marshal_load(mrb_state *mrb, mrb_value /*self*/){
     mrb_value port; mrb_get_args(mrb,"o",&port);
-    if(!mrb_string_p(port))
-        mrb_raise(mrb,mrb_class_get(mrb,"ArgumentError"),"Marshal.load: expected String");
+    /* [MARSHAL-PORT] aceitar IO/File alem de String (CRuby): le' a partir da posicao
+     * ATUAL e avanca-a exatamente o consumido por UM documento -> suporta o padrao
+     * do SaveData "save_data << Marshal.load(file) until file.eof?" (saves pre-v19). */
+    if(!mrb_string_p(port)){
+        {
+            /* [SAVE-0B-FIX 2026-07-03] idem dump: chamada DIRETA em vez de
+             * mrb_respond_to (nao-fiavel). pos e' opcional: falhar nao invalida. */
+            mrb_value pos0 = mrb_funcall(mrb,port,"pos",0);
+            bool has_pos = !mrb->exc && mrb_integer_p(pos0);
+            if(mrb->exc) mrb->exc = 0;
+            mrb_value data = mrb_funcall(mrb,port,"read",0);
+            if(mrb->exc || !mrb_string_p(data)){
+                mrb->exc = 0;
+                mrb_raise(mrb,mrb_class_get(mrb,"ArgumentError"),
+                          "Marshal.load: port.read nao devolveu String");
+            }
+            ReadBuf rb2(RSTRING_PTR(data),(size_t)RSTRING_LEN(data));
+            ReadCtx c2; c2.rb=&rb2; c2.mrb=mrb;
+            mrb_value val2=mrb_nil_value();
+            try{ verify_header(&c2); val2=read_value(&c2); }
+            catch(const MarshalException &e){ raiseMrbExc(mrb,e); return mrb_nil_value(); }
+            if(has_pos && mrb_integer_p(pos0)){
+                mrb_funcall(mrb,port,"pos=",1,
+                            mrb_int_value(mrb,mrb_integer(pos0)+(mrb_int)rb2.pos));
+                if(mrb->exc) mrb->exc = 0;   /* pos= falhar nao invalida o load */
+            }
+            return val2;
+        }
+        mrb_raise(mrb,mrb_class_get(mrb,"ArgumentError"),"Marshal.load: expected String/IO");
+    }
     ReadBuf rb(RSTRING_PTR(port),(size_t)RSTRING_LEN(port));
     ReadCtx c; c.rb=&rb; c.mrb=mrb;
     mrb_value val=mrb_nil_value();

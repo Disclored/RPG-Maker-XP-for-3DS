@@ -92,6 +92,12 @@ struct SeSlot {
 };
 
 static bool    s_inited = false;
+/* [AUDIO-DEAD] true quando o ndspInit() falhou (Azahar sem firmware DSP / 3DS sem
+ * dspfirm.cdc). Com o DSP morto NAO ha som E os wavebufs nunca ficam DONE -> os 12
+ * canais de SE nunca reciclam. ALEM disso o se_play descodifica o OGG INTEIRO de
+ * forma sincrona por cada SE (cursor de menu = stalls de ~1.8s + spam "cortar
+ * canal"). Quando morto, se/bgm/me fazem NO-OP ANTES do decode -> zero stalls. */
+static bool    s_audio_dead = false;
 static SeSlot  s_se[SE_SLOTS];
 static int     s_se_rr = 0;          /* indice round-robin */
 static long    s_play_count = 0;     /* diagnostico */
@@ -236,7 +242,11 @@ static int se_reap(void) {
  * o MESMO bloco (sem buraco audivel). ME nao faz loop. Buffers pequenos =>
  * ~150KB por stream activo => NAO mexe na memoria dos mapas grandes.
  * ========================================================================= */
-#define STREAM_SECS_PER_BUF 0.35f
+/* [PERF-AUDIO 2026-07-04] 0.35f -> 0.15f: o decode OGG e' SINCRONO; blocos de
+ * 0.35s custavam picos de 20-70ms num frame a cada ~10 frames (provado: os
+ * frames a 6fps do log). 0.15s decode em fatias de ~10-30ms; com a worker
+ * thread (abaixo) o main thread deixa de pagar decode de todo. */
+#define STREAM_SECS_PER_BUF 0.15f
 #define BGM_CHANNEL 0
 #define BGS_CHANNEL 1
 #define ME_CHANNEL  2
@@ -252,6 +262,10 @@ struct Stream {
     bool        looping;
     bool        active;
     int         volume;       /* 0..100 */
+    /* [AUDIO-FADE] rampa de fade-out: >0 = a desvanecer. Avanca 1x/frame no
+     * stream_pump; vol_efetivo = volume * left/total; a 0 -> stream_stop. */
+    int         fade_left;    /* frames restantes (0 = sem fade) */
+    int         fade_total;   /* frames totais do fade */
     char        name[256];
 };
 
@@ -323,6 +337,8 @@ static void stream_start(Stream *s, const char *name, int volume, int pitch,
     if (s->bufSamples < 1024) s->bufSamples = 1024;
     s->looping    = looping;
     s->volume     = (volume < 0 ? 0 : (volume > 100 ? 100 : volume));
+    s->fade_left  = 0;   /* [AUDIO-FADE] play novo cancela fade pendente */
+    s->fade_total = 0;
     strncpy(s->name, name, sizeof(s->name) - 1); s->name[sizeof(s->name) - 1] = '\0';
 
     size_t bytes = (size_t)s->bufSamples * s->chans * sizeof(int16_t);
@@ -350,9 +366,64 @@ static void stream_start(Stream *s, const char *name, int volume, int pitch,
             tag, name, s->chans, s->rate, s->bufSamples, s->channel, s->volume, pitch, looping ? 1 : 0);
 }
 
+/* [AUDIO-FADE] Arma o fade-out de um stream ativo. ms<=0 -> stop imediato.
+ * Converte ms->frames a 30fps (o loop do jogo esta' capado a 30; o pump corre
+ * 1x/frame). Fade sobre stream inativo = no-op (nada a desvanecer). */
+static void stream_fade(Stream *s, int ms, const char *tag) {
+    if (!s->active) return;
+    if (ms <= 0) {
+        aud_log("[AUDIO] %s_fade(%d) -> stop imediato ('%s')\n", tag, ms, s->name);
+        stream_stop(s);
+        return;
+    }
+    int frames = (ms * 30) / 1000;
+    if (frames < 1) frames = 1;
+    s->fade_left = s->fade_total = frames;
+    aud_log("[AUDIO] %s_fade(%dms) -> rampa de %d frames ('%s', vol=%d)\n",
+            tag, ms, frames, s->name, s->volume);
+}
+
+/* [AUDIO-THREAD 2026-07-04] worker de pump no CORE 1 (syscore): o decode OGG
+ * sai do main thread (era a maior fonte de picos de frame: 20-70ms sincronos).
+ * LightLock protege o estado dos streams entre o worker e as entradas publicas
+ * (play/stop/fade). Os helpers internos (stream_start/stop/fade/pump) NUNCA
+ * fazem lock — so' as fronteiras publicas e o worker (LightLock nao e'
+ * reentrante). Se o threadCreate falhar (sem quota no syscore), fallback
+ * transparente: audio_3ds_update volta a bombear no main thread como antes. */
+static LightLock     s_alock;
+static Thread        s_pump_thread = NULL;
+static volatile bool s_pump_quit   = false;
+static void stream_pump(Stream *s);   /* fwd */
+static void audio_pump_main(void *arg) {
+    (void)arg;
+    while (!s_pump_quit) {
+        LightLock_Lock(&s_alock);
+        stream_pump(&s_bgm);
+        stream_pump(&s_bgs);
+        stream_pump(&s_me);
+        LightLock_Unlock(&s_alock);
+        svcSleepThread(30LL * 1000 * 1000);   /* 30ms: ~5 checks por buffer de 0.15s */
+    }
+}
+
 /* 1x/frame: re-enche os buffers que o DSP ja' consumiu. */
 static void stream_pump(Stream *s) {
     if (!s->active || !s->v) return;
+    /* [AUDIO-FADE] avancar a rampa ANTES do refill: vol_efetivo desce linearmente
+     * ate' 0 e o stream para (liberta canal+buffers). Custo: 1 ndspChnSetMix/frame
+     * SO' durante o fade. */
+    if (s->fade_left > 0) {
+        s->fade_left--;
+        if (s->fade_left <= 0) {
+            aud_log("[AUDIO] fade concluido canal=%d ('%s') -- parado\n", s->channel, s->name);
+            stream_stop(s);
+            return;
+        }
+        float vol = (s->volume / 100.0f) * ((float)s->fade_left / (float)s->fade_total);
+        float mix[12]; memset(mix, 0, sizeof(mix));
+        mix[0] = vol; mix[1] = vol;
+        ndspChnSetMix(s->channel, mix);
+    }
     bool anyAlive = false;
     for (int i = 0; i < 2; i++) {
         if (s->wbuf[i].status == NDSP_WBUF_DONE) {
@@ -389,12 +460,41 @@ extern "C" void audio_3ds_init(void) {
     s_se_rr = 0;
     s_play_count = 0;
     s_inited = true;
+    /* [AUDIO-DEAD] detectar DSP morto: se o ndspInit() (main.cpp) falhou, marcar para
+     * que se/bgm/me facam NO-OP (sem decode -> sem stalls de 1.8s nem spam de canais). */
+    {
+        extern s32 g_ndsp_init_result;   /* definido em main.cpp */
+        s_audio_dead = R_FAILED(g_ndsp_init_result);
+        if (s_audio_dead)
+            aud_log("[AUDIO] DSP MORTO (ndspInit falhou) -> se/bgm/me em NO-OP "
+                    "(sem decode OGG, sem stalls, sem spam de canais)\n");
+    }
     aud_log("[AUDIO] init OK: NDSP STEREO | SE %d canais (%d..%d) | BGM/BGS/ME streaming canais 0/1/2 | OGG+WAV\n",
             SE_SLOTS, SE_CH_FIRST, SE_CH_LAST);
+
+    /* [AUDIO-THREAD] arrancar o worker de pump no core 1 (syscore). Precisa da
+     * quota APT (30% e' o maximo permitido a apps no syscore). Falha -> NULL ->
+     * fallback para pump no main thread (comportamento antigo). */
+    LightLock_Init(&s_alock);
+    s_pump_quit = false;
+    if (!s_audio_dead) {
+        APT_SetAppCpuTimeLimit(30);
+        s_pump_thread = threadCreate(audio_pump_main, NULL, 16 * 1024, 0x20, 1, false);
+        aud_log("[AUDIO] worker de pump no core 1: %s\n",
+                s_pump_thread ? "ATIVO (decode OGG fora do main thread)"
+                              : "indisponivel -> pump no main thread (fallback)");
+    }
 }
 
 extern "C" void audio_3ds_exit(void) {
     if (!s_inited) return;
+    /* [AUDIO-THREAD] parar o worker ANTES de libertar os streams */
+    if (s_pump_thread) {
+        s_pump_quit = true;
+        threadJoin(s_pump_thread, U64_MAX);
+        threadFree(s_pump_thread);
+        s_pump_thread = NULL;
+    }
     stream_stop(&s_bgm); stream_stop(&s_bgs); stream_stop(&s_me);
     for (int i = 0; i < SE_SLOTS; i++) se_slot_free(&s_se[i]);
     s_inited = false;
@@ -403,6 +503,7 @@ extern "C" void audio_3ds_exit(void) {
 
 extern "C" void audio_3ds_se_play(const char *name, int volume, int pitch) {
     if (!s_inited) { aud_log("[AUDIO] se_play ANTES de init -- ignorado ('%s')\n", name ? name : "?"); return; }
+    if (s_audio_dead) return;   /* [AUDIO-DEAD] DSP morto -> NO-OP antes do decode (anti-stall) */
     if (!name || name[0] == '\0') { aud_log("[AUDIO] se_play com nome VAZIO -- ignorado\n"); return; }
 
     /* 1) resolver ficheiro */
@@ -501,15 +602,24 @@ extern "C" void audio_3ds_update(void) {
     if (!s_inited) return;
     int freed = se_reap();
     if (freed > 0) aud_log("[AUDIO] update: %d buffer(s) de SE reciclado(s)\n", freed);
-    /* alimentar os streams (re-enche os buffers ja' consumidos pelo DSP) */
-    stream_pump(&s_bgm);
-    stream_pump(&s_bgs);
-    stream_pump(&s_me);
+    /* [AUDIO-THREAD] com o worker ativo, o main thread NAO bombeia (nem paga
+     * decode); fallback so' quando a thread nao arrancou. */
+    if (!s_pump_thread) {
+        LightLock_Lock(&s_alock);
+        stream_pump(&s_bgm);
+        stream_pump(&s_bgs);
+        stream_pump(&s_me);
+        LightLock_Unlock(&s_alock);
+    }
 }
 
-/* ---- BGM/BGS/ME: streaming OGG real (canais 0/1/2) ------------------------ */
+/* ---- BGM/BGS/ME: streaming OGG real (canais 0/1/2) ------------------------
+ * [AUDIO-THREAD] TODAS as entradas publicas que tocam nos streams fazem lock
+ * (o worker no core 1 bombeia em paralelo). Os helpers stream_* nao fazem. */
 extern "C" void audio_3ds_bgm_play(const char *name, int volume, int pitch) {
     if (!s_inited) { aud_log("[AUDIO] bgm_play antes de init -- ignorado\n"); return; }
+    if (s_audio_dead) return;   /* [AUDIO-DEAD] DSP morto -> NO-OP (anti-stall) */
+    LightLock_Lock(&s_alock);
     /* mesmo BGM ja' a tocar em loop -> NAO reiniciar (evita cortar a musica a
        cada mapa que use a mesma faixa); apenas ajusta o volume se mudou. */
     if (s_bgm.active && name && strcmp(s_bgm.name, name) == 0) {
@@ -521,24 +631,35 @@ extern "C" void audio_3ds_bgm_play(const char *name, int volume, int pitch) {
             ndspChnSetMix(s_bgm.channel, mix);
             aud_log("[AUDIO] bgm '%s' ja' a tocar -- volume -> %d\n", name, v);
         }
+        LightLock_Unlock(&s_alock);
         return;
     }
     stream_start(&s_bgm, name, volume, pitch, true, "bgm");
+    LightLock_Unlock(&s_alock);
 }
-extern "C" void audio_3ds_bgm_stop(void) { if (s_inited) { stream_stop(&s_bgm); aud_log("[AUDIO] bgm_stop\n"); } }
+extern "C" void audio_3ds_bgm_stop(void) { if (s_inited) { LightLock_Lock(&s_alock); stream_stop(&s_bgm); LightLock_Unlock(&s_alock); aud_log("[AUDIO] bgm_stop\n"); } }
 
 extern "C" void audio_3ds_bgs_play(const char *name, int volume, int pitch) {
     if (!s_inited) return;
-    if (s_bgs.active && name && strcmp(s_bgs.name, name) == 0) return;
+    LightLock_Lock(&s_alock);
+    if (s_bgs.active && name && strcmp(s_bgs.name, name) == 0) { LightLock_Unlock(&s_alock); return; }
     stream_start(&s_bgs, name, volume, pitch, true, "bgs");
+    LightLock_Unlock(&s_alock);
 }
-extern "C" void audio_3ds_bgs_stop(void) { if (s_inited) { stream_stop(&s_bgs); aud_log("[AUDIO] bgs_stop\n"); } }
+extern "C" void audio_3ds_bgs_stop(void) { if (s_inited) { LightLock_Lock(&s_alock); stream_stop(&s_bgs); LightLock_Unlock(&s_alock); aud_log("[AUDIO] bgs_stop\n"); } }
 
 extern "C" void audio_3ds_me_play(const char *name, int volume, int pitch) {
     if (!s_inited) return;
     /* ME (jingle, ex: subir de nivel / apanhar item): one-shot, sem loop. Em
        RMXP o ME pausa o BGM; aqui toca por cima e o jogo volta a chamar bgm_play
        quando o ME acaba (o motor RMXP trata do resume ao nivel do script). */
+    LightLock_Lock(&s_alock);
     stream_start(&s_me, name, volume, pitch, false, "me");
+    LightLock_Unlock(&s_alock);
 }
-extern "C" void audio_3ds_me_stop(void) { if (s_inited) { stream_stop(&s_me); aud_log("[AUDIO] me_stop\n"); } }
+extern "C" void audio_3ds_me_stop(void) { if (s_inited) { LightLock_Lock(&s_alock); stream_stop(&s_me); LightLock_Unlock(&s_alock); aud_log("[AUDIO] me_stop\n"); } }
+
+/* [AUDIO-FADE] fades reais (rampa + stop). Ver stream_fade/stream_pump. */
+extern "C" void audio_3ds_bgm_fade(int ms) { if (s_inited) { LightLock_Lock(&s_alock); stream_fade(&s_bgm, ms, "bgm"); LightLock_Unlock(&s_alock); } }
+extern "C" void audio_3ds_bgs_fade(int ms) { if (s_inited) { LightLock_Lock(&s_alock); stream_fade(&s_bgs, ms, "bgs"); LightLock_Unlock(&s_alock); } }
+extern "C" void audio_3ds_me_fade(int ms)  { if (s_inited) { LightLock_Lock(&s_alock); stream_fade(&s_me,  ms, "me");  LightLock_Unlock(&s_alock); } }
