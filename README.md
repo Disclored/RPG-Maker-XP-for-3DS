@@ -141,3 +141,7 @@ Some Screenshots Progress:
 <img width="550" height="369" alt="Captura de ecrã 2026-06-25 212634" src="https://github.com/user-attachments/assets/effdc0f9-b5fc-43ef-83ba-0f36eb0aec53" />
 <img width="593" height="344" alt="Captura de ecrã 2026-06-25 212640" src="https://github.com/user-attachments/assets/89ec40d6-2833-4d54-af40-08700109ea68" />
 
+ ---
+ 
+04/07/2026 - Fixing Menus like Bag, Saves and Loads, Options, Trainer Card, etc
+<img width="324" height="238" alt="image" src="https://github.com/user-attachments/assets/1665e82a-b189-41f2-a22c-1a9bd352c199" />
