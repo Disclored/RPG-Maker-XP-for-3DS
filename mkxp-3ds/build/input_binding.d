@@ -98,7 +98,8 @@ input_binding.o: \
  C:/devkitPro/libctru/include/3ds/romfs.h \
  C:/devkitPro/libctru/include/3ds/font.h \
  C:/devkitPro/libctru/include/3ds/gdbhio_dev.h \
- C:/devkitPro/libctru/include/3ds/3dslink.h
+ C:/devkitPro/libctru/include/3ds/3dslink.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/debug_3ds.h
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mrbconf.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/common.h:
@@ -198,3 +199,4 @@ C:/devkitPro/libctru/include/3ds/romfs.h:
 C:/devkitPro/libctru/include/3ds/font.h:
 C:/devkitPro/libctru/include/3ds/gdbhio_dev.h:
 C:/devkitPro/libctru/include/3ds/3dslink.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/debug_3ds.h:

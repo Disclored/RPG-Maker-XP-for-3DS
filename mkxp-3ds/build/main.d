@@ -110,7 +110,8 @@ main.o: C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/main.cpp \
  C:/devkitPro/libctru/include/c2d/sprite.h \
  C:/devkitPro/libctru/include/c2d/text.h \
  C:/devkitPro/libctru/include/c2d/font.h \
- C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/platform_3ds.h
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/platform_3ds.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/audio_3ds.h
 C:/devkitPro/libctru/include/3ds.h:
 C:/devkitPro/libctru/include/3ds/types.h:
 C:/devkitPro/libctru/include/3ds/result.h:
@@ -223,3 +224,4 @@ C:/devkitPro/libctru/include/c2d/sprite.h:
 C:/devkitPro/libctru/include/c2d/text.h:
 C:/devkitPro/libctru/include/c2d/font.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/platform_3ds.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/audio_3ds.h:

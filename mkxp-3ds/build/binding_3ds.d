@@ -106,8 +106,11 @@ binding_3ds.o: \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/irep.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/proc.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/khash.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/data.h \
  C:/devkitPro/portlibs/3ds/include/zlib.h \
  C:/devkitPro/portlibs/3ds/include/zconf.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/audio_3ds.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/profile_3ds.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/display_3ds.h \
  C:/devkitPro/libctru/include/citro2d.h \
  C:/devkitPro/libctru/include/citro3d.h \
@@ -140,7 +143,6 @@ binding_3ds.o: \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/graphics_binding_3ds.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/etc_binding_3ds.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/bitmap_binding_3ds.h \
- C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/data.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/sprite_binding_3ds.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/compat_stubs.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/tilemap_binding_3ds.h
@@ -250,8 +252,11 @@ C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/dump.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/irep.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/proc.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/khash.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/data.h:
 C:/devkitPro/portlibs/3ds/include/zlib.h:
 C:/devkitPro/portlibs/3ds/include/zconf.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/audio_3ds.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/profile_3ds.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/display_3ds.h:
 C:/devkitPro/libctru/include/citro2d.h:
 C:/devkitPro/libctru/include/citro3d.h:
@@ -284,7 +289,6 @@ C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/input_binding_3ds.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/graphics_binding_3ds.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/etc_binding_3ds.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/bitmap_binding_3ds.h:
-C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/data.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/sprite_binding_3ds.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/compat_stubs.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/tilemap_binding_3ds.h:

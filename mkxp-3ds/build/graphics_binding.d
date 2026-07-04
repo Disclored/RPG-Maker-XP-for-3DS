@@ -9,9 +9,11 @@ graphics_binding.o: \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/boxing_word.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/gc.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/version.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/debug_3ds.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/class.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/variable.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/string.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/compile.h \
  C:/devkitPro/libctru/include/3ds.h \
  C:/devkitPro/libctru/include/3ds/types.h \
  C:/devkitPro/libctru/include/3ds/result.h \
@@ -138,9 +140,11 @@ C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/object.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/boxing_word.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/gc.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/version.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/debug_3ds.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/class.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/variable.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/string.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/compile.h:
 C:/devkitPro/libctru/include/3ds.h:
 C:/devkitPro/libctru/include/3ds/types.h:
 C:/devkitPro/libctru/include/3ds/result.h:

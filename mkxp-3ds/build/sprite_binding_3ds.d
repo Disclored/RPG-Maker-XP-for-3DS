@@ -124,8 +124,12 @@ sprite_binding_3ds.o: \
  C:/devkitPro/libctru/include/c2d/sprite.h \
  C:/devkitPro/libctru/include/c2d/text.h \
  C:/devkitPro/libctru/include/c2d/font.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/debug_3ds.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/class.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/variable.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/hash.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/array.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/string.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/tilemap_binding_3ds.h
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/sprite_binding_3ds.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby.h:
@@ -251,6 +255,10 @@ C:/devkitPro/libctru/include/c2d/spritesheet.h:
 C:/devkitPro/libctru/include/c2d/sprite.h:
 C:/devkitPro/libctru/include/c2d/text.h:
 C:/devkitPro/libctru/include/c2d/font.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/debug_3ds.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/class.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/variable.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/hash.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/array.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/string.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/tilemap_binding_3ds.h:

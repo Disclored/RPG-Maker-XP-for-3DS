@@ -86,7 +86,8 @@ input_3ds.o: C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/input_3ds.cpp \
  C:/devkitPro/libctru/include/3ds/romfs.h \
  C:/devkitPro/libctru/include/3ds/font.h \
  C:/devkitPro/libctru/include/3ds/gdbhio_dev.h \
- C:/devkitPro/libctru/include/3ds/3dslink.h
+ C:/devkitPro/libctru/include/3ds/3dslink.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/debug_3ds.h
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/input_3ds.h:
 C:/devkitPro/libctru/include/3ds.h:
 C:/devkitPro/libctru/include/3ds/types.h:
@@ -175,3 +176,4 @@ C:/devkitPro/libctru/include/3ds/romfs.h:
 C:/devkitPro/libctru/include/3ds/font.h:
 C:/devkitPro/libctru/include/3ds/gdbhio_dev.h:
 C:/devkitPro/libctru/include/3ds/3dslink.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/debug_3ds.h:
