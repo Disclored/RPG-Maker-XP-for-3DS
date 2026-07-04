@@ -138,58 +138,25 @@ module RPG
     def initialize(n='',v=100,p=100); @name=n;@volume=v;@pitch=p; end
   end
 
-  class Tileset
-    attr_accessor :id, :name, :tileset_name, :autotile_names,
-                  :panorama_name, :panorama_hue,
-                  :fog_name, :fog_hue, :fog_opacity,
-                  :fog_blend_type, :fog_zoom, :fog_sx, :fog_sy,
-                  :battleback_name, :passages, :priorities,
-                  :terrain_tags
-    def initialize
-      @id             = 0
-      @name           = ""
-      @tileset_name   = ""
-      @autotile_names = Array.new(7, "")
-      @panorama_name  = ""
-      @panorama_hue   = 0
-      @fog_name       = ""
-      @fog_hue        = 0
-      @fog_opacity    = 64
-      @fog_blend_type = 0
-      @fog_zoom       = 200
-      @fog_sx         = 0
-      @fog_sy         = 0
-      @battleback_name= ""
-      @passages       = nil
-      @priorities     = nil
-      @terrain_tags   = nil
-    end
-  end
-
-  class MapInfo
-    attr_accessor :name, :parent_id, :order, :expanded, :scroll_x, :scroll_y
-    def initialize
-      @name      = ""; @parent_id = 0; @order = 0
-      @expanded  = false; @scroll_x = 0; @scroll_y = 0
-    end
-  end
-
-  class Map
-    attr_accessor :tileset_id, :width, :height, :autoplay_bgm, :bgm,
-                  :autoplay_bgs, :bgs, :encounter_list, :encounter_step,
-                  :data, :events
-    def initialize(w=20, h=15)
-      @tileset_id     = 1
-      @width          = w
-      @height         = h
-      @autoplay_bgm   = false
-      @bgm            = RPG::AudioFile.new
-      @autoplay_bgs   = false
-      @bgs            = RPG::AudioFile.new("", 80)
-      @encounter_list = []
-      @encounter_step = 30
-      @data           = nil
-      @events         = {}
+  # ── Classes de DADOS RPG (Marshal) ───────────────────────────────────────────
+  # CAUSA-RAIZ provada (analise do seguidor "Giltbert"): estas classes NAO estavam
+  # definidas, por isso o `const_missing` do Essentials resolvia-as para um NullStub.
+  # O Marshal carregava os ivars (@list cheio) MAS o getter `.list` do stub devolvia
+  # nil -> CommonEvents/eventos com `.list=nil` -> comandos nunca corriam (ex.: o
+  # `pbAddDependency` do seguidor). Antes isto era remendado em runtime pela CEWRAP
+  # (debug_probe). Definir as classes REAIS aqui, ANTES de qualquer load_data, corrige
+  # a raiz no motor e dispensa o remendo. So' attr_accessor (o Marshal poe os ivars
+  # direto; NAO definir initialize -- as classes com binding C ja' estao registadas).
+  class CommonEvent; attr_accessor :id, :name, :trigger, :switch_id, :list; end
+  class EventCommand; attr_accessor :code, :indent, :parameters; end
+  class MoveRoute;   attr_accessor :list, :repeat, :skippable; end
+  class MoveCommand; attr_accessor :code, :parameters; end
+  class Event
+    attr_accessor :id, :name, :x, :y, :pages
+    class Page
+      attr_accessor :condition, :graphic, :move_type, :move_speed, :move_frequency,
+                    :move_route, :walk_anime, :step_anime, :direction_fix, :through,
+                    :always_on_top, :trigger, :list
     end
   end
 end
@@ -228,48 +195,92 @@ module Dir
   def self.all(*a); []; end
 end
 
-class File
-  def self.open(path, mode="r", *a)
-    return nil unless block_given?
-    begin
-      yield nil
-    rescue
+# [FILE-IO 2026-07-02] O motor C agora define um File REAL (fopen no sdmc; gate
+# File.mkxp_native?) para o SAVE/LOAD funcionar (antes o stub fazia open{yield nil},
+# read->"", write->0 -> gravar era um NO-OP silencioso). Quando o nativo esta'
+# presente, so' juntamos os utilitarios de caminho PUROS (que o C nao define) e
+# helpers de texto por cima do IO real. O stub antigo fica como fallback p/ builds
+# sem o binding (nunca sobrepoe o nativo).
+if (File.mkxp_native? rescue false)
+  class File
+    def self.join(*parts); parts.join("/"); end
+    def self.basename(p, *a)
+      s = p.to_s.split("/").last || ""
+      a[0] ? s.sub(a[0].to_s, "") : s
     end
-    nil
+    def self.dirname(p)
+      parts = p.to_s.split("/")
+      parts.length > 1 ? parts[0..-2].join("/") : "."
+    end
+    def self.extname(p)
+      b = self.basename(p.to_s)
+      i = b.rindex(".")
+      i ? b[i..-1] : ""
+    end
+    def self.expand_path(p, *a); p.to_s; end
+    def self.read(p); (binread(p) rescue ""); end
+    def self.write(p, s); (binwrite(p, s.to_s) rescue 0); end
+    def self.foreach(p, *a)
+      return unless block_given?
+      f = (open(p, "rb") rescue nil)
+      return unless f
+      while (l = f.gets); yield l; end
+      f.close
+    end
+    def self.readlines(p)
+      out = []
+      foreach(p) { |l| out << l }
+      out
+    end
+    def self.safe?(f); (exist?(f) rescue false); end
   end
-  def self.exist?(p); false; end
-  def self.exists?(p); false; end
-  def self.read(p); ""; end
-  def self.write(*a); 0; end
-  def self.join(*parts); parts.join("/"); end
-  def self.basename(p, *a)
-	  s = p.to_s.split("/").last || ""
-	  a[0] ? s.sub(a[0].to_s, "") : s
-	end
-  def self.dirname(p)
-    parts = p.to_s.split("/")
-    parts.length > 1 ? parts[0..-2].join("/") : "."
+else
+  class File
+    def self.open(path, mode="r", *a)
+      return nil unless block_given?
+      begin
+        yield nil
+      rescue
+      end
+      nil
+    end
+    def self.exist?(p); false; end
+    def self.exists?(p); false; end
+    def self.read(p); ""; end
+    def self.write(*a); 0; end
+    def self.join(*parts); parts.join("/"); end
+    def self.basename(p, *a)
+      s = p.to_s.split("/").last || ""
+      a[0] ? s.sub(a[0].to_s, "") : s
+    end
+    def self.dirname(p)
+      parts = p.to_s.split("/")
+      parts.length > 1 ? parts[0..-2].join("/") : "."
+    end
+    def self.extname(p)
+      b = self.basename(p.to_s)
+      i = b.rindex(".")
+      i ? b[i..-1] : ""
+    end
+    def self.expand_path(p, *a); p.to_s; end
+    def self.delete(*a); end
+    def self.rename(*a); end
+    def self.size(p); 0; end
+    def self.foreach(p, *a); end
+    def self.readlines(p); []; end
+    def self.safe?(f); false; end
   end
-  def self.extname(p)
-    b = self.basename(p.to_s)
-    i = b.rindex(".")
-    i ? b[i..-1] : ""
-  end
-  def self.expand_path(p, *a); p.to_s; end
-  def self.delete(*a); end
-  def self.rename(*a); end
-  def self.size(p); 0; end
-  def self.foreach(p, *a); end
-  def self.readlines(p); []; end
-  def self.safe?(f); false; end
 end
 
-module FileTest
-  def self.exist?(p); false; end
-  def self.exists?(p); false; end
-  def self.directory?(p); false; end
-  def self.file?(p); false; end
-  def self.size(p); 0; end
+unless (File.mkxp_native? rescue false)
+  # so' no fallback sem binding nativo (o C ja' define FileTest real)
+  module FileTest
+    def self.exist?(p); false; end
+    def self.exists?(p); false; end
+    def self.directory?(p); false; end
+    def self.file?(p); false; end
+    def self.size(p); 0; end
+  end
 end
 
 # Só definir se o binding C (marshal.cpp) ainda não registou
@@ -279,43 +290,12 @@ end
 unless respond_to?(:save_data)
   def save_data(obj, path); nil; end
 end
-def safeExists?(f); false; end
-def safeIsDirectory?(f); false; end
-
-# ── Sprite_Reflection stub ────────────────────────────────────────────────────
-# FIX: NilClass#width/height/set — o char_sprite.bitmap pode ser nil no init.
-# Guard explícito para evitar crash durante setup do mapa.
-class Sprite_Reflection
-  def initialize(char_sprite=nil, character=nil, viewport=nil)
-    @char_sprite = char_sprite
-    @character   = character
-    @viewport    = viewport
-    # NÃO aceder a char_sprite.bitmap aqui — pode ser nil no init
-  end
-
-  def update
-    return if @char_sprite.nil?
-    bmp = nil
-    begin; bmp = @char_sprite.bitmap; rescue; end
-    return if bmp.nil?
-    # só agora é seguro usar bmp.width, bmp.height, src_rect.set(...)
-    begin
-      return if bmp.respond_to?(:disposed?) && bmp.disposed?
-      w = bmp.width  rescue 0
-      h = bmp.height rescue 0
-      return if w == 0 || h == 0
-    rescue; end
-  end
-
-  def dispose
-    begin; @char_sprite = nil; rescue; end
-  end
-
-  def disposed?; @char_sprite.nil?; end
-
-  def visible;    false; end
-  def visible=(v); nil;  end
-  def method_missing(m, *a); nil; end
+if (File.mkxp_native? rescue false)
+  def safeExists?(f); (File.exist?(f) rescue false); end
+  def safeIsDirectory?(f); (File.directory?(f) rescue false); end
+else
+  def safeExists?(f); false; end
+  def safeIsDirectory?(f); false; end
 end
 
 module PluginManager
@@ -379,9 +359,17 @@ end
 
 def pbEmergencySave; end
 
-module Marshal
-  def self.dump(obj, *a); ""; end
-  def self.load(str); nil; end
+# [SAVE-0B-FIX v3 2026-07-03] ESTE BLOCO ERA A RAIZ DE TODA A SAGA DOS SAVES:
+# sobrescrevia o Marshal NATIVO do motor (marshal.cpp, registado ANTES a t=0.09)
+# com stubs que devolvem ""/nil -> o jogo "gravava com sucesso" ficheiros de
+# 0 BYTES ("saved the game" sem nenhum byte escrito) e qualquer Marshal.load
+# de um save devolvia nil -> sem "Continuar". So' definir os stubs em builds
+# SEM o binding nativo (mesmo gate do File acima).
+unless (File.mkxp_native? rescue false)
+  module Marshal
+    def self.dump(obj, *a); ""; end
+    def self.load(str); nil; end
+  end
 end
 
 class Object
