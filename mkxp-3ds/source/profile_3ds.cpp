@@ -83,6 +83,9 @@ void prof_report(const char *tag) {
 void prof_report_marshal(const char *fname, uint64_t bytes,
                          uint64_t objs, uint64_t frees,
                          double total_ms) {
+    /* [LOG-LEAN] so' ficheiros grandes ou parses lentos (os pequenos eram 115
+     * linhas/sessao de puro ruido + flush ao SD) */
+    if (bytes < 256u * 1024u && total_ms < 50.0) return;
     char buf[320];
     double ms_per_kb   = bytes ? (total_ms / ((double)bytes / 1024.0)) : 0.0;
     double ms_per_obj  = objs  ? (total_ms / (double)objs)             : 0.0;
@@ -99,20 +102,12 @@ void prof_report_marshal(const char *fname, uint64_t bytes,
         (unsigned long long)bytes, (unsigned long long)objs,
         (unsigned long long)frees);
     prof_emit(buf);
+    (void)ms_per_kb; (void)ms_per_obj; (void)us_per_byte; (void)free_ratio;
 
-    snprintf(buf, sizeof(buf),
-        "[PROFILE|marshal]   -> %.2f ms/KB | %.4f ms/obj | %.2f us/byte\n",
-        ms_per_kb, ms_per_obj, us_per_byte);
-    prof_emit(buf);
-
-    snprintf(buf, sizeof(buf),
-        "[PROFILE|marshal]   -> frees/objs=%.2f => GC %s\n",
-        free_ratio,
-        free_ratio > 0.5 ? "ESTEVE MUITO ATIVO no parse (GARGALO = garbage collector!)"
-                         : (free_ratio > 0.05 ? "ativo (contribui p/ lentidao)"
-                                              : "quase parado (tempo NAO e' GC; ver leitura/criacao)"));
-    prof_emit(buf);
-
+    /* [LOG-LEAN 2026-07-05] as 4 linhas de detalhe (ms/KB, frees/objs, BREAKDOWN,
+     * parentese) eram da fase de otimizacao do marshal (fechada) -> so' a linha
+     * resumo acima fica. Reativar so' se voltarmos a perfilar o parser. */
+    if (false) {
     /* BREAKDOWN interno: dos N ms totais, quantos em criar objetos (alloc),
      * setar variaveis de instancia (ivset), resolver classes (class), internar
      * simbolos (symbol) e criar strings (string). O resto (total - estes) e'
@@ -139,6 +134,7 @@ void prof_report_marshal(const char *fname, uint64_t bytes,
         (symbol_ms>=string_ms && symbol_ms>=resto_ms) ? "SYMBOL (mrb_intern -- otimizavel)" :
         (string_ms>=resto_ms) ? "STRING (mrb_str_new)" : "ARRAYS/LEITURA (buffer/arrays/hashes)");
     prof_emit(buf);
+    }  /* [LOG-LEAN] fim do if(false) */
     if (g_dbglog) dbg_flush();
 }
 

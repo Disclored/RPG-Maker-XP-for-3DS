@@ -110,6 +110,19 @@ static bool s_gapflush_logged = false;
  * Input.update (Ruby) e um no-op para evitar double-poll. */
 void inputBindingUpdate() {
     if (g_input_rgss_model) {
+        /* [BOUNDARY-DIAG 2026-07-06] O was_held nunca avanca (=0 em todo o DUP-TRIG).
+         * A escrita was_held=1 so' vive no bloco `if(s_input_was_read)`. Medir se esse
+         * flag EstA' true quando este update corre. Se raramente/nunca -> a fronteira
+         * de frame logico esta' morta e todo o trigger? sai de held_any stale. Cap 60. */
+        {
+            static int __bd = 0;
+            if (__bd < 8 && g_dbglog) {   /* [LOG-LEAN 2026-07-11] 60->8: fronteira validada */
+                __bd++;
+                fprintf(g_dbglog, "[BOUNDARY-DIAG] f=%d input_was_read=%d held[USE]=%d was_held[USE]=%d held_any[USE]=%d noread_run=%d\n",
+                        g_dbg_frame, s_input_was_read?1:0, s_held[13]?1:0, s_was_held[13]?1:0, s_held_any[13]?1:0, s_noread_run);
+                dbg_flush();
+            }
+        }
         /* [FIX-INPUT-RGSS v2] Flancos calculados AQUI (grph_update corre sempre,
          * ao contrario de Input.update que esta' intercetado -> [DIAG-INPUT]=0).
          * Fronteira de frame logico = LEITURA de input do jogo (s_input_was_read,
@@ -120,7 +133,14 @@ void inputBindingUpdate() {
             bool was_gap = (g_input_flush_on && s_noread_run >= 2);
             for (int i = 0; i < RMXP_KEY_COUNT; i++) {
                 s_was_held[i] = s_held[i];   /* base = estado do frame logico anterior */
-                s_held_any[i] = s_held[i];   /* repor acumulador */
+                /* [FIX-DOUBLE-EVENT 2026-07-06] RAIZ do "tudo 2x" (item/ataque/entrada
+                 * a repetir, PROVADO: pbReceiveItem 2x a 101 frames = a tecla de FECHAR
+                 * a mensagem sangra p/ o mapa e re-dispara o evento). O acumulador tem de
+                 * ser reposto a VAZIO (false), NAO ao nivel-mantido: senao um botao ainda
+                 * em baixo quando a mensagem fecha mantem held_any=1 -> o mapa le trigger?
+                 * =true logo a seguir -> 2o evento. Um toque GENUINAMENTE novo re-arma via
+                 * flanco de subida (linha ~178). Semantica RGSS correcta (trigger? = 1 frame). */
+                s_held_any[i] = false;       /* repor acumulador A VAZIO (era = s_held = BUG) */
                 /* [FIX-INPUT-TRANSITION gap] Se houve transicao sem leitura, suprime o
                  * flanco de uma tecla que (a) ja' estava em baixo no inicio do gap = o
                  * press que abriu a cena (segurado), OU (b) ja' tinha o flanco CONSUMIDO
@@ -130,7 +150,7 @@ void inputBindingUpdate() {
                  * caem em (a) nem (b) -> mantem o flanco. */
                 if (was_gap && (s_held_at_gap[i] || s_consumed_at_gap[i])) {
                     s_was_held[i] = true;        /* !was_held = false -> sem flanco de pressao */
-                    s_held_any[i] = s_held[i];   /* descarta acumulacao do press de abertura */
+                    s_held_any[i] = false;       /* [FIX-DOUBLE-EVENT] descarta acumulacao (era = s_held) */
                 }
             }
             if (was_gap && !s_gapflush_logged && g_dbglog) {
@@ -304,11 +324,25 @@ static mrb_value inp_trigger(mrb_state *mrb, mrb_value self) {
          * depois). Com janela, ha' sempre orcamento fresco quando o menu abre. */
         if (t && k == 13 && g_dbglog) {
             static int __ut = 0; static int __ut_win = -1;
-            int win = g_dbg_frame / 600;
+            int win = g_dbg_frame / 3600;   /* [LOG-LEAN] janela 600->3600; caso auto-Bag FECHADO */
             if (win != __ut_win) { __ut_win = win; __ut = 0; }
-            if (__ut++ < 15) {
+            if (__ut++ < 3) {               /* [LOG-LEAN] 15->3 por janela */
                 fprintf(g_dbglog, "[USE-TRIG] f=%d trigger?(USE)=1 press=%d held=%d was_held=%d held_any=%d\n",
                         g_dbg_frame, s_pressed[13]?1:0, s_held[13]?1:0, s_was_held[13]?1:0, s_held_any[13]?1:0);
+                dbg_flush();
+            }
+        }
+        /* [DUP-TRIG 2026-07-06] rastreio do "tudo 2x": loga TODA leitura trigger?=1
+         * de ACTION(11)/USE(13)/C-equiv com o frame. Um UNICO toque que produza DUAS
+         * linhas com frames diferentes (proximos) = duplo disparo de input = a raiz
+         * de item-2x / ataque-2x / entrada-batalha-2x. press=0 = flanco FANTASMA
+         * (held_any stale). Cap 80. */
+        if (t && (k == 11 || k == 13) && g_dbglog) {
+            static int __dt = 0;
+            if (__dt++ < 8) {   /* [LOG-LEAN 2026-07-11] 80->8: raiz do "2x" fechada ha' ciclos; era ~200 linhas+flush por corrida */
+                fprintf(g_dbglog, "[DUP-TRIG] f=%d trigger?(%s)=1 press=%d held=%d was_held=%d held_any=%d edge_consumed=%d\n",
+                        g_dbg_frame, k == 11 ? "ACTION" : "USE",
+                        s_pressed[k]?1:0, s_held[k]?1:0, s_was_held[k]?1:0, s_held_any[k]?1:0, s_edge_consumed[k]?1:0);
                 dbg_flush();
             }
         }

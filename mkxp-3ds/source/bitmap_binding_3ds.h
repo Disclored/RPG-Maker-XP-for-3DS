@@ -30,6 +30,9 @@ struct Bitmap3DS {
                                * quando o heap de malloc esta' esgotado pela pool do
                                * mruby) -> bitmap_free tem de usar linearFree, nao
                                * free. Default false (malloc/stb/calloc). */
+    unsigned       last_read_epoch; /* [GIANT-LRU v2] recencia de LEITURA como
+                               * fonte (compose/blt/stretch): quem foi lido ha'
+                               * pouco esta' EM USO e nunca e' despojado. */
     bool           pixels_4444; /* true = b->pixels esta' em RGBA4444 (2 bytes/px,
                                * um u16 por pixel: RRRRGGGGBBBBAAAA) em vez de RGBA8888
                                * (4 bytes/px). USADO so' p/ TILESETS GIGANTES (o 8888

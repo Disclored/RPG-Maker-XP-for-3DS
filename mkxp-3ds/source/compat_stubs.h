@@ -386,9 +386,17 @@ begin
       end
       @visible=true; @z=0; @ox=0; @oy=0
       @color=Color.new(0,0,0,0); @tone=Tone.new; @disposed=false
+      # [VP-REGISTRY 2026-07-11] regista p/ o overlay de color/tone no motor
+      # (pbFadeOutIn anima viewport.color de viewports LOCAIS -- 176 call-sites
+      # de fades de cena que eram inertes). O motor percorre $__mkxp_vps por
+      # frame e desenha o overlay no rect; dispose remove da lista.
+      begin; ($__mkxp_vps ||= []) << self; rescue; end
     end
     def disposed?; @disposed; end
-    def dispose; @disposed=true; end
+    def dispose
+      @disposed=true
+      begin; $__mkxp_vps.delete(self) if $__mkxp_vps; rescue; end
+    end
     def update; end
     def flash(c,d); end
   end
@@ -435,6 +443,10 @@ begin
         # Sem isto, o background (Plane) ficava com vp_z=0 e caia atras do mapa.
         (@__psprite.viewport = @viewport) rescue nil
         @__psprite.z = @z
+        # [PLANE-WRAP 2026-07-10] marca no motor: o blit tila este sprite pelo
+        # ecra inteiro (wrap RGSS do Plane) -> fog/panorama com scroll ox/oy
+        # deixam de aparecer como UMA copia solta no canto.
+        (MKXPDebug.mark_plane(@__psprite) rescue nil)
       rescue
         @__psprite = nil
       end
@@ -470,6 +482,22 @@ begin
     def __sync_psprite
       return unless @__psprite && (@__psprite.disposed? rescue true)==false
       begin
+        # [PLANE-DIRTY 2026-07-05] corria 3x por Plane por frame (ox=,oy=,update)
+        # x 2 Planes (panorama+fog) x 2 mapas = 12 syncs/frame com 9 setters
+        # nativos + funcall viewport.z cada, MESMO sem nada mudar (~108 chamadas
+        # nativas/frame). Dirty-guard: nada mudou -> 0 chamadas. O vp_z e'
+        # auto-corrigido por frame pelo ROUPEIRO-ZFIX (sprite_binding), por isso
+        # saltar a re-propagacao do viewport quando identico e' seguro.
+        _vpz = @viewport ? (@viewport.z rescue 0) : nil
+        if @__ps_vp.equal?(@viewport) && @__ps_vpz == _vpz &&
+           @__ps_ox == @ox && @__ps_oy == @oy && @__ps_z == @z &&
+           @__ps_vis == @visible && @__ps_op == @opacity &&
+           @__ps_zx == @zoom_x && @__ps_zy == @zoom_y && @__ps_bt == @blend_type
+          return
+        end
+        @__ps_vp = @viewport; @__ps_vpz = _vpz
+        @__ps_ox = @ox; @__ps_oy = @oy; @__ps_z = @z; @__ps_vis = @visible
+        @__ps_op = @opacity; @__ps_zx = @zoom_x; @__ps_zy = @zoom_y; @__ps_bt = @blend_type
         @__psprite.x = -(@ox || 0)
         @__psprite.y = -(@oy || 0)
         @__psprite.z = @z
@@ -1792,6 +1820,16 @@ rescue; end
 # -- Integer extras ------------------------------------------------------------
 begin
   class Integer
+    # [OPPOSES-FIX 2026-07-11] RAIZ do "2 Pikachus" na batalha (provado no log
+    # 19:06 + leitura do 172_PokeBattle_Battle.rb:543): o Essentials normaliza
+    # indices com `x = x.index if x.respond_to?("index")` — o nosso respond_to?
+    # universal MENTE e o auto-stub devolve 0 -> opposes?(1) virava false ->
+    # pbParty(1) devolvia a party do JOGADOR -> battlers[1] = Pikachu do jogador
+    # (databox do inimigo com o teu pokemon, own=true). Integer#index -> self
+    # torna o guard mentiroso IDEMPOTENTE em todos os sitios com este padrao
+    # (opposes?, pbParty, allSameSideBattlers, ...). Generico p/ qualquer
+    # jogo Essentials; estritamente melhor que o 0 do auto-stub em qualquer caso.
+    def index(*_a); self; end unless method_defined?(:index)
     def name; self.to_s; end unless method_defined?(:name)
     def each(*_a); yield self if block_given?; self; end unless method_defined?(:each)
     def each_with_index(*_a)
@@ -2857,6 +2895,75 @@ if (Object.const_defined?(:Spriteset_Map) rescue false) &&
   (dbg "[J3] throttle de spriteset vizinho instalado (every=#{$MKXP_PERF_J3_EVERY}, flag $MKXP_PERF_J3)") rescue nil
 else
   (dbg "[J3] NAO instalado (Spriteset_Map ausente ou ja' aliasado)") rescue nil
+end
+
+# ─── [WX-IDLE 2026-07-05] RPG::Weather (script 226, NAO o stub) em idle ───────
+# Com weather :None, fade_in fazia GameData::Weather.get+validate (Hash/Array
+# novos) ANTES do proprio early-out, e update corria update_screen_tone inteiro
+# com Tone.new alocado POR FRAME — x2 spritesets = ~0.8-2ms/frame + churn GC.
+# Guard exato: reproduz o return de 226:68 sem o .get; o update so' salta
+# DEPOIS de uma passagem original em idle e re-verifica o estado vivo.
+begin
+  if (RPG.const_defined?(:Weather) rescue false) &&
+     (RPG::Weather.instance_methods.include?(:fade_in) rescue false) &&
+     !(RPG::Weather.instance_methods.include?(:__wx_fade_orig) rescue false)
+    module RPG
+      class Weather
+        alias __wx_fade_orig fade_in
+        alias __wx_upd_orig  update
+        def fade_in(new_type, new_max, duration = 1)
+          return if !@fading && @type == :None && @max == 0 &&
+                    (new_type == :None || new_type == 0)
+          @__wx_idle = false
+          __wx_fade_orig(new_type, new_max, duration)
+        end
+        def update
+          return if @__wx_idle && @type == :None && !@fading && @max == 0
+          __wx_upd_orig
+          @__wx_idle = (@type == :None && !@fading && @max == 0 &&
+                        @sprites.empty? && @new_sprites.empty? &&
+                        @tiles.empty? && (@tiles_wide || 0) == 0)
+        end
+      end
+    end
+    (dbg "[WX-IDLE] RPG::Weather early-out idle instalado") rescue nil
+  else
+    (dbg "[WX-IDLE] NAO instalado (Weather ausente ou ja' aliasado)") rescue nil
+  end
+rescue => __ewx
+  (dbg "[WX-IDLE] falhou: #{__ewx.class}: #{__ewx.message}") rescue nil
+end
+
+# ─── [CTOX 2026-07-05] CustomTilemap#ox=/oy= early-out sem mudanca ────────────
+# Cada set chamava shown? DUAS vezes (~12-15 dispatches cada) mesmo com o valor
+# igual — 4x shown? por mapa por frame (~100-120 dispatches parado). Com valor
+# igual, wasshown==shown? -> @nowshown=(!s && s)=false SEMPRE: reproduzimos o
+# resultado exato sem calcular nada.
+begin
+  if (Object.const_defined?(:CustomTilemap) rescue false) &&
+     !(CustomTilemap.instance_methods.include?(:__ctox_orig) rescue false)
+    class CustomTilemap
+      alias __ctox_orig ox=
+      alias __ctoy_orig oy=
+      def ox=(val)
+        if val.floor == @ox
+          @nowshown = false
+          return
+        end
+        __ctox_orig(val)
+      end
+      def oy=(val)
+        if val.floor == @oy
+          @nowshown = false
+          return
+        end
+        __ctoy_orig(val)
+      end
+    end
+    (dbg "[CTOX] CustomTilemap ox=/oy= early-out instalado") rescue nil
+  end
+rescue => __ectx
+  (dbg "[CTOX] falhou: #{__ectx.class}: #{__ectx.message}") rescue nil
 end
 
 end  # fim da lambda $__mkxp_perf_install

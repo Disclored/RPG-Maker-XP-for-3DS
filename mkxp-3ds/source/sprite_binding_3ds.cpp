@@ -18,6 +18,8 @@ extern void display_3ds_blit_ex(DS3Texture* t,
 #include <stdlib.h>
 #include <string.h>         /* [ZINVERT/STATUE-SPR] strcmp p/ comparar classe do sprite */
 #include <string.h>
+extern "C" void *mkxp_etc_rect_ptr(mrb_state *mrb, mrb_value v);  /* [VP-RECT] usado no draw (decl duplicada mais abaixo p/ CHARBATCH) */
+extern "C" void mkxp_bitmap_strip(Bitmap3DS*);  /* [TITLE-SWEEP v6] despojar bitmaps vazados */
 #include <math.h>   /* FIX-NSYNC: lround (arredondamento half-away-from-zero = .round do Ruby) */
 #include <vector>
 #include <algorithm>   /* std::stable_sort */
@@ -60,6 +62,18 @@ static int read_viewport_z(mrb_state *mrb, mrb_value vp);
 
 #include "tilemap_binding_3ds.h"
 
+/* [SPRFX/SCREENFX] helpers type-checked de etc_binding */
+extern "C" void *mkxp_etc_tone_ptr(mrb_state*, mrb_value);
+extern "C" void *mkxp_etc_color_ptr(mrb_state*, mrb_value);
+
+/* [MKXP_DIAG_BATTLER] Diagnostico one-shot dos sprites "tamanho-battler" (>=120px,
+ * sem texto) -- despeja estado (vis/op/pos/z/src/tex) ANTES do gate de visibilidade,
+ * para apanhar battlers do EBDX que ficam invisiveis. Deduplica por (w,h,vis), cap 48.
+ * Por para 0 depois de diagnosticar a batalha. */
+#ifndef MKXP_DIAG_BATTLER
+#define MKXP_DIAG_BATTLER 0   /* [QUIET 2026-07-12] 1->0: batalha diagnosticada (BGATE/BATTLEDUMP/ATLASDIAG2). Escreviam por-frame na batalha -> FPS 20-30 caiu p/ 5-10. Compilados p/ fora (custo zero). Repor 1 p/ voltar a diagnosticar. */
+#endif
+
 void sprites_draw_all() {
     /* [BUILD-CHK-J20] Marcador INCONDICIONAL de compilacao (dispara 1x, sem
      * depender de estado do jogo). Se NAO aparecer no log, este
@@ -78,7 +92,8 @@ void sprites_draw_all() {
     {
         static int s_diag_frame = 0;
         s_diag_frame++;
-        if (s_diag_frame <= 10) {
+        extern bool g_log_verbose;
+        if (g_log_verbose && s_diag_frame <= 10) {
             extern FILE *g_dbglog;
             int total    = (int)g_sprites.size();
             int disposed = 0, invisible = 0, no_bitmap = 0, ready = 0;
@@ -185,6 +200,55 @@ void sprites_draw_all() {
             if (z_regtie && ka >= 99990) return a->reg_seq < b->reg_seq;
             return a->z < b->z;
         });
+
+    /* [TITLE-SWEEP v2 2026-07-10] RAIZ dos battlers tapados. Os paineis do TITULO
+     * (0045/0046/0047: z=998/999, viewport 99999) NUNCA sao dispostos e o fluxo do
+     * jogo nunca regressa ao loop de cenas (load arranca DENTRO do Scene_Intro#main)
+     * -> o sweep por fim-de-cena nunca disparava. AQUI e' a prova-de-fogo: quando ha'
+     * BATTLER em cena (sprite >=300x300 com viewport z>=99990), qualquer sprite com
+     * z em [990..99989] criado ANTES do battler (reg_seq menor) so' pode ser lixo
+     * de cena anterior -> escondido. Os overlays legitimos da batalha (entry/vs/
+     * mensagens) sao criados DEPOIS dos pokemon_N (reg_seq maior) ou vivem em
+     * z>=99990 -> intactos. Custo: O(n) so' quando ha' battler. */
+    {
+        /* [v3 2026-07-10] ASSINATURA CORRIGIDA: os frames "346x346/401x363" a f~230
+         * eram a ARTE DO TITULO (Modular Title Screen), nao battlers! Os battlers
+         * REAIS (BATTLEDUMP) sao bitmap 192x192, vp_z=99999, z~11. So' esta
+         * assinatura marca "batalha a serio" -> o sweep fica INERTE no titulo. */
+        /* [v5 DETERMINISTICO] fim das heuristicas (colidiam com arte do titulo e
+         * sombras 192x192 do overworld): o battler e' MARCADO pelo probe (que o
+         * conhece: DynamicPokemonSprite@sprite) via MKXPDebug.mark_battler ->
+         * s->is_battler. Zero falsos positivos. */
+        unsigned battler_seq = 0; bool has_battler = false;
+        for (size_t i = 0; i < g_sprites.size(); i++) {
+            Sprite3DS *s = g_sprites[i];
+            if (!s || s->disposed || !s->visible || !s->bitmap || s->bitmap->disposed) continue;
+            if (s->is_battler) {
+                if (!has_battler || s->reg_seq < battler_seq) battler_seq = s->reg_seq;
+                has_battler = true;
+            }
+        }
+        extern int g_bd_battle_frame_flag;                 /* p/ o BLITDIAG do display */
+        g_bd_battle_frame_flag = has_battler ? 1 : 0;
+        if (has_battler) {
+            static int swept_total = 0;
+            for (size_t i = 0; i < g_sprites.size(); i++) {
+                Sprite3DS *s = g_sprites[i];
+                if (!s || s->disposed || !s->visible) continue;
+                if (s->z >= 990 && s->z <= 99989 && s->reg_seq < battler_seq &&
+                    s->has_vp && s->vp_z >= 99990) {   /* so' viewports de topo (titulo=99999); NPCs always_on_top do mapa ficam fora */
+                    s->visible = false;
+                    extern FILE *g_dbglog;
+                    if (g_dbglog && swept_total < 20) { swept_total++;
+                        fprintf(g_dbglog, "[TITLE-SWEEP v2] WARNING lixo pre-batalha escondido: z=%d seq=%u bmp=%dx%d\n",
+                                (int)s->z, s->reg_seq,
+                                s->bitmap ? s->bitmap->width : 0, s->bitmap ? s->bitmap->height : 0);
+                        fflush(g_dbglog);
+                    }
+                }
+            }
+        }
+    }
 
     /* ═══ [DIAG 2026-07-02] Instrumentacao dedicada para PROVAR 2 bugs nao confirmados.
      * g_sprites esta' AGORA em ordem de desenho (indice 0 = fundo, ultimo = topo).
@@ -529,13 +593,31 @@ void sprites_draw_all() {
                 if (mrb_test(er)) {
                     gk_suppress[cands[ci].idx] = 1;
                     static unsigned gk_elog = 0;
-                    if ((++gk_elog % 300) == 1 && g_dbglog) {
+                    extern bool g_log_verbose;
+                    if (g_log_verbose && (++gk_elog % 300) == 1 && g_dbglog) {
                         fprintf(g_dbglog, "[GHOST-KILL v3] sprite de evento ERASED suprimido @(%d,%d) (estatua visual)\n",
                                 g_sprites[cands[ci].idx]->x, g_sprites[cands[ci].idx]->y);
                         dbg_flush();
                     }
                     continue;
                 }
+            }
+            /* [STALE-SPRITE 2026-07-05] Sprite_Character orfao do loop de update do
+             * spriteset (jogo faz @spritesets={} sem dispor): #update nunca corre ->
+             * o bitmap fica CONGELADO no grafico velho (ex: 'Object ball') enquanto o
+             * EVENTO ja' foi p/ pagina vazia -> "pokebola que segue o jogador".
+             * Deteta: @character_name do SPRITE (cache) mostra grafico mas o do
+             * EVENTO ja' e' '' -> nao desenhar. So' 2 iv_get sobre o conjunto ja'
+             * filtrado (barato; substitui o ObjectSpace.each_object do probe que
+             * varria o heap inteiro e matava o FPS). */
+            {
+                static mrb_sym gk_sy_cn2 = 0;
+                if (!gk_sy_cn2) gk_sy_cn2 = mrb_intern_lit(mrb, "@character_name");
+                mrb_value spr_cn = mrb_iv_get(mrb, g_sprites[cands[ci].idx]->rb_self, gk_sy_cn2);
+                mrb_value ev_cn  = mrb_iv_get(mrb, ch, gk_sy_cn2);
+                bool spr_has  = mrb_string_p(spr_cn) && RSTRING_LEN(spr_cn) > 0;
+                bool ev_empty = mrb_nil_p(ev_cn) || (mrb_string_p(ev_cn) && RSTRING_LEN(ev_cn) == 0);
+                if (spr_has && ev_empty) { gk_suppress[cands[ci].idx] = 1; continue; }
             }
             /* (b) clone vivo do seguidor? */
             bool in_real = false;
@@ -566,7 +648,8 @@ void sprites_draw_all() {
             if (!legit) {
                 gk_suppress[cands[ci].idx] = 1;
                 static unsigned gk_log = 0;
-                if ((++gk_log % 120) == 1 && g_dbglog) {
+                extern bool g_log_verbose;
+                if (g_log_verbose && (++gk_log % 120) == 1 && g_dbglog) {
                     mrb_value cid = mrb_iv_get(mrb, ch, gk_sy_id);
                     fprintf(g_dbglog, "[GHOST-KILL v3] fantasma ev%d suprimido @(%d,%d) (nao e' evento vivo nem clone em realEvents)\n",
                             mrb_fixnum_p(cid)?(int)mrb_fixnum(cid):-1,
@@ -606,7 +689,8 @@ void sprites_draw_all() {
                 (void)win;
                 gk_suppress[lose] = 1;
                 static unsigned gk_dlog = 0;
-                if ((++gk_dlog % 120) == 1 && g_dbglog) {
+                extern bool g_log_verbose;
+                if (g_log_verbose && (++gk_dlog % 120) == 1 && g_dbglog) {
                     fprintf(g_dbglog, "[GHOST-KILL v3] duplicado do mesmo clone: sprite copia suprimido (fica o atualizado)\n");
                     dbg_flush();
                 }
@@ -616,11 +700,86 @@ void sprites_draw_all() {
 
     for (size_t i = 0; i < g_sprites.size(); i++) {
         Sprite3DS *s = g_sprites[i];
-        if (!s || s->disposed || !s->visible || !s->bitmap) continue;
+#if MKXP_DIAG_BATTLER
+        /* despejo battler ANTES do gate de visibilidade (linha abaixo) */
+        {
+            extern bool g_boot_done; extern FILE *g_dbglog;
+            if (g_boot_done && s && !s->disposed && s->bitmap && !s->bitmap->disposed
+                && !s->bitmap->has_text && s->bitmap->width >= 136 && s->bitmap->height >= 136) {
+                /* Regista quando o ESTADO muda (vis/op-bucket/pos-bucket), nao 1x por
+                 * tamanho -- assim apanha a transicao send-out -> repouso (o battler
+                 * revela-se a meio do arco e depois assenta; o repouso e' o que importa).
+                 * Chave por (w,h); assinatura = vis | op-bucket | on-screen | quadrante.
+                 * Cap 90 linhas totais. */
+                const int W = s->bitmap->width, H = s->bitmap->height;
+                int drawx = (int)s->x - (int)((double)s->ox * s->zoom_x);
+                int drawy = (int)s->y - (int)((double)s->oy * s->zoom_y);
+                int dw = (int)((double)W * s->zoom_x), dh = (int)((double)H * s->zoom_y);
+                /* ecra interno ~512x384; on-screen se a caixa intersecta [0,512]x[0,384] */
+                int onscr = (drawx < 512 && drawx + dw > 0 && drawy < 384 && drawy + dh > 0) ? 1 : 0;
+                int opb = (int)s->opacity <= 0 ? 0 : ((int)s->opacity >= 250 ? 2 : 1);
+                int sig = (s->visible ? 1 : 0) | (opb << 1) | (onscr << 3)
+                          | ((drawx / 64) << 4) | ((drawy / 64) << 12);
+                static int bs_w[64], bs_h[64], bs_sig[64], bs_n = 0;
+                int slot = -1;
+                for (int k = 0; k < bs_n; k++) if (bs_w[k] == W && bs_h[k] == H) { slot = k; break; }
+                bool changed = false;
+                if (slot < 0) { if (bs_n < 64) { slot = bs_n++; bs_w[slot] = W; bs_h[slot] = H; bs_sig[slot] = ~sig; } }
+                if (slot >= 0 && bs_sig[slot] != sig) { changed = true; bs_sig[slot] = sig; }
+                static int bs_lines = 0;
+                if (changed && bs_lines < 60 && g_dbglog) {
+                    bs_lines++;
+                    /* amostra de conteudo: quantos de ~100 pontos tem alpha>0 (8888).
+                     * content=0/N -> bitmap TRANSPARENTE (clone/frame-extraction vazio);
+                     * content alto -> tem imagem (problema e' render/posicao, nao conteudo). */
+                    int csamp = 0, cnon = 0;
+                    if (s->bitmap->pixels && !s->bitmap->pixels_4444) {
+                        int total = W * H, step = total / 100; if (step < 1) step = 1;
+                        for (int p = 0; p < total; p += step) {
+                            csamp++;
+                            if (s->bitmap->pixels[(size_t)p * 4 + 3] != 0) cnon++;
+                        }
+                    }
+                    fprintf(g_dbglog,
+                        "[BATTLER?] bmp=%dx%d vis=%d op=%d ONSCR=%d content=%d/%d draw=(%d,%d..%d,%d) "
+                        "xy=(%d,%d) z=%d o=(%d,%d) zoom=(%.2f,%.2f) src=(%d,%d,%d,%d) tex=%d px=%d\n",
+                        W, H, s->visible ? 1 : 0, (int)s->opacity, onscr, cnon, csamp,
+                        drawx, drawy, drawx + dw, drawy + dh,
+                        (int)s->x, (int)s->y, (int)s->z, (int)s->ox, (int)s->oy,
+                        (double)s->zoom_x, (double)s->zoom_y,
+                        (int)s->src_x, (int)s->src_y, (int)s->src_w, (int)s->src_h,
+                        s->bitmap->tex ? 1 : 0, s->bitmap->pixels ? 1 : 0);
+                    dbg_flush();
+                }
+            }
+        }
+#endif
+#if MKXP_DIAG_BATTLER
+        /* [BGATE] rastreio de portao: um sprite tamanho-battler que passa o dump de
+         * topo mas nao chega ao blit e' morto num destes continue. Loga QUAL. Nao
+         * gated por verbose (so' por tamanho >=300 => raro fora de batalha). */
+        extern bool g_boot_done;
+        bool bdbg = g_boot_done && s && !s->disposed && s->bitmap && !s->bitmap->disposed
+                    && !s->bitmap->has_text && s->bitmap->width >= 136 && s->bitmap->height >= 136;
+        /* [PERF 2026-07-11] throttle 1/60: cada linha custava um fprintf+FLUSH
+         * ao SD por FRAME por sprite morto (417-1606 linhas nos logs = ms de
+         * escrita em cima do frame). 1 em 60 chega p/ diagnostico. */
+        #define BGATE_LOG(tag) do { if (bdbg && g_dbglog) { \
+            static unsigned _bg_thr = 0; \
+            if ((_bg_thr++ % 60) == 0) { \
+            fprintf(g_dbglog, "[BGATE] %s bmp=%dx%d vis=%d op=%d z=%d\n", tag, \
+                s->bitmap?s->bitmap->width:0, s->bitmap?s->bitmap->height:0, \
+                s&&s->visible?1:0, s?(int)s->opacity:0, s?(int)s->z:0); dbg_flush(); } } } while(0)
+#else
+        #define BGATE_LOG(tag) do{}while(0)
+        bool bdbg = false; (void)bdbg;
+#endif
+        if (!s || s->disposed || !s->bitmap) continue;
+        if (!s->visible) { BGATE_LOG("KILL-INVISIBLE"); continue; }
         if (s->bitmap->disposed) continue;
 
         /* [GHOST-KILL v3] veredito da passada de analise */
-        if (ghost_on && i < gk_suppress.size() && gk_suppress[i]) continue;
+        if (ghost_on && i < gk_suppress.size() && gk_suppress[i]) { BGATE_LOG("KILL-GHOSTKILL"); continue; }
 
         /* FIX BUG 3: fazer upload sempre que tex_dirty=true OU tex=nullptr.
          * tex pode ser nullptr mesmo com tex_dirty=false se o bitmap foi
@@ -650,7 +809,7 @@ void sprites_draw_all() {
             }
         }
         if (s->bitmap->tex_dirty) s->bitmap->tex_failed = false;
-        if (s->bitmap->tex_failed && !s->bitmap->tex) continue;
+        if (s->bitmap->tex_failed && !s->bitmap->tex) { BGATE_LOG("KILL-TEXFAILED"); continue; }
         if (s->bitmap->tex_dirty || !s->bitmap->tex) {
             /* [FPS] CAMINHO RAPIDO anti-40ms: se a textura JA' existe com as mesmas
              * dims, update IN-PLACE (sem free/create/evict, SEM fechar o frame GPU).
@@ -696,7 +855,7 @@ void sprites_draw_all() {
             }
             s->bitmap->tex_dirty = false;
         }
-        if (!s->bitmap->tex || !s->bitmap->tex->valid) continue;
+        if (!s->bitmap->tex || !s->bitmap->tex->valid) { BGATE_LOG("KILL-TEXINVALID"); continue; }
 
         /* ── FIX RASTO (sprite-sheet inteira desenhada) ─────────────────────
          * O RGSS atualiza o recorte de frame via `self.src_rect.set(x,y,w,h)`,
@@ -731,6 +890,20 @@ void sprites_draw_all() {
                 else if (mrb_float_p(vw))  rw = (int)mrb_float(vw);
                 if      (mrb_fixnum_p(vh)) rh = (int)mrb_fixnum(vh);
                 else if (mrb_float_p(vh))  rh = (int)mrb_float(vh);
+                /* ── [SRCRECT-EMPTY] src_rect com width==0 OU height==0 = DESENHA NADA ──
+                 * Semantica RGSS: um src_rect vazio nao copia nada. spr_set_bitmap
+                 * repoe SEMPRE @src_rect=(0,0,bw,bh) ao atribuir bitmap, por isso um
+                 * 0 numerico aqui e' SEMPRE explicito (o jogo pos-o a 0 de proposito),
+                 * nunca "por definir". O EBDX esconde o icone de estado da databox com
+                 * `src_rect.width = 0` (0106_UI_Data_Boxes) -> sem isto, o motor caia
+                 * no fallback bitmap->width e desenhava a FOLHA INTEIRA de estados
+                 * (SLP/PSN/BRN/PAR/FRZ empilhados) mesmo sem estado. rw/rh so' sao
+                 * >=0 quando o valor era numerico; -1 = Rect por definir (nao mexer). */
+                if ((rw == 0 || rh == 0) && (rw >= 0 && rh >= 0) &&
+                    s->bitmap->width > 0 && s->bitmap->height > 0) {
+                    BGATE_LOG("KILL-SRCRECT-EMPTY");
+                    continue;   /* recorte vazio -> sprite nao desenhado neste frame */
+                }
                 if (rw > 0 && rh > 0) {
                     mrb_value vx = mrb_iv_get(g_mkxp_mrb, ro, sy_x);
                     mrb_value vy = mrb_iv_get(g_mkxp_mrb, ro, sy_y);
@@ -776,10 +949,25 @@ void sprites_draw_all() {
             /* Fonte de pattern/direction: @character -> @event -> o proprio sprite.
              * Antes so' tratava @character; reflexos/sombras (Overworld Shadows EX,
              * Sprite_Reflection) usam o charset mas guardam a ref noutro ivar -> a
-             * folha inteira ia para o void. Agora recortamos SEMPRE; sem fonte,
-             * frame (0,0) -- um sprite estatico, nunca a grelha 4x4. */
+             * folha inteira ia para o void. */
             mrb_value src = mrb_iv_get(g_mkxp_mrb, s->rb_self, sy_ch);
             if (mrb_nil_p(src)) src = mrb_iv_get(g_mkxp_mrb, s->rb_self, sy_ev);
+            int cw = s->bitmap->width  / 4;
+            int ch = s->bitmap->height / 4;
+            /* [GRELHA7-BATTLER v2 2026-07-11] O "recortamos SEMPRE mesmo sem
+             * fonte" MATAVA os battlers EBDX (Sprites puros 192x192 -> src
+             * 48x48 = canto transparente). A v1 (so' recortar com anchor de
+             * frame EXATO) trouxe de volta as grelhas 4x4 nas sombras/reflexos
+             * (anchor (0,0), sem fonte) E ia partir battlers com offsets
+             * PX/PY/ALTITUDE do pokemon.ebdx (anchor != exato bw/2,bh).
+             * v2: recortar SEMPRE exceto anchor claramente de BITMAP-INTEIRO
+             * (ox>bw/4 || oy>bh/2). Charset/sombra: anchor dentro de um frame
+             * (ox<=cw=bw/4, oy<=ch=bh/4; (0,0) incluido) -> recorta. Battler:
+             * refreshMetrics poe ox=bw/2±off, oy=bh±alt (96/192 num 192x192,
+             * offsets <=~32) -> muito acima do limiar -> nao recorta. */
+            bool full_anchor = (s->ox > s->bitmap->width / 4 ||
+                                s->oy > s->bitmap->height / 2);
+            if (!mrb_nil_p(src) || !full_anchor) {
             mrb_value powner = mrb_nil_p(src) ? s->rb_self : src;
             mrb_value vp = mrb_iv_get(g_mkxp_mrb, powner, sy_pat);
             mrb_value vd = mrb_iv_get(g_mkxp_mrb, powner, sy_dir);
@@ -787,13 +975,12 @@ void sprites_draw_all() {
             int dir = mrb_fixnum_p(vd) ? (int)mrb_fixnum(vd) : 2;
             if (pat < 0) pat = 0; else if (pat > 3) pat = pat & 3;
             int row = (dir >= 2 && dir <= 8) ? ((dir - 2) / 2) : 0;
-            int cw = s->bitmap->width  / 4;
-            int ch = s->bitmap->height / 4;
             s->src_x = pat * cw; s->src_y = row * ch;
             s->src_w = cw;       s->src_h = ch;
             src_w = cw;          src_h = ch;
             static int s_gp = 0;
-            if (s_gp++ < 12) {
+            extern bool g_log_verbose;
+            if (g_log_verbose && s_gp++ < 12) {
                 const char *cls = "?";
                 struct RClass *kc = mrb_class(g_mkxp_mrb, s->rb_self);
                 if (kc) cls = mrb_class_name(g_mkxp_mrb, kc);
@@ -806,6 +993,7 @@ void sprites_draw_all() {
                         s->src_x, s->src_y, cw, ch);
                     dbg_flush();
                 }
+            }
             }
         }
 
@@ -842,6 +1030,60 @@ void sprites_draw_all() {
         /* ox/oy são o ponto de origem do sprite -- scaled pelo zoom */
         float dx = (float)s->x - s->ox * s->zoom_x;
         float dy = (float)s->y - s->oy * s->zoom_y;
+
+        /* [VPOFS 2026-07-10] P2/shake: aplicar o ox/oy do VIEWPORT (RGSS:
+         * screen = sprite.x - viewport.ox). O Viewport e' Ruby puro
+         * (compat_stubs) e era IGNORADO no draw -> $game_screen.shake
+         * (Spriteset_Map poe @viewport1.ox=shake) nunca mexia o ecra; idem
+         * efeitos de scroll de viewport do EBDX. Live-read de @viewport.@ox/@oy
+         * so' p/ sprites com viewport (2 iv_get; barato vs. funcall).
+         * Kill-switch sem rebuild: $MKXP_VPOFS=false na 1a linha do probe. */
+        {
+            static int vpofs_on = -1;
+            if (vpofs_on < 0 && g_mkxp_mrb) {
+                mrb_value fv = mrb_gv_get(g_mkxp_mrb, mrb_intern_lit(g_mkxp_mrb, "$MKXP_VPOFS"));
+                vpofs_on = (!mrb_nil_p(fv) && !mrb_test(fv)) ? 0 : 1;   /* default ON */
+            }
+            if (vpofs_on == 1 && s->has_vp && g_mkxp_mrb && !mrb_nil_p(s->rb_self)) {
+                static mrb_sym sy_vvp = 0, sy_vox = 0, sy_voy = 0,
+                               sy_vrc = 0, sy_vrx = 0, sy_vry = 0;
+                if (!sy_vvp) { sy_vvp = mrb_intern_lit(g_mkxp_mrb, "@viewport");
+                               sy_vox = mrb_intern_lit(g_mkxp_mrb, "@ox");
+                               sy_voy = mrb_intern_lit(g_mkxp_mrb, "@oy");
+                               sy_vrc = mrb_intern_lit(g_mkxp_mrb, "@rect");
+                               sy_vrx = mrb_intern_lit(g_mkxp_mrb, "@x");
+                               sy_vry = mrb_intern_lit(g_mkxp_mrb, "@y"); }
+                mrb_value vpv = mrb_iv_get(g_mkxp_mrb, s->rb_self, sy_vvp);
+                if (!mrb_nil_p(vpv)) {
+                    mrb_value vox = mrb_iv_get(g_mkxp_mrb, vpv, sy_vox);
+                    mrb_value voy = mrb_iv_get(g_mkxp_mrb, vpv, sy_voy);
+                    float fox = mrb_fixnum_p(vox) ? (float)mrb_fixnum(vox)
+                              : (mrb_float_p(vox) ? (float)mrb_float(vox) : 0.0f);
+                    float foy = mrb_fixnum_p(voy) ? (float)mrb_fixnum(voy)
+                              : (mrb_float_p(voy) ? (float)mrb_float(voy) : 0.0f);
+                    dx -= fox; dy -= foy;
+                    /* [VP-RECT 2026-07-11] origem do viewport (RGSS: o conteudo
+                     * desenha a partir de rect.x/y). Viewports fullscreen teem
+                     * rect (0,0) -> 0 custo visivel; cobre jukebox (16,52),
+                     * slots (x,y,64,144), Vs-intro e o esconde-fora-de-ecra do
+                     * Scripted Battles (rect.x=-512). Clipping ao rect fica p/
+                     * ciclo proprio (exige recorte de UV). */
+                    mrb_value vrc = mrb_iv_get(g_mkxp_mrb, vpv, sy_vrc);
+                    if (!mrb_nil_p(vrc)) {
+                        void *rp = mkxp_etc_rect_ptr(g_mkxp_mrb, vrc);
+                        if (rp) {
+                            struct RI { int x,y,w,h; };
+                            dx += (float)((RI*)rp)->x; dy += (float)((RI*)rp)->y;
+                        } else if (mrb_type(vrc) == MRB_TT_OBJECT) {
+                            mrb_value rxv = mrb_iv_get(g_mkxp_mrb, vrc, sy_vrx);
+                            mrb_value ryv = mrb_iv_get(g_mkxp_mrb, vrc, sy_vry);
+                            if (mrb_fixnum_p(rxv)) dx += (float)mrb_fixnum(rxv);
+                            if (mrb_fixnum_p(ryv)) dy += (float)mrb_fixnum(ryv);
+                        }
+                    }
+                }
+            }
+        }
 
         /* FIX-PICDOWN: se a textura foi REDUZIDA (picture sobredimensionada >1024 ou
          * OOM), as coords de ORIGEM tem de ser em espaco da textura REAL (divididas
@@ -896,12 +1138,112 @@ void sprites_draw_all() {
                 }
             }
         }
+#if MKXP_DIAG_BATTLER
+        if (bdbg && g_dbglog) {
+            /* chegou ao blit: coords finais + alpha + alpha do pixel central (RAM).
+             * Se isto aparece p/ o battler mas ele nao se ve -> problema no blit/
+             * coords/overdraw, NAO na visibilidade. */
+            int ca = -1;
+            if (s->bitmap->pixels && !s->bitmap->pixels_4444) {
+                long pi = ((long)(s->bitmap->height/2) * s->bitmap->width + s->bitmap->width/2) * 4;
+                if (pi + 3 < (long)s->bitmap->width * s->bitmap->height * 4) ca = s->bitmap->pixels[pi+3];
+            }
+            static unsigned rd = 0;
+            /* [FINALDIAG 2026-07-10] com $MKXP_BLITDIAG: SEM throttle (cap 500) —
+             * cada REACHED-DRAW (cls=) casa 1:1 com a linha BLITDIAG do mesmo blit
+             * -> a CLASSE de cada sprite grande fica identificada na corrida final. */
+            extern bool g_blitdiag; static int rd_full = 0;
+            extern int g_bd_battle_frame_flag;
+            bool _rd_battle = (g_bd_battle_frame_flag != 0);   /* v4: assinatura real do battler */
+            /* [LOG-LEAN 2026-07-11] cap TOTAL no 1/30: a cadeia de desenho ja' esta
+             * provada; 872 linhas BGATE+flush por corrida eram I/O de SD constante.
+             * As primeiras ~80 amostras chegam p/ validar qualquer corrida. */
+            bool _rd_log = (g_blitdiag && _rd_battle) ? (rd_full < 500 && ++rd_full > 0)
+                                                      : (rd <= 2400 && (++rd % 30) == 1);
+            if (_rd_log) {
+                const char *cls = (g_mkxp_mrb && !mrb_nil_p(s->rb_self)) ? mrb_obj_classname(g_mkxp_mrb, s->rb_self) : "?";
+                /* [ATLASDIAG2] p/ o tilemap 832x704: 5 amostras de alpha no buffer
+                 * + ptr + dirty — decide se o buffer TEM conteudo fora do centro. */
+                if (s->bitmap->width == 832 && s->bitmap->height == 704 && s->bitmap->pixels) {
+                    unsigned char *px = s->bitmap->pixels;
+                    long W = 832;
+                    int a1 = px[((100L*W)+100)*4+3], a2 = px[((100L*W)+700)*4+3],
+                        a3 = px[((350L*W)+416)*4+3], a4 = px[((600L*W)+100)*4+3],
+                        a5 = px[((600L*W)+700)*4+3];
+                    fprintf(g_dbglog, "[ATLASDIAG2] layer0 px=%p dirty=%d amostras_alpha=[%d,%d,%d,%d,%d]\n",
+                            (void*)px, s->bitmap->tex_dirty ? 1 : 0, a1, a2, a3, a4, a5);
+                    dbg_flush();
+                }
+                fprintf(g_dbglog, "[BGATE] REACHED-DRAW cls=%s bmp=%dx%d z=%d vpz=%d hvp=%d dst=(%.0f,%.0f %.0fx%.0f) "
+                    "alpha=%.2f a_centro=%d tex=%p src=(%d,%d,%d,%d)\n",
+                    cls?cls:"?", s->bitmap->width, s->bitmap->height, (int)s->z, (int)s->vp_z, s->has_vp?1:0,
+                    (double)dx, (double)dy,
+                    (double)draw_w, (double)draw_h, (double)alpha, ca, (void*)s->bitmap->tex,
+                    (int)s->src_x, (int)s->src_y, (int)src_w, (int)src_h);
+                dbg_flush();
+            }
+        }
+#endif
+        /* [SPRFX 2026-07-10] passa angle/mirror/color/tone do sprite ao blit.
+         * color/tone: structs nativos TT_DATA lidos type-checked (NULL se Ruby-puro).
+         * Caso comum (neutro) = 2 stores + 2 iv_get por sprite. */
+        {
+            extern float g_blit_angle; extern bool g_blit_mirror;
+            extern unsigned char g_blit_color[4]; extern float g_blit_tone[3];
+            extern int g_blit_blend;   /* [BLEND-MODE] 0=normal 1=add 2=sub */
+            g_blit_angle = s->angle; g_blit_mirror = s->mirror;
+            g_blit_blend = (s->blend_type == 1 || s->blend_type == 2) ? s->blend_type : 0;
+            if (g_mkxp_mrb && !mrb_nil_p(s->rb_self)) {
+                        static mrb_sym sy_col = 0, sy_ton = 0;
+                if (!sy_col) { sy_col = mrb_intern_lit(g_mkxp_mrb, "@color");
+                               sy_ton = mrb_intern_lit(g_mkxp_mrb, "@tone"); }
+                mrb_value cv = mrb_iv_get(g_mkxp_mrb, s->rb_self, sy_col);
+                struct CF { float r,g,b,a; };
+                CF *cp = (CF*)(mrb_nil_p(cv) ? NULL : mkxp_etc_color_ptr(g_mkxp_mrb, cv));
+                if (cp && cp->a > 0.5f) {
+                    g_blit_color[0]=(unsigned char)cp->r; g_blit_color[1]=(unsigned char)cp->g;
+                    g_blit_color[2]=(unsigned char)cp->b; g_blit_color[3]=(unsigned char)cp->a;
+                }
+                mrb_value tv = mrb_iv_get(g_mkxp_mrb, s->rb_self, sy_ton);
+                struct TF { float r,g,b,gray; };
+                TF *tp = (TF*)(mrb_nil_p(tv) ? NULL : mkxp_etc_tone_ptr(g_mkxp_mrb, tv));
+                if (tp) { g_blit_tone[0]=tp->r; g_blit_tone[1]=tp->g; g_blit_tone[2]=tp->b; }
+            }
+        }
+        /* [PLANE-WRAP 2026-07-10] Plane RGSS = bitmap repetido (wrap) por todo o
+         * ecra com scroll ox/oy. O stub Ruby poe a fase em @__psprite.x=-ox ->
+         * dx/dy ja' trazem a fase; tilamos a partir do primeiro multiplo <=0
+         * ate cobrir o ecra logico 512x384. Guard: tiles <8px = degenerado
+         * (evita milhares de blits); 1 tile fullscreen = caso addBackgroundPlane
+         * (1-2 blits, custo igual ao antigo). */
+        if (s->is_plane && draw_w >= 8.0f && draw_h >= 8.0f) {
+            float px = fmodf(dx, draw_w); if (px > 0.0f) px -= draw_w;
+            float py = fmodf(dy, draw_h); if (py > 0.0f) py -= draw_h;
+            for (float ty = py; ty < 384.0f; ty += draw_h)
+                for (float tx = px; tx < 512.0f; tx += draw_w)
+                    display_3ds_blit_ex(s->bitmap->tex,
+                        tx, ty, draw_w, draw_h,
+                        (float)s->src_x / tscale, (float)s->src_y / tscale,
+                        (float)src_w / tscale, (float)src_h / tscale,
+                        alpha);
+        } else
         display_3ds_blit_ex(s->bitmap->tex,
             dx, dy, draw_w, draw_h,
             (float)s->src_x / tscale, (float)s->src_y / tscale,
             (float)src_w / tscale, (float)src_h / tscale,
             alpha);
+        /* [SPRFX] repor neutro p/ o proximo blit (tilemap/janelas nao teem FX) */
+        {
+            extern float g_blit_angle; extern bool g_blit_mirror;
+            extern unsigned char g_blit_color[4]; extern float g_blit_tone[3];
+            extern int g_blit_blend;
+            g_blit_blend = 0;   /* [BLEND-MODE] */
+            g_blit_angle = 0.0f; g_blit_mirror = false;
+            g_blit_color[0]=g_blit_color[1]=g_blit_color[2]=g_blit_color[3]=0;
+            g_blit_tone[0]=g_blit_tone[1]=g_blit_tone[2]=0.0f;
+        }
     }
+#undef BGATE_LOG
 }
 
 /* DUMP-DE-FRAME (botao Y): despeja TODOS os sprites registados no frame actual,
@@ -911,6 +1253,43 @@ void sprites_draw_all() {
  * retrato completo do que esta' empilhado em cada pixel -- p/ identificar a
  * origem de artefactos (ex. axadrezado dourado do teclado) sem adivinhar.
  * Custo: so' corre quando o utilizador carrega no Y (nunca por-frame). */
+/* [TITLE-SWEEP 2026-07-10] RAIZ dos battlers tapados: os paineis do TITULO
+ * (0045/0046/0047: "start"/"shine"/logo, z=998/999, viewport z=99999) NUNCA sao
+ * dispostos ao sair do Scene_Intro (nem no caminho normal nem no crash) e ficam
+ * a desenhar POR CIMA da batalha para sempre (provado: BLITDIAG seq6 328x192
+ * a=1.00 sobre os battlers). Chamado pelo loop de cenas (MFD) QUANDO o
+ * Scene_Intro termina — nesse momento nada legitimo tem z>=990 (a batalha ainda
+ * nao existe; databoxes/mensagens dela criam-se depois) -> esconder e' seguro. */
+void sprites_sweep_title_leftovers() {
+    extern FILE *g_dbglog;
+    int n = 0;
+    for (size_t i = 0; i < g_sprites.size(); i++) {
+        Sprite3DS *s = g_sprites[i];
+        if (!s || s->disposed || !s->visible) continue;
+        /* [v7 2026-07-11] assinatura PRECISA dos paineis do titulo vazados:
+         * viewport de topo (vp_z>=99990) + z proprio 990..99989. Exclui
+         * janelas de mensagem (sem viewport, z=99999) e databoxes (z<990).
+         * Necessario porque o sweep passou a correr em TODAS as entradas de
+         * mapa (createSpritesets) — o gancho antigo (scene loop) nunca
+         * disparava fora de batalha e os paineis ficavam vivos a sessao
+         * toda (linear 9.6MB->0.7MB no log 14:12 = chao sem memoria p/
+         * compor -> preto). */
+        if (s->has_vp && s->vp_z >= 99990 && s->z >= 990 && s->z <= 99989) {
+            s->visible = false; n++;
+            /* [TITLE-SWEEP v6 2026-07-11] esconder nao chegava: os bitmaps dos
+             * paineis vazados ficavam VIVOS (pixels+textura) = MBs de linear
+             * presos a sessao toda -> o mapa entrava ja com <1MB livre e o
+             * chao ficava preto (log 13:53). Despojar liberta a RAM; o sprite
+             * fica husk invisivel (todas as guardas !pixels cobrem). */
+            if (s->bitmap) mkxp_bitmap_strip(s->bitmap);
+        }
+    }
+    if (g_dbglog && n > 0) {
+        fprintf(g_dbglog, "[TITLE-SWEEP] WARNING %d sprites z>=990 do titulo escondidos ao sair do Scene_Intro\n", n);
+        fflush(g_dbglog);
+    }
+}
+
 void sprites_dump_frame(mrb_state *mrb, const char *motivo) {
     extern FILE *g_dbglog;
     if (!g_dbglog) return;
@@ -989,7 +1368,8 @@ static mrb_value spr_init(mrb_state *mrb, mrb_value self) {
     {
         static int s_spr_init_count = 0;
         s_spr_init_count++;
-        if (s_spr_init_count <= 10) {
+        extern bool g_log_verbose;
+        if (g_log_verbose && s_spr_init_count <= 10) {
             extern FILE *g_dbglog;
             if (g_dbglog) {
                 fprintf(g_dbglog,
@@ -1029,13 +1409,72 @@ static Bitmap3DS *resolve_bitmap(mrb_state *mrb, mrb_value bobj);   /* fwd (defi
 struct CBRect { int x, y, w, h; };
 struct CBTone { float r, g, b, gray; };
 
+/* ═══ [PRIOSYNC 2026-07-05] Sprite.__mkxp_prio_sync — sync x/y/z dos sprites de
+ * priotiles do CustomTilemap numa UNICA chamada por frame. O refresh do 075
+ * rechamava addTile por celula (~66-74) em TODOS os frames com camara a mexer:
+ * ~8-10 dispatches por sprite (visible=,x=,y=,tone=,color=,bitmap,src,z=) + 1
+ * funcall try_get — o grosso dos 571-784 setters/frame medidos. Entre
+ * fronteiras de tile, so' x/y/z mudam e sao funcao pura de (tx,ty,prio,ox,oy,
+ * bridge). data: 5 fixnums/sprite [tx,ty,refl,brdg,pri]. z = formula EXATA de
+ * addTile: refl->-100; bridge&&brdg->1; pri==0->0; senao ypos+pri*32+32.
+ * mode 2 = verify (compara com o que o vanilla escreveu, nao altera).
+ * false a qualquer anomalia -> o seam cai no refresh vanilla. */
+/* [TILESET-BATCH 2026-07-05] Sprite#__mkxp_tile_set(visible, x, y, z) — os 4
+ * setters do addTile num dispatch (o slow-frame do refresh fazia ~100 sprites
+ * x 4 setters so' nisto). Escreve direto na struct. */
+static mrb_value spr_tile_set(mrb_state *mrb, mrb_value self) {
+    mrb_bool vis; mrb_int x, y, z;
+    mrb_get_args(mrb, "biii", &vis, &x, &y, &z);
+    Sprite3DS *s = GET_SPR(self);
+    if (s) { s->visible = vis; s->x = (int)x; s->y = (int)y; s->z = (int)z; }
+    return self;
+}
+
+static mrb_value spr_prio_sync(mrb_state *mrb, mrb_value) {
+    mrb_value sprs, data; mrb_int ox, oy, tw, th, mode = 1; mrb_bool bridge;
+    mrb_get_args(mrb, "AAiiiib|i", &sprs, &data, &ox, &oy, &tw, &th, &bridge, &mode);
+    mrb_int n = RARRAY_LEN(sprs);
+    if (RARRAY_LEN(data) != n * 5) return mrb_false_value();
+    for (mrb_int i = 0; i < n; i++) {
+        mrb_value so = mrb_ary_ref(mrb, sprs, i);
+        if (mrb_type(so) != MRB_TT_DATA || DATA_TYPE(so) != &Sprite3DSType)
+            return mrb_false_value();
+        Sprite3DS *s = GET_SPR(so);
+        if (!s || s->disposed) return mrb_false_value();
+        long v[5];
+        for (int k = 0; k < 5; k++) {
+            mrb_value e = mrb_ary_ref(mrb, data, i*5 + k);
+            if (!mrb_fixnum_p(e)) return mrb_false_value();
+            v[k] = (long)mrb_fixnum(e);
+        }
+        int xpos = (int)(v[0]*tw - ox), ypos = (int)(v[1]*th - oy);
+        int z = v[2] ? -100 : (bridge && v[3]) ? 1
+              : (v[4] == 0) ? 0 : (int)(ypos + v[4]*32 + 32);
+        if (mode == 2) {
+            static unsigned long ps_cmp = 0, ps_diff = 0; ps_cmp++;
+            if (s->x != xpos || s->y != ypos || s->z != z) {
+                ps_diff++;
+                if (g_dbglog && ps_diff <= 40) { fprintf(g_dbglog,
+                    "[PRIOSYNC|DIFF] i=%ld got=(%d,%d,%d) exp=(%d,%d,%d)\n",
+                    (long)i, s->x, s->y, s->z, xpos, ypos, z); dbg_flush(); }
+            }
+            if (g_dbglog && (ps_cmp % 2000) == 1) { fprintf(g_dbglog,
+                "[PRIOSYNC|COBERTURA] cmp=%lu diff=%lu\n", ps_cmp, ps_diff); dbg_flush(); }
+        } else {
+            s->x = xpos; s->y = ypos; s->z = z;
+        }
+    }
+    return mrb_true_value();
+}
+
 static mrb_value spr_char_batch(mrb_state *mrb, mrb_value self) {
     mrb_int mode = 1;
     mrb_get_args(mrb, "|i", &mode);
     /* [FUNIL 2026-07-04] histograma de desqualificacao por __LINE__ (verify):
      * cobertura=0 sem isto era indiagnosticavel. Log 1x/900 entradas. */
     static unsigned long cbq_line[16], cbq_cnt[16]; static unsigned long cbq_in = 0;
-    if ((++cbq_in % 900) == 0) {     /* [2026-07-04e] funil tambem em modo 1 (a rua desqualifica muito) */
+    extern bool g_log_verbose;
+    if (g_log_verbose && (++cbq_in % 900) == 0) {     /* [2026-07-04e] funil tambem em modo 1 (a rua desqualifica muito) */
         extern FILE *g_dbglog;
         if (g_dbglog) {
             fprintf(g_dbglog, "[CHARBATCH|FUNIL] entradas=%lu |", cbq_in);
@@ -1091,11 +1530,15 @@ static mrb_value spr_char_batch(mrb_state *mrb, mrb_value self) {
     if (mrb_nil_p(ch) || mrb_type(ch) != MRB_TT_OBJECT) CB_FAIL0();
 
     /* gate L95 (ANTES do super, como o vanilla): Game_Event (is_a?, inclui
-     * subclasses) com @to_update falso -> return imediato */
+     * subclasses) com @to_update falso -> return imediato.
+     * [POPIN-FIX 2026-07-05] EXCECAO: sprite ainda SEM bitmap = nunca fez o 1o
+     * update (o gate por-distancia impedia o carregamento do charset/tile ->
+     * portas/NPCs "apareciam" so' ao chegar perto; no PC o ecra maior escondia).
+     * Deixa-se o 1o update correr (carrega o bitmap 1x); depois o gate volta. */
     struct RClass *ge_cls = mrb_class_defined(mrb, "Game_Event")
                           ? mrb_class_get(mrb, "Game_Event") : NULL;
     bool is_event = ge_cls && mrb_obj_is_kind_of(mrb, ch, ge_cls);
-    if (is_event && !mrb_test(mrb_iv_get(mrb, ch, sy_toupd)))
+    if (is_event && !mrb_test(mrb_iv_get(mrb, ch, sy_toupd)) && s->bitmap != NULL)
         return mrb_fixnum_value(2);
 
     /* ── DESQUALIFICADORES (qualquer um -> 0 = corpo vanilla) ─────────────── */
@@ -1654,9 +2097,10 @@ static mrb_value spr_set_bitmap(mrb_state *mrb, mrb_value self) {
         /* DIAGNÓSTICO: log nas primeiras 20 chamadas */
         static int s_set_bmp_count = 0;
         s_set_bmp_count++;
-        if (s_set_bmp_count <= 20) {
+        if (s_set_bmp_count <= 6) {   /* [LOG-LEAN] era 20 */
             extern FILE *g_dbglog;
-            if (g_dbglog) {
+            extern bool g_log_verbose;
+            if (g_log_verbose && g_dbglog) {
                 int tt = mrb_nil_p(bobj) ? -1 : (int)mrb_type(bobj);
                 void *dp = mrb_nil_p(bobj) ? nullptr : DATA_PTR(bobj);
                 fprintf(g_dbglog,
@@ -2030,6 +2474,9 @@ void spriteBindingInit(mrb_state *mrb) {
     /* [CHARBATCH] corpo nativo do Sprite_Character#update (caso comum); o seam
      * Ruby (injecao pos-scripts) decide off/on/verify via $MKXP_NATIVE_CHAR_BATCH */
     mrb_define_method(mrb, k, "__mkxp_char_batch", spr_char_batch, MRB_ARGS_OPT(1));
+    /* [PRIOSYNC] sync em lote dos priotiles (seam no CustomTilemap#refresh) */
+    mrb_define_class_method(mrb, k, "__mkxp_prio_sync", spr_prio_sync, MRB_ARGS_ARG(7,1));
+    mrb_define_method(mrb, k, "__mkxp_tile_set", spr_tile_set, MRB_ARGS_REQ(4));
 #define MP(n) \
     mrb_define_method(mrb, k, #n,    spr_get_##n, MRB_ARGS_NONE()); \
     mrb_define_method(mrb, k, #n"=", spr_set_##n, MRB_ARGS_REQ(1))

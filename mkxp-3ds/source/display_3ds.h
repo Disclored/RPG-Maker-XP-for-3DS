@@ -11,6 +11,10 @@ struct DS3Texture {
     bool    has_text = false;  /* DIAG/fix: bitmap de origem teve draw_text */
     unsigned pot_bytes = 0;    /* DIAG: bytes POT alocados (p/ contabilidade de heap) */
     bool    in_vram = false;   /* fix: textura alocada em VRAM (overflow do heap linear) */
+    bool    is_shared_atlas = false; /* [ATLAS-ETERNO] usa a g_atlas_tex partilhada
+                                        (criada no boot, 1024x1024): NUNCA fazer
+                                        C3D_TexDelete; o destroy so' liberta a
+                                        posse (g_atlas_tex_busy=false). */
     int     create_frame   = 0;  /* SUPER: frame em que foi criada (idade)        */
     int     last_blit_frame = -1; /* SUPER: ultimo frame em que foi desenhada (necessidade) */
     /* [EVICT] back-pointer para o campo 'tex' do Bitmap dono (ex: &b->tex).

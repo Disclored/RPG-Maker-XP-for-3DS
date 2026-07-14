@@ -409,8 +409,55 @@ static void dbglog_close() { if (g_dbglog) { fclose(g_dbglog); g_dbglog = NULL; 
 /* Escreve para consola E para ficheiro, com timestamp [t=...s d=...ms] no inicio
  * de cada linha. O timestamp permite ver exatamente quanto tempo cada passo do
  * boot/jogo demorou e apanhar gargalos (ex: 2-3 min num passo especifico). */
+/* [LIMPEZA 2026-07-05] espelha $MKXP_VERBOSE p/ o C poder suprimir os seus
+ * diagnosticos runtime periodicos (GFX|RENDER/SUPERDBG/HEARTBEAT/WD/CHARBATCH|FUNIL/
+ * GHOST-KILL/marshal-Table/load) sem ler uma global Ruby a cada frame. Set em
+ * MKXPDebug.log (que ja' le $MKXP_VERBOSE). Default false = silencio;
+ * $MKXP_VERBOSE=true reactiva tudo. */
+bool g_log_verbose = false;
+/* [BOOT-LEAN 2026-07-05] enquanto false, o boot mostra SO' plugins + GameData +
+ * erros (pedido do user). Vira true quando o scene loop arranca (set em
+ * MKXPDebug.log ao ver "entering scene loop"). Depois: filtro runtime normal. */
+bool g_boot_done = false;
+/* [PLUGIN-RETRY 2026-07-05] scripts de plugin (EBDX) que dao excecao na 1a
+ * execucao por ORDEM-DE-LOAD (alias :M_ebdx :M com M ainda nao definido). Sao
+ * coletados e RE-CORRIDOS depois de TODOS os plugins carregarem (M ja' existe). */
+#include <vector>
+#include <string>
+#include <utility>
+bool g_plugin_exec_failed = false;
+std::vector<std::pair<std::string, std::string>> g_plugin_retry;
+/* Blacklist de tags que passam pelo DBGLOG (teem [t=] stamp): marshal por-mapa
+ * (Table reconstruido/load OK/dump->port) enche o log em cada carregamento. */
+static inline bool dbg_fmt_suppressed(const char *fmt){
+    if (g_log_verbose || !fmt) return false;
+    static const char *BL[] = {
+        "[marshal] Table", "[marshal] load OK", "[marshal] dump->port",
+        "[PROFILE|marshal]", "[RXCACHE]",
+        /* confirmacoes de boot (uma vez cada; ruido quando o boot ja' e' estavel) */
+        "[SKIP-PATCH]", "[SCRIPTS]", "[RESCHECK]",
+        "[LOADORDER]", "[DISPLAY|BLACK]", "[DISPLAY|INIT]", "[BOOT]",
+        0
+    };
+    for (int i=0; BL[i]; i++) if (strstr(fmt, BL[i])) return true;
+    return false;
+}
+/* Durante o boot, suprime linhas C DIRETAS (nao-[MFD]) que nao sejam plugins/erros.
+ * As linhas [MFD] (MKXPDebug.log) sao filtradas la'; aqui so' tocamos nas C-puras
+ * (GFX|*, BMP|REINIT, etc.) que de outra forma sujavam o boot. */
+static inline bool dbg_boot_suppressed(const char *fmt){
+    if (g_log_verbose || !fmt) return false;
+    if (strncmp(fmt, "[MFD] ", 6) == 0) return false;   /* [MFD] filtrado em MKXPDebug.log */
+    /* erros passam sempre */
+    if (strstr(fmt,"FALH") || strstr(fmt,"ERRO") || strstr(fmt,"WARN") ||
+        strstr(fmt,"CRASH")) return false;
+    /* no boot tambem plugins + dados; em RUNTIME (overworld) NADA -> 0 escritas SD */
+    if (!g_boot_done && (strstr(fmt,"[PLUGINS]") || strstr(fmt,"[Game.init]"))) return false;
+    return true;
+}
 #define DBGLOG(fmt, ...) \
     do { \
+        if (dbg_fmt_suppressed(fmt) || dbg_boot_suppressed(fmt)) break; \
         double __ts_t, __ts_d; dbglog_stamp(&__ts_t, &__ts_d); \
         printf("[t=%8.3fs d=%7.1fms] " fmt, __ts_t, __ts_d, ##__VA_ARGS__); \
         if (g_dbglog) { fprintf(g_dbglog, "[t=%8.3fs d=%7.1fms] " fmt, __ts_t, __ts_d, ##__VA_ARGS__); \
@@ -742,6 +789,67 @@ static void replace_defined_keyword(char *buf, size_t len) {
     }
 }
 
+/* [DEFINED-RESCUE 2026-07-06] Variante IDEMPOTENTE de replace_defined_keyword.
+ * Em vez de trocar defined?(X) -> nil (que MATA o guard `unless defined?(X_ebdx)`
+ * -> o alias re-instala sempre -> com o PLUGIN-RETRY corre 2x -> ATAQUES/ITENS a
+ * duplicar), envolve cada `defined?(X)` em `(defined?(X) rescue nil)`. Assim:
+ *   - X indefinido e o defined? do mruby LEVANTA -> rescue -> nil (falsy) -> como
+ *     CRuby -> o alias instala na 1a passagem (batalha continua a funcionar);
+ *   - X JA' definido -> defined?(X) devolve "method"/"expression" (truthy) -> o
+ *     guard bloqueia a 2a instalacao no RETRY -> SEM duplicacao.
+ * Cresce o buffer (~13 chars por ocorrencia). So' apanha a forma com parenteses
+ * `defined?(` (igual ao original). Ignora ocorrencias em comentario de linha. */
+static void wrap_defined_rescue(std::vector<Bytef> &decomp) {
+    const char needle[] = "defined?(";
+    const size_t nlen = sizeof(needle) - 1;
+    const char *buf = (const char*)decomp.data();
+    const size_t len = decomp.size();
+    std::string out;
+    out.reserve(len + 128);
+    size_t i = 0;
+    while (i < len) {
+        if (i + nlen <= len && memcmp(buf + i, needle, nlen) == 0) {
+            /* FRONTEIRA DE PALAVRA: `defined?(` e' substring de `method_defined?(`,
+             * `const_defined?(`, `instance_method_defined?(`, etc. So' e' o KEYWORD
+             * `defined?` se o char anterior NAO for de identificador nem '.'. Sem isto,
+             * envolviamos o sufixo -> `self.method_(defined?(:x) rescue nil)` = SyntaxError. */
+            bool boundary = true;
+            if (i > 0) {
+                char pc = buf[i - 1];
+                if ((pc >= 'a' && pc <= 'z') || (pc >= 'A' && pc <= 'Z') ||
+                    (pc >= '0' && pc <= '9') || pc == '_' || pc == '.') boundary = false;
+            }
+            if (!boundary) { out += buf[i]; i++; continue; }
+            /* nao dentro de comentario de linha */
+            size_t ls = i;
+            while (ls > 0 && buf[ls - 1] != '\n') ls--;
+            bool in_comment = false;
+            for (size_t c = ls; c < i; c++) { if (buf[c] == '#') { in_comment = true; break; } }
+            if (!in_comment) {
+                /* fecha o parentesis correspondente */
+                size_t scan = i + nlen;
+                int depth = 1;
+                while (scan < len && depth > 0) {
+                    if      (buf[scan] == '(') depth++;
+                    else if (buf[scan] == ')') { depth--; if (depth == 0) break; }
+                    scan++;
+                }
+                if (depth == 0) {
+                    out += '(';
+                    out.append(buf + i, scan - i + 1);   /* "defined?(...)" */
+                    out += " rescue nil)";
+                    i = scan + 1;
+                    continue;
+                }
+            }
+        }
+        out += buf[i];
+        i++;
+    }
+    decomp.resize(out.size());
+    if (!out.empty()) memcpy(decomp.data(), out.data(), out.size());
+}
+
 /* =========================================================
  * PATCH SCRIPT
  * ========================================================= */
@@ -749,7 +857,16 @@ static void patch_script(std::vector<Bytef> &decomp, uLong dest_sz, const char *
     char *buf = (char*)decomp.data();
 
     if (strcmp(name, "PluginManager") == 0 ||
-        strcmp(name, "Intl_Messages") == 0 ||
+        // [BISSECAO 2026-07-09] Intl re-skip TESTADO: NAO e' o veneno (probe continuou
+        // morto) -> revertido; o INTL-UNSKIP fica ATIVO (nomes reais).
+        // [INTL-UNSKIP 2026-07-08] Intl_Messages DES-SKIPADO. O skip era a RAIZ dos
+        // nomes "0": este script define OrderedHash/MessageTypes/pbGetMessage --
+        // sem ele, o auto-stub devolvia 0 p/ pbGetMessage -> TODOS os nomes = "0"
+        // (+ cascata de tipos na batalha: Integer#force_encoding, Move_000).
+        // Compila LIMPO no mrbc host (Syntax OK, verificado 2026-07-08); sem codigo
+        // top-level (so' define classes/metodos; os regex pesados sao ferramentas de
+        // dev nunca chamadas em runtime). O messages.dat (400x 'Iu' OrderedHash)
+        // requer o [IU-USERDEF] no marshal.cpp (mesma data).
         strcmp(name, "Compiler") == 0 ||
         strcmp(name, "Compiler_CompilePBS") == 0 ||
         strcmp(name, "Compiler_WritePBS") == 0 ||
@@ -758,8 +875,11 @@ static void patch_script(std::vector<Bytef> &decomp, uLong dest_sz, const char *
         // Fix 5: script 191 depende do 189 que falhou
         strcmp(name, "AI_Move_EffectScores") == 0 ||
         strcmp(name, "AI_Move_EffectScores_Gen8") == 0 ||
-        // Fix 6: SyntaxError em Ruby nao suportado por mruby
-        strcmp(name, "EBDX Wrapper Compatibility") == 0 ||
+        // [UNSKIP 2026-07-09] "EBDX Wrapper Compatibility" DES-SKIPADO (GAP #3): o
+        // "SyntaxError" era FALSO (mrbc: Syntax OK — 3o caso do padrao, apos EBDX e
+        // Intl_Messages). E' o unico dono de EBDXBitmapWrapper -> sem ele, Pokedex/
+        // Sumario/PC usam sprites errados/crasham. Top-level: PluginManager.register
+        // (stub do motor L~2226 ✓) + Essentials::ERROR_TEXT (001 nao-skipado ✓).
         // [SAVE-VALUES-FIX 2026-07-03] Game_SaveValues DES-SKIPPADO: o skip antigo
         // ("apenas registam campos de save; nao necessarios p/ boot") era A RAIZ dos
         // saves de 101 bytes -- sem os 15 registos core (player/switches/map_factory/
@@ -768,9 +888,18 @@ static void patch_script(std::vector<Bytef> &decomp, uLong dest_sz, const char *
         // register ja' nao se reproduz (mruby/ambiente amadureceu); validado por
         // self-run (SELFTEST agora conta os valores registados).
         strcmp(name, "Game_SaveConversions") == 0 ||
-        // Fix 6: deprecated_method_alias / deprecate_constant nao existem em mruby
+        // [RE-SKIP 2026-07-09 BISSECAO] os 2 Deprecated ERRAM no load (egg?/full_name
+        // "nao definidos" — sub-misterio) e sao o suspeito nº1 de envenenar a VM p/
+        // os mrb_load_string seguintes (probe morto). Re-skipados ate resolver o
+        // sub-misterio; o EBDX Wrapper Compat (carrega limpo) fica des-skipado.
         strcmp(name, "Player_Deprecated") == 0 ||
         strcmp(name, "Pokemon_Deprecated") == 0 ||
+        // [UNSKIP 2026-07-09] (histórico) Player/Pokemon_Deprecated (GAP #2):
+        // deprecated_method_alias EXISTE (016_Deprecation, nao-skipado, kwargs OK em
+        // mruby 3.2; mrbc: Syntax OK em ambos). deprecate_constant era o que faltava
+        // -> stub no-op no PRE-FIX (Module#deprecate_constant). Sem estes scripts,
+        // pbGenPkmn crashava Mystery Gift/Rotom e pbHasSpecies?/pbHasType? (auto-stub
+        // 0) tornavam 3 paginas de evento SEMPRE-ATIVAS.
         // Fix 7: Sprite_DynamicShadows usa APIs graficas avancadas nao suportadas
         strcmp(name, "Sprite_DynamicShadows") == 0 ||
         // Fix 8 REVERTIDO: apagar o script inteiro tirava o addEvent REAL (com push),
@@ -1112,7 +1241,31 @@ mrb_define_module_function(mrb, dbg_mod, "log",
                 mrb_value v = mrb_gv_get(mrb, mrb_intern_lit(mrb, "$MKXP_VERBOSE"));
                 verbose = mrb_test(v);
             }
-            if (!verbose && s) {
+            g_log_verbose = verbose;   /* espelha p/ os diagnosticos C-puros runtime */
+            { /* [BLITDIAG] switch runtime p/ o diagnostico GPU dos battlers */
+              extern bool g_blitdiag;
+              mrb_value bd = mrb_gv_get(mrb, mrb_intern_lit(mrb, "$MKXP_BLITDIAG"));
+              g_blitdiag = mrb_test(bd); }
+            extern bool g_boot_done;
+            if (s && !g_boot_done && (strstr(s, "entering scene loop") ||
+                                      strstr(s, "scene.main start") ||
+                                      strstr(s, "step8 done")))
+                g_boot_done = true;
+            /* [BOOT-LEAN] durante o boot mostra SO' o carregamento de dados
+             * ([Game.init]/GameData) + erros; os fixes/steps sao suprimidos.
+             * (Os plugins vem por DBGLOG/C, tratados a' parte.) */
+            if (!verbose && s && !g_boot_done) {
+                if (!(strstr(s,"[Game.init]") || strstr(s,"FALH") ||
+                      strstr(s,"ERRO") || strstr(s,"WARNING")))
+                    return mrb_nil_value();
+            }
+            if (!verbose && s && g_boot_done) {
+                /* [OVERWORLD-SILENT 2026-07-05] pedido do user: 0 escritas no SD
+                 * durante a jogatina. Em runtime so' passam ERROS/crashes. Reativar
+                 * o resto: $MKXP_VERBOSE=true. */
+                if (!(strstr(s,"FALH")||strstr(s,"ERRO")||strstr(s,"WARNING")||
+                      strstr(s,"CRASH")||strstr(s,"Exception")||strstr(s,"crash")))
+                    return mrb_nil_value();
                 /* prefixos de alta-frequencia a suprimir quando NAO-verbose.
                  * Estes probes correm por-frame/por-redraw e cada linha escreve
                  * ao SD (~ms). Sao SO diagnostico -> suprimidos por defeito agora
@@ -1125,6 +1278,19 @@ mrb_define_module_function(mrb, dbg_mod, "log",
                     "[WSKIN-PROBE", "[CFIX", "[CORNERFIX", "[BACKFILL", "[BOXFIT",
                     "[PLANE-DIAG", "[MAPDUMP", "[MEVENT", "[SEQ>", "[TSTAT",
                     "[SHEET?", "[CARTAO", "[SPRGUARD", "[DEPGUARD",
+                    /* [LIMPEZA 2026-07-05] diagnosticos de bugs JA' RESOLVIDOS ou
+                     * profilers granulares -- so' ruido/escrita-SD agora. Reativar
+                     * TUDO com $MKXP_VERBOSE=true. MANTIDOS: [FPS], [FPSPROBE],
+                     * [DIAG-PERF], [POKEDBG], [NESTED-AUTODEF], [SAVE-REPAIR],
+                     * [GHOST-KILL], [ITEMNAME-FIX] e erros. */
+                    "[ARVDBG", "[GILBERTDIAG", "[SAPDBG", "[SUPERDBG",
+                    "[RUBYPROF", "[VWPATH", "[TILEPROF", "[PERF-RESTO",
+                    "[PBMSG", "[OUTFITDIAG", "[PBCMW", "[GIF-FIX",
+                    "[CHURN", "[HEARTBEAT", "[NAMEIN", "[TILEANIM",
+                    "[SPR|DUMP", "[SPR|SET_BMP", "[SPR|INIT",
+                    "[J3]", "[BMP|WSKIN-TRUST", "[EBDXPROF",
+                    "[MISSING_PATCH", "[PATCH", "[WSKIN", "[BMP|FULLPATH",
+                    "[MISSING-TOP", "[DIAG-SPRITE0", "[FIX-GRELHA7",
                     NULL
                 };
                 for (int i = 0; noisy[i]; i++) {
@@ -1133,11 +1299,50 @@ mrb_define_module_function(mrb, dbg_mod, "log",
                         return mrb_nil_value();   /* suprimido */
                     }
                 }
+                /* [LIMPEZA 2026-07-05] confirmacoes de instalacao de fixes no boot
+                 * ("...  OK", "... instalad*", "... adicionad*") -- uma vez cada,
+                 * so' ruido quando o boot ja' e' estavel. $MKXP_VERBOSE=true reactiva. */
+                size_t sl = strlen(s);
+                if (sl >= 3 && s[sl-1]=='K' && s[sl-2]=='O' && s[sl-3]==' ')
+                    return mrb_nil_value();
+                if (strstr(s, " instalad") || strstr(s, " adicionad"))
+                    return mrb_nil_value();
             }
             DBGLOG("[MFD] %s\n", s);
         }
         return mrb_nil_value();
     }, MRB_ARGS_REQ(1));
+
+    /* [BATTLER-MARK] o probe marca os sprites-battler (identificacao deterministica) */
+    mrb_define_module_function(mrb, dbg_mod, "mark_battler",
+        [](mrb_state *mrb, mrb_value) -> mrb_value {
+            mrb_value sp; mrb_get_args(mrb, "o", &sp);
+            if (mrb_type(sp) == MRB_TT_DATA || mrb_type(sp) == MRB_TT_OBJECT) {
+                Sprite3DS *s = (Sprite3DS*)DATA_PTR(sp);
+                if (s) s->is_battler = true;
+            }
+            return mrb_nil_value();
+        }, MRB_ARGS_REQ(1));
+
+    /* [PLANE-WRAP] o stub Ruby do Plane marca o seu sprite interno -> o blit
+     * final tila o bitmap pelo ecra (fog/panorama com wrap RGSS). */
+    mrb_define_module_function(mrb, dbg_mod, "mark_plane",
+        [](mrb_state *mrb, mrb_value) -> mrb_value {
+            mrb_value sp; mrb_get_args(mrb, "o", &sp);
+            if (mrb_type(sp) == MRB_TT_DATA || mrb_type(sp) == MRB_TT_OBJECT) {
+                Sprite3DS *s = (Sprite3DS*)DATA_PTR(sp);
+                if (s) s->is_plane = true;
+            }
+            return mrb_nil_value();
+        }, MRB_ARGS_REQ(1));
+
+    /* [TITLE-SWEEP] esconder os paineis do titulo (z>=990) ao sair do Scene_Intro */
+    mrb_define_module_function(mrb, dbg_mod, "sweep_title",
+        [](mrb_state*, mrb_value) -> mrb_value {
+            extern void sprites_sweep_title_leftovers();
+            sprites_sweep_title_leftovers();
+            return mrb_nil_value();
+        }, MRB_ARGS_NONE());
 
     /* ── [SUPERDBG] MKXPDebug.mem_info -> string com a fotografia da memoria ────
      * Linear livre (decodes de tilesets), heap malloc (livre/usado via mallinfo),
@@ -1885,14 +2090,51 @@ begin
   end
 rescue; end
 
-# -- pbDayNightTint override pos-scripts ---------------------------------------
-# Neutralizar completamente -- precisa de Bitmap/Tone reais para funcionar.
-# Definir aqui (pos-scripts) garante override mesmo que algum script o redefina.
+# -- [DAYNIGHT 2026-07-11] pbDayNightTint com cache por-frame (pos-scripts) -----
+# ANTES: no-op total ("precisa de Bitmap/Tone reais") -> dia/noite MORTO em todo
+# o jogo. A justificacao caducou: o [SPRFX] aplica sprite.tone no blit e o
+# [TONE-DUAL] le Tone Ruby-puro -> a cadeia inteira funciona:
+#   pbDayNightTint(self) por sprite (061:154) + pbDayNightTint(@tilemap) (066:79)
+#   -> tone.set barato; CustomTilemap propaga @tone as suas sprites (075:973-979)
+#   -> SPRFX tinge personagens E chao. O calculo caro (MapMetadata/getTone) e'
+# feito UMA vez por frame ($__dnt_frame) e o CHARBATCH ja consome $__dnt_tone
+# nativamente no fast-path. Kill-switch sem rebuild: $MKXP_DAYNIGHT=false.
 begin
-  def pbDayNightTint(sprite); end
-  module Kernel
-    def pbDayNightTint(sprite); end
-    module_function :pbDayNightTint
+  unless $__dnt_installed
+    $__dnt_installed = true
+    $__dnt_frame = -1
+    $__dnt_apply = false
+    $__dnt_tone  = nil
+    def pbDayNightTint(object)
+      return if $MKXP_DAYNIGHT == false
+      return if !$scene.is_a?(Scene_Map)
+      fc = (Graphics.frame_count rescue 0)
+      if fc != $__dnt_frame
+        $__dnt_frame = fc
+        begin
+          if (Settings::TIME_SHADING && $PokemonSystem.daytone == 0) &&
+             GameData::MapMetadata.exists?($game_map.map_id) &&
+             GameData::MapMetadata.get($game_map.map_id).outdoor_map
+            t = PBDayNight.getTone
+            $__dnt_tone  = [t.red, t.green, t.blue, t.gray]
+            $__dnt_apply = true
+          else
+            $__dnt_apply = false
+          end
+        rescue
+          $__dnt_apply = false
+        end
+      end
+      begin
+        if $__dnt_apply && $__dnt_tone
+          object.tone.set($__dnt_tone[0], $__dnt_tone[1], $__dnt_tone[2], $__dnt_tone[3])
+        else
+          object.tone.set(0, 0, 0, 0)
+        end
+      rescue
+      end
+    end
+    (MKXPDebug.log("[DAYNIGHT] pbDayNightTint cache reativado (era no-op)") rescue nil)
   end
 rescue; end
 
@@ -2034,15 +2276,44 @@ begin
         @__mkxp_hasanim = false
         fc = @framecount
         if fc.is_a?(Array)
+          anim = [false, false, false, false, false, false, false]
+          any = false
           i = 0
           while i < 7
-            if fc[i] && fc[i] >= 2 ; @__mkxp_hasanim = true ; break ; end
+            if fc[i] && fc[i] >= 2 ; anim[i] = true ; any = true ; end
             i += 1
+          end
+          if any
+            # [TILEANIM v2 2026-07-11] o gate por-TILESET era quase morto: o
+            # 'Gen4 Interior' (236 mapas) tem o autotile 'Calm Water2' animado,
+            # logo hasanim=true e TODOS os interiores repintavam o chao por
+            # frame (~40ms) sem agua nenhuma colocada. Agora verificamos se
+            # algum autotile ANIMADO esta' COLOCADO nos dados DESTE mapa:
+            # 1 passagem com early-exit (mapas com agua saem nos primeiros
+            # tiles; custo unico no load). ids de autotile: 48..383, slot
+            # = (id/48)-1. Fallback conservador: qualquer duvida -> true.
+            begin
+              raw = @map.data.instance_variable_get(:@data)
+              if raw.is_a?(Array)
+                raw.each do |t|
+                  next if !t.is_a?(Integer) || t < 48 || t >= 384
+                  s = (t / 48) - 1
+                  if s >= 0 && s < 7 && anim[s]
+                    @__mkxp_hasanim = true
+                    break
+                  end
+                end
+              else
+                @__mkxp_hasanim = true
+              end
+            rescue
+              @__mkxp_hasanim = true
+            end
           end
         else
           @__mkxp_hasanim = true   # sem info -> nao arriscar, deixa correr o original
         end
-        (MKXPDebug.log("[TILEANIM] mapa hasanim=#{@__mkxp_hasanim} framecount=#{fc.inspect[0,40]}") rescue nil)
+        (MKXPDebug.log("[TILEANIM v2] mapa hasanim=#{@__mkxp_hasanim}") rescue nil)
       end
 
       alias_method :__mkxp_orig_repaintAutotiles, :repaintAutotiles
@@ -2072,7 +2343,32 @@ module PluginManager
   def self.installed?(name); false; end
   def self.checkDependencies; end
   def self.requiredVersion(name, ver); end
+  def self.version(name); "1.0"; end   # [EBDX-SETUP] plugins interpolam em strings
+  def self.plugins; []; end            # [P5] ecra de creditos itera os plugins
 end
+
+# [P5 AI-SHIM 2026-07-10] o script AI (189, Gen8) esta' SKIPADO -> a IA da
+# batalha chama pbGetMoveScoreFunctionCode e caia no auto-stub (0-truthy
+# imprevisivel). Definir so' se nao existir (sonda por alias em begin/rescue --
+# NUNCA respond_to?, o method_missing universal mente).
+begin
+  alias __mkxp_probe_pgmsfc pbGetMoveScoreFunctionCode
+rescue NameError
+  def pbGetMoveScoreFunctionCode(*a); 0; end
+  (MKXPDebug.log("[AI-SHIM] pbGetMoveScoreFunctionCode -> 0 (script AI skipado)") rescue nil)
+end
+
+# [NAMEIN-HARD 2026-07-11] o default do jogo e' textinput=1 (teclado fisico,
+# 284_UI_Options:47) e o dispatch (0094:795) abriria PokemonEntryScene com
+# Input.text_input, que NAO existe no 3DS -> soft-lock no 1o nickname. Forcar o
+# getter a 0 = cena por grelha de setas (Window_CharacterEntry, input nativo).
+# Complementa o [NAMEIN] USEKEYBOARD=false; a opcao no menu Options fica inerte
+# (correto num handheld sem teclado).
+begin
+  class PokemonSystem
+    def textinput; 0; end
+  end
+rescue; end
 
 module Compiler
   def self.main; end
@@ -2132,6 +2428,92 @@ module Game
     rescue => e
       dbg "[Game.init] GameData.load_all geral: #{e.message}"
     end
+    # ---- [EBDX-SETUP v2 2026-07-10] RAIZ da batalha vazia ----
+    # O EBDX pendura o seu setupData (que executa os blocos configProcess a
+    # carregar TODOS os .ebdx: metrics=vetores de camara, ui=databoxes,
+    # maps=cenarios, animationmap=animacoes de ataque, pokemon/trainers/rules)
+    # num alias de Game.initialize (0062_EBDX_Setup:87-104). Este Game.initialize
+    # do motor SUBSTITUI esse wrapper (e carregado depois dos plugins), logo os
+    # blocos NUNCA corriam. Executamos os blocos aqui, um-a-um, na MESMA posicao
+    # do fluxo Essentials real (logo apos o GameData carregar).
+    # v2 (provado no log do user 2026-07-10 21:13):
+    #  (a) @compiled=true ANTES dos blocos. O add_data (0061:279) tem o desvio
+    #      "if !@compiled && $DEBUG -> @cachedData.push; return" que CACHEIA em
+    #      vez de processar; so o Compiler real poe @compiled=true (0060:66) e
+    #      esse nunca corre no port -> NADA era processado (pokemon/trainers/
+    #      ui/environments vazios = sem sprites/cenario/nomes na batalha,
+    #      apesar dos vetores OK -- add_vector nao passa pelo add_data).
+    #      Os .ebdx JA SAO os dados compilados -> compiled=true e' a verdade.
+    #  (b) NAO chamar CompilerEBDX.addFromCached: itera @cachedData enquanto o
+    #      add_data (ainda !@compiled) re-push no MESMO array -> loop infinito
+    #      -> "array size too big" (t=11.5s) -> array gigante vivo ->
+    #      NoMemoryError (t=24.8s) -> restart do jogo. Com (a) nada e' cacheado.
+    #  (c) guarda run-once $__ebdx_setup_done: o mainFunctionDebug reinicia o
+    #      jogo apos crash e re-chama Game.initialize -> sem guarda os blocos
+    #      re-corriam (e no log falharam os 6 que usam add_data).
+    #      instance_variable_set direto: o set() do EBDX passa por parse() que
+    #      usa eval("defined?(@x)") -- nao-fiavel no mruby.
+    # [EBDX-DEFER 2026-07-11 — leitura integral do log 739 linhas] o setup EBDX
+    # (9.6s, ~6MB de objetos residentes) corria AQUI (boot, t=18s) e enchia o
+    # malloc ANTES do titulo -> os paineis do titulo (11MB) iam TODOS para o
+    # linear -> ao chegar ao mapa restavam ~200KB -> nem os buffers de leitura
+    # dos tilesets (231KB) cabiam -> NCACHE -> mapa preto/magenta. Os dados
+    # EBDX so' sao precisos NA BATALHA -> diferir para a entrada no 1o mapa
+    # (createSpritesets, pos-titulo e pos-sweep): o titulo corre com malloc
+    # LIVRE, os paineis vao p/ malloc, o linear sobrevive p/ os tilesets.
+    # $MKXP_EBDX_EAGER=true reverte para o comportamento antigo.
+    $__ebdx_setup_pending = true
+    $__mkxp_ebdx_setup = lambda do
+      next if $__ebdx_setup_done
+      begin
+      if Object.const_defined?(:EliteBattle)
+        if false
+          nil
+        else
+          EliteBattle.instance_variable_set(:@compiled, true)
+          EliteBattle.instance_variable_set(:@cachedData, [])
+          __cfg = (EliteBattle.class_variable_get(:@@configData) rescue nil)
+          if __cfg.is_a?(Hash)
+            __ok = []; __bad = []
+            __cfg.keys.each do |k|
+              begin
+                __cfg[k].call
+                __ok.push(k)
+              rescue => e
+                __bad.push(k)
+                dbg "[Game.init][EBDX-SETUP] bloco #{k} FALHOU: #{e.class}: #{e.message}"
+              end
+            end
+            $__ebdx_setup_done = true
+            dbg "[Game.init][EBDX-SETUP] blocos OK=#{__ok.inspect} FALH=#{__bad.inspect}"
+            begin
+              __vk = EliteBattle.instance_variable_get(:@vectors)
+              dbg "[Game.init][EBDX-SETUP] vetores registados: #{__vk.is_a?(Hash) ? __vk.keys.inspect : __vk.inspect}"
+            rescue => e
+              dbg "[Game.init][EBDX-SETUP] leitura vetores: #{e.message}"
+            end
+            # prova de que o add_data PROCESSOU (na v1 cacheava e ficava tudo 0)
+            begin
+              __pd = EliteBattle.instance_variable_get(:@pokemonData)
+              __td = EliteBattle.instance_variable_get(:@trainerData)
+              __md = EliteBattle.instance_variable_get(:@mapData)
+              __cc = EliteBattle.instance_variable_get(:@cachedData)
+              dbg "[Game.init][EBDX-SETUP] dados processados: pokemon=#{__pd.is_a?(Hash) ? __pd.size : __pd.class} trainers=#{__td.is_a?(Hash) ? __td.size : __td.class} maps=#{__md.is_a?(Hash) ? __md.size : __md.class} cache_residual=#{__cc.is_a?(Array) ? __cc.size : __cc.class}"
+            rescue => e
+              dbg "[Game.init][EBDX-SETUP] leitura dados: #{e.message}"
+            end
+          else
+            dbg "[Game.init][EBDX-SETUP] @@configData ausente (#{__cfg.class}) -- EBDX sem blocos?"
+          end
+        end
+      end
+      $__ebdx_setup_pending = false
+      rescue => e
+        dbg "[EBDX-SETUP] geral: #{e.class}: #{e.message}"
+      end
+    end
+    # boot: so' corre ja' se o utilizador pedir explicitamente
+    $__mkxp_ebdx_setup.call if $MKXP_EBDX_EAGER == true
     # ---- #7 GPS-FIX: get_player robusto, AGORA que GameData::Metadata.load correu ----
     # O picker "what picture you'd like to use?" constroi o caminho da imagem a
     # partir de GameData::Metadata.get_player(i)[0], que DEVIA ser o simbolo do
@@ -3890,6 +4272,20 @@ begin
             @bitmap = BitmapWrapper.new(32, 32)
           end
         end
+        # [CACHE-SAFE-DISPOSE 2026-07-05] RAIZ do "Gilbert invisivel na costura"
+        # (provada pelo XRAY: bmp 256x256 -> DISPOSED apos DES#refresh):
+        # @bitmap vem DIRETO da RPG::Cache (partilhado por todos os sprites com o
+        # mesmo charset); o dispose original fazia @bitmap.dispose -> matava o
+        # bitmap NA CACHE -> o proximo pbGetCharset devolvia o cadaver e TODOS os
+        # sprites desse charset ficavam invisiveis p/ sempre. No RGSS real o
+        # AnimatedBitmap e' wrapper por-sprite; aqui o dispose passa a marcar
+        # apenas. (Os raros fallbacks BitmapWrapper diretos ficam para o GC.)
+        def dispose
+          @disposed = true
+        end
+        def disposed?
+          @disposed ? true : false
+        end
       end
     end
     dbg "[GIF-FIX] GifBitmap#initialize envolvido (diagnostico+fallback directo)"
@@ -4497,6 +4893,59 @@ begin
         def createSpritesets
           dbg "[createSpritesets] $MapFactory=#{$MapFactory.nil? ? 'NIL' : $MapFactory.class}"
           dbg "[createSpritesets] $game_map=#{$game_map.nil? ? 'NIL' : $game_map.class}"
+          # ===== [EBDX-DEFER] carregar dados de batalha AGORA (pos-titulo) =====
+          ($__mkxp_ebdx_setup.call rescue nil) if $__ebdx_setup_pending && !$__ebdx_setup_done && $__mkxp_ebdx_setup
+          # ===== [TITLE-SWEEP v7 2026-07-11] despojar paineis do titulo AQUI =====
+          # O gancho antigo (scene loop pos Scene_Intro) NUNCA dispara no fluxo
+          # real; createSpritesets corre em TODAS as entradas de mapa. O sweep
+          # esconde+DESPOJA (pixels+tex) so' sprites com a assinatura dos
+          # paineis (viewport>=99990 e z 990..99989) — liberta os MBs que
+          # afogavam a composicao do chao. Idempotente e barato (so' varre).
+          (MKXPDebug.sweep_title rescue nil)
+          # ===== [TSCACHE-EVICT 2026-07-11] RAM: despejar tilesets GIGANTES =====
+          # O RPG::Cache guarda cada tileset para sempre -> apos 3 mapas havia
+          # 3 gigantes residentes (Interior+Outside+Route = ~30MB = 47% da RAM
+          # total!) e o linear morria (battlers sem textura, atlas furado).
+          # Na (re)construcao dos spritesets: manter SO' os tilesets dos mapas
+          # ATUAIS do factory; dispor os restantes >=2M px (so' gigantes; os
+          # pequenos nao pesam e beneficiam do cache). O proximo uso re-carrega
+          # do SD (~0.5s) -- raro (so' ao voltar a uma zona antiga).
+          begin
+            __keep = {}
+            begin
+              if $MapFactory && $MapFactory.respond_to?(:maps)
+                $MapFactory.maps.each do |gm|
+                  tn = (gm.tileset_name.to_s rescue "")
+                  __keep["Graphics/Tilesets/" + tn] = true unless tn.empty?
+                end
+              end
+            rescue; end
+            begin
+              tn = ($game_map.tileset_name.to_s rescue "")
+              __keep["Graphics/Tilesets/" + tn] = true unless tn.empty?
+            rescue; end
+            __cc = (RPG::Cache.instance_variable_get(:@cache) rescue nil)
+            if __cc.is_a?(Hash) && !__keep.empty?
+              __cc.keys.each do |k|
+                ks = (k.is_a?(Array) ? k[0].to_s : k.to_s) rescue next
+                next unless ks.include?("Tilesets/")
+                next if __keep[ks]
+                b = __cc[k]
+                next if b.nil?
+                bw = (b.width rescue 0); bh = (b.height rescue 0)
+                next if bw * bh < 2_000_000
+                # [v2 2026-07-11] NAO dispor: o CustomTilemap pode ainda usar
+                # este bitmap como fonte do compose (dispor deixava o chao
+                # PRETO permanente). Basta soltar a referencia do cache — a
+                # memoria e' recuperada pelo GIANT-LRU do motor (por recencia
+                # de leitura) ou pelo GC quando o spriteset largar a dele.
+                __cc.delete(k)
+                dbg "[TSCACHE-EVICT v2] ref de cache do tileset '#{ks}' (#{bw}x#{bh}) solta"
+              end
+            end
+          rescue => _ete
+            dbg "[TSCACHE-EVICT] falhou: #{_ete.class}: #{_ete.message}"
+          end
           # ===== FIX ECRA PRETO (entrar mapa ligado c/ tileset vizinho falhado) =====
           # O wrapper INTERNO do porte (__orig_update_3ds__) foi instalado no BOOT,
           # ANTES dos plugins. O Following Pokemon EX / EBDX embrulham
@@ -5384,14 +5833,13 @@ begin
       end
       return BitmapWrapper.new(96, 128)
     end
-    dbg "[BMP] pbGetAutotile: tentando 'Graphics/Autotiles/#{name}'"
+    # [LOG-LEAN] "tentando/resultado" por-autotile removido (2 linhas x ~8/mapa)
     begin
       bm = BitmapWrapper.new("Graphics/Autotiles/#{name}")
     rescue => e
-      dbg "[BMP] pbGetAutotile ERRO: #{e.class}: #{e.message}"
+      dbg "[BMP] pbGetAutotile ERRO: #{e.class}: #{e.message}"   # KEEP: erro
       bm = BitmapWrapper.new(96, 128)
     end
-    dbg "[BMP] pbGetAutotile('#{name}') -> #{bm.width rescue '?'}x#{bm.height rescue '?'}"
     bm
   end
   module Kernel
@@ -5575,14 +6023,39 @@ begin
             begin
               bt = scene_err.backtrace
               if bt && bt.is_a?(Array)
-                bt[0, 12].each_with_index { |l, i| dbg "[MFD]  bt[#{i}]: #{l}" }
+                bt[0, 12].each_with_index { |l, i| dbg "[MFD] WARNING bt[#{i}]: #{l}" }
               end
             rescue; end
+            # [INTRO-LEAK-FIX 2026-07-10] o crash salta o disposeTitle -> os paineis
+            # do titulo (328x192/344x208, z=999) ficam VIVOS para sempre e desenham
+            # por cima de TUDO (era o que tapava os battlers na batalha!). Dispor
+            # explicitamente no crash.
+            begin
+              $scene.disposeTitle if $scene && $scene.respond_to?(:disposeTitle)
+            rescue; end
+            # [INTRO-RECOVER] intro crashou -> em vez de fechar o jogo, cair no ecra
+            # de load (o mesmo destino do closeTitle normal). Se falhar, sai como antes.
+            recovered = false
+            begin
+              if klass.to_s == "Scene_Intro" && defined?(PokemonLoadScreen) && defined?(PokemonLoad_Scene)
+                dbg "[MFD] WARNING [INTRO-RECOVER] a recuperar do crash do intro -> load screen"
+                $scene = nil
+                sscreen = PokemonLoadScreen.new(PokemonLoad_Scene.new)
+                sscreen.pbStartLoadScreen
+                recovered = !$scene.nil?
+              end
+            rescue => _re
+              dbg "[MFD] WARNING [INTRO-RECOVER] falhou: #{_re.class}: #{_re.message}"
+            end
             # Nao parar -- tentar avancar para a proxima scene se possivel
-            $scene = nil
+            $scene = nil unless recovered
           end
 
           dbg "[MFD] scene.main done: #{klass} -> $scene=#{$scene.nil? ? 'nil' : $scene.class}"
+          # [TITLE-SWEEP] o titulo (Modular Title Screen) NUNCA dispoe os paineis
+          # z=998/999 -> tapavam os battlers na batalha. Ao sair do Scene_Intro
+          # (qualquer caminho: normal, delete, crash-recover) esconde-os no motor.
+          (MKXPDebug.sweep_title if klass.to_s == "Scene_Intro") rescue nil
         end
 
         if scene_crashes >= max_scene_crashes
@@ -5984,6 +6457,184 @@ end
             "  MKXPDebug.log(\"[DLG] hook falhou: #{e.class}: #{e.message}\")\n"
             "end\n";
         mrb_load_string(mrb, dlg_hook);
+        if (mrb->exc) { mrb->exc = 0; }
+    }
+
+    /* [TRAINERID-N 2026-07-09] MIGRACAO probe->motor do TRAINERIDFIX (raiz #4,
+     * overflow MRB_INT32). Trainer#initialize do jogo faz
+     *   @id = rand(2**16) | rand(2**16) << 16    (max 2^32-1)
+     * mas o mrb_int e' int32 COM SINAL -> o <<16 estoura -> promove a Float ->
+     * `Integer | Float` = TypeError -> Player.new falha -> $Trainer nil -> cartao
+     * de treinador vazio (excecao engolida por rescues do jogo). FIX: @id com
+     * secret_ID a 15 bits (max = INT32_MAX exato); public_ID mantem 16 bits.
+     * Mesma guarda $__traineridfix_installed do probe: o motor corre PRIMEIRO ->
+     * o bloco equivalente do probe ve a guarda e salta (migracao limpa; remover
+     * do probe apos 2 ciclos confirmados, regra §9.4). Regiao pos-plugins: nada
+     * de plugin redefine Trainer#initialize (verificado nos dumps). */
+    {
+        static const char *trainerid_fix = R"TIDFIX(
+begin
+  if defined?(Trainer) && Trainer.method_defined?(:initialize) && !$__traineridfix_installed
+    $__traineridfix_installed = true
+    class Trainer
+      def initialize(name, trainer_type)
+        @trainer_type = GameData::TrainerType.get(trainer_type).id
+        @name         = name
+        @id           = rand(2 ** 16) | (rand(2 ** 15) << 16)   # int32-safe
+        @language     = (pbGetLanguage rescue 2)
+        @party        = []
+      end
+    end
+    MKXPDebug.log("[TRAINERID-N] Trainer#initialize int32-safe instalado pelo MOTOR (probe passa a saltar)") rescue nil
+  end
+rescue => e
+  MKXPDebug.log("[TRAINERID-N] falhou: #{e.class}: #{e.message}") rescue nil
+end
+)TIDFIX";
+        mrb_load_string(mrb, trainerid_fix);
+        if (mrb->exc) { mrb->exc = 0; }
+    }
+
+    /* [FOLLOWER-SHIM + CBWRAP 2026-07-10] Os 2 desbloqueadores da BATALHA
+     * (diagnostico BATALHA_DIAGNOSTICO_FINAL.md, 5 agentes):
+     * FIX1: $PokemonGlobal.follower_toggled nao declarado -> auto-stub devolve 0
+     *   (truthy!) -> EliteBattle.follower()=0 -> send-out do player faz next/early
+     *   -return -> SEM sprite do treinador, SEM pokebola, SEM reveal, databox unica
+     *   ("Pikachu 20/20" = a caixa do FOLLOWER do jogador; o foe sempre foi o Mareep).
+     *   Shim: attr_accessor real -> nil genuino -> follower()=nil -> fluxo normal.
+     * FIX2: CallbackWrapper#execute fazia instance_variable_set num ARRAY (mruby:
+     *   RArray sem iv_tbl -> "cannot set instance variable", o [IVSET-DIAG] @scene
+     *   em Array) -> TODAS as animacoes comuns (pokebola, captura, transicoes custom)
+     *   abortavam. Substituir por um contexto-objeto. Pos-plugins (0015 ja definiu). */
+    {
+        static const char *battle_unblockers = R"BUNBLK(
+begin
+  if defined?(PokemonGlobalMetadata)
+    class PokemonGlobalMetadata
+      attr_accessor :follower_toggled unless method_defined?(:follower_toggled)
+    end
+    MKXPDebug.log("[FOLLOWER-SHIM] WARNING follower_toggled real (nil) -- send-out do player desbloqueado") rescue nil
+  end
+rescue; end
+begin
+  # [FOLLOWER-KILL] ha' DUAS definicoes de EliteBattle.follower (0061 + 0077
+  # FollowingPkmn-compat, a ultima vence) e a 0077 esta' envenenada por OUTRO stub
+  # (FollowingPkmn.active? -> 0 truthy) -> early-return no send-out na mesma.
+  # O "walk into battle" do follower nao funciona no port de qualquer forma ->
+  # matar deterministicamente AS DUAS no motor: follower() = nil SEMPRE.
+  if defined?(EliteBattle)
+    (class << EliteBattle; self; end).class_eval do
+      define_method(:follower) { |*a| nil }
+    end
+    MKXPDebug.log("[FOLLOWER-KILL] WARNING EliteBattle.follower()=nil definitivo (ambas as defs mortas)") rescue nil
+  end
+rescue; end
+begin
+  # [EVUPD-MEMO 2026-07-11, achado da pesquisa] Game_Event#should_update?
+  # (046:245) corre POR EVENTO POR FRAME e faz `@event.name[/update/i]` — um
+  # REGEX sobre um nome IMUTAVEL, 30-60x por frame. Memoizar o regex (1x por
+  # evento) corta ~0.5-2ms/frame no updateMaps. Corpo identico ao v19.1, so' o
+  # regex vira flag cacheada. Sonda por alias (nunca respond_to?).
+  if Object.const_defined?(:Game_Event)
+    class Game_Event
+      begin
+        alias __mkxp_memo_probe should_update?
+        unless method_defined?(:__mkxp_upd_memoized)
+          def __mkxp_upd_memoized; true; end
+          def should_update?(recalc = false)
+            return @to_update if !recalc
+            return true if @trigger && (@trigger == 3 || @trigger == 4)
+            return true if @move_route_forcing
+            if @__mkxp_name_upd.nil?
+              @__mkxp_name_upd = (@event.name[/update/i] ? true : false) rescue false
+            end
+            return true if @__mkxp_name_upd
+            range = 2
+            return false if self.screen_x - @sprite_size[0]/2 > Graphics.width + range * Game_Map::TILE_WIDTH
+            return false if self.screen_x + @sprite_size[0]/2 < -range * Game_Map::TILE_WIDTH
+            return false if self.screen_y_ground - @sprite_size[1] > Graphics.height + range * Game_Map::TILE_HEIGHT
+            return false if self.screen_y_ground < -range * Game_Map::TILE_HEIGHT
+            return true
+          end
+          (MKXPDebug.log("[EVUPD-MEMO] should_update? com regex memoizado") rescue nil)
+        end
+      rescue NameError
+        # jogo sem should_update? (nao e' v19) -> nada a fazer
+      end
+    end
+  end
+rescue; end
+begin
+  # [EBDX-FRAME0 2026-07-11] RAM da batalha: BitmapEBDX#refresh construia TODOS
+  # os frames do strip (ate 104 x Bitmap 140x140 = 8MB por battler) MESMO com
+  # @@disableBitmapAnimation=true (a flag so travava o update). Com a animacao
+  # de frames desligada no port (EBDXFIX do probe), construir SO' o frame 0:
+  # -6 a -30MB por batalha. Reversivel: reativar animacao remove o cap.
+  if Object.const_defined?(:BitmapEBDX)
+    class BitmapEBDX
+      unless method_defined?(:__mkxp_f0_orig_refresh)
+        alias_method :__mkxp_f0_orig_refresh, :refresh
+        def refresh(bitmaps = nil)
+          __f0 = (self.class.class_variable_get(:@@disableBitmapAnimation) rescue false)
+          if __f0 && bitmaps.nil? && @bitmapFile.is_a?(String)
+            self.dispose
+            f_bmp = Bitmap.new(@bitmapFile)
+            @width  = f_bmp.height * @scale
+            @height = f_bmp.height * @scale
+            bitmap = Bitmap.new(@width, @height)
+            bitmap.stretch_blt(Rect.new(0, 0, @width, @height), f_bmp,
+                               Rect.new(0, 0, f_bmp.height, f_bmp.height))
+            @bitmaps.push(bitmap)
+            f_bmp.dispose
+            if @bitmaps.length < 1 && !self.is_bitmap?
+              EliteBattle.log.error("Unable to construct bitmap sheet (frame0) `#{@bitmapFile}`") rescue nil
+            end
+            if !self.is_bitmap?
+              @totalFrames = @bitmaps.length
+              @animationFrames = @totalFrames * @frames
+              @tempBmp = Bitmap.new(@bitmaps[0].width, @bitmaps[0].width)
+            end
+          else
+            __mkxp_f0_orig_refresh(bitmaps)
+          end
+        end
+        MKXPDebug.log("[EBDX-FRAME0] WARNING refresh frame-0-only armado (poupa ate 30MB/batalha)") rescue nil
+      end
+    end
+  end
+rescue => e
+  (MKXPDebug.log("[EBDX-FRAME0] falhou: #{e.class}: #{e.message}") rescue nil)
+end
+begin
+  # [FPKMN-OFF] FollowingPkmn.active? stub-0-truthy envenena varios ramos do EBDX.
+  # Se o modulo existir mas active? vier do stub, define-o real: false.
+  if defined?(FollowingPkmn)
+    _real = (FollowingPkmn.respond_to?(:active?) rescue false)
+    unless _real
+      (class << FollowingPkmn; self; end).class_eval do
+        define_method(:active?) { |*a| false }
+      end
+      MKXPDebug.log("[FPKMN-OFF] WARNING FollowingPkmn.active?=false real definido") rescue nil
+    end
+  end
+rescue; end
+begin
+  if defined?(CallbackWrapper)
+    class CallbackContext
+      def initialize(args); @args = args; end
+    end
+    class CallbackWrapper
+      def execute(block, *args)
+        ctx = CallbackContext.new(args)
+        (@params || {}).each { |k, v| ctx.instance_variable_set("@#{k}", v) }
+        ctx.instance_eval(&block)
+      end
+    end
+    MKXPDebug.log("[CBWRAP] WARNING CallbackWrapper sem ivars-em-Array -- animacoes comuns desbloqueadas") rescue nil
+  end
+rescue; end
+)BUNBLK";
+        mrb_load_string(mrb, battle_unblockers);
         if (mrb->exc) { mrb->exc = 0; }
     }
 
@@ -7149,21 +7800,21 @@ begin
           alias_method :__ssw_orig_switchIsOn?, :switchIsOn?
           def switchIsOn?(id)
             _sw = $data_system.switches[id]
-            return false if !_sw
+            # [SWITCHNAME-FIX 2026-07-05] RAIZ do NEW GAME preso: System.rxdata
+            # falha no boot (allocation failure) -> $data_system.switches[id]=nil
+            # (nome em falta) -> o `return false if !_sw` original dava FALSE p/
+            # TODOS os switches globais mesmo LIGADOS -> condicoes de pagina de
+            # eventos (EV26 'INTRO' cond ShowOpening=switch50) nunca cumpriam ->
+            # player preso nas arvores. nome nil = switch NORMAL = valor real.
+            return ($game_switches[id] ? true : false) if !_sw
+            # [SSW-FIX 2026-07-05] switches "s:" (script) DELEGADOS ao eval original.
+            # RAIZ do "new game preso no intro": o meu instance_exec de um Proc
+            # compilado em scope limpo NAO era equivalente ao eval original (binding
+            # diferente) -> switchIsOn?("s:...") do switch 50 devolvia FALSE ->
+            # a condicao da pagina do EV26 (autorun do intro) falhava -> o intro
+            # nunca corria. Correcao > micro-otimizacao: so' os switches NORMAIS
+            # usam o fast-path ($game_switches direto); os "s:" usam o original.
             if _sw[/^s\:/]
-              _code = $~.post_match
-              _pr = $__ssw_cache[_code]
-              if _pr.nil?
-                _pr = (Interpreter.__evsc_compile(_code) rescue :bad)
-                $__ssw_cache[_code.dup] = _pr
-              end
-              if _pr != :bad
-                begin
-                  return instance_exec(&_pr)
-                rescue Exception
-                  return __ssw_orig_switchIsOn?(id)   # erro identico pelo original
-                end
-              end
               return __ssw_orig_switchIsOn?(id)
             end
             return $game_switches[id]
@@ -7302,6 +7953,435 @@ begin
   end
   # ---- FIM AUTOFADE-CACHE ------------------------------------------------------------
 
+  # ---- [PLAYERPACK 2026-07-05] 4 cortes no Game_Player#update (9-16ms na rua) ------
+  # Auditoria por leitura provou os 4 quentes: (1) pbTerrainTag recalculado por
+  # frame (plugin Following) e 3-5x por passo; (2) regex trainer()/counter()
+  # RECOMPILADA por evento por passo (mruby nao cacheia literais) em varrimentos
+  # de TODOS os eventos; (3) display_x=/display_y= -> 2x metadata lookup + 2x
+  # setMapsInRange POR FRAME a andar; (4) update_pattern corre a cauda float
+  # em TODOS os characters PARADOS. Semantica exata; tudo por alias/fail-open.
+  # [TTCACHE] pbTerrainTag memoizado por [map,x,y,bridge] (globals, nunca ivars:
+  # player/map sao marshalados no save)
+  begin
+    $MKXP_PERF_TTCACHE = true if $MKXP_PERF_TTCACHE.nil?
+    if $MKXP_PERF_TTCACHE && Object.const_defined?(:Game_Player) &&
+       Game_Player.instance_methods.include?(:pbTerrainTag) &&
+       !Game_Player.instance_methods.include?(:__ttc_orig)
+      class Game_Player
+        alias_method :__ttc_orig, :pbTerrainTag
+        def pbTerrainTag(countBridge = false)
+          _mid = self.map.map_id
+          _br  = ($PokemonGlobal ? $PokemonGlobal.bridge : 0)
+          _c = countBridge ? $__ttc_b : $__ttc_a
+          return _c[4] if _c && _c[0] == _mid && _c[1] == @x && _c[2] == @y && _c[3] == _br
+          _r = __ttc_orig(countBridge)
+          _slot = [_mid, @x, @y, _br, _r]
+          if countBridge then $__ttc_b = _slot else $__ttc_a = _slot end
+          _r
+        end
+      end
+      MKXPDebug.log("[TTCACHE] Game_Player#pbTerrainTag memoizado por posicao") rescue nil
+    end
+  rescue => __ettc
+    MKXPDebug.log("[TTCACHE] falhou: #{__ettc.class}: #{__ettc.message}") rescue nil
+  end
+  # [EVDIST] distancias trainer()/counter() cacheadas por evento (nome imutavel)
+  begin
+    if Object.const_defined?(:Game_Player) &&
+       !Game_Player.instance_methods.include?(:__evd_get)
+      $__evdist = {}
+      (Events.onMapChange += proc { $__evdist.clear }) rescue nil
+      class Game_Player
+        EVD_TRAINER_RE = /trainer\((\d+)\)/i
+        EVD_COUNTER_RE = /counter\((\d+)\)/i
+        def __evd_get(event)
+          _k = ($game_map.map_id << 20) | event.id
+          _d = $__evdist[_k]
+          if _d.nil?
+            _n = event.name.to_s
+            _mt = EVD_TRAINER_RE.match(_n)
+            _mc = EVD_COUNTER_RE.match(_n)
+            _d = [_mt ? _mt[1].to_i : false, _mc ? _mc[1].to_i : false]
+            $__evdist[_k] = _d
+          end
+          _d
+        end
+        def pbTriggeredTrainerEvents(triggers, checkIfRunning = true)
+          result = []
+          return result if checkIfRunning && $game_system.map_interpreter.running?
+          for event in $game_map.events.values
+            distance = __evd_get(event)[0]
+            next if !distance
+            if pbEventCanReachPlayer?(event, self, distance) && triggers.include?(event.trigger)
+              result.push(event) if !event.jumping? && !event.over_trigger?
+            end
+          end
+          return result
+        end
+        def pbTriggeredCounterEvents(triggers, checkIfRunning = true)
+          result = []
+          return result if checkIfRunning && $game_system.map_interpreter.running?
+          for event in $game_map.events.values
+            distance = __evd_get(event)[1]
+            next if !distance
+            if pbEventFacesPlayer?(event, self, distance) && triggers.include?(event.trigger)
+              result.push(event) if !event.jumping? && !event.over_trigger?
+            end
+          end
+          return result
+        end
+      end
+      MKXPDebug.log("[EVDIST] trainer/counter regex -> cache por evento") rescue nil
+    end
+  rescue => __eevd
+    MKXPDebug.log("[EVDIST] falhou: #{__eevd.class}: #{__eevd.message}") rescue nil
+  end
+  # [DISPXY] guard barato primeiro + display X/Y fundidos (1 setMapsInRange/frame)
+  begin
+    if Object.const_defined?(:Game_Map) && Object.const_defined?(:Game_Player) &&
+       Game_Player.instance_methods.include?(:update_screen_position) &&
+       !Game_Map.instance_methods.include?(:__mk_set_display)
+      $__mk_snap = {}
+      (Events.onMapChange += proc { $__mk_snap.clear }) rescue nil
+      class Game_Map
+        def __mk_set_display(_vx, _vy)
+          # [DISPXY v2 2026-07-05] early-return SO' se o mapa for o MESMO da
+          # ultima chamada: ao cruzar fronteira de mapas CONECTADOS o mapa troca
+          # de identidade com o MESMO display -> o return antigo saltava o
+          # setMapsInRange e os vizinhos (e o seguidor, ancorado ao display do
+          # mapa velho) dessincronizavam — o Gilbert "desaparecia na fronteira".
+          if @display_x == _vx && @display_y == _vy && $__mk_disp_last == self.__id__
+            return
+          end
+          $__mk_disp_last = self.__id__
+          @display_x = _vx
+          @display_y = _vy
+          _sn = $__mk_snap[self.map_id]
+          if _sn.nil?
+            _sn = (GameData::MapMetadata.exists?(self.map_id) &&
+                   GameData::MapMetadata.get(self.map_id).snap_edges) ? true : false
+            $__mk_snap[self.map_id] = _sn
+          end
+          if _sn
+            _max_x = (self.width  - Graphics.width * 1.0 / TILE_WIDTH)  * REAL_RES_X
+            _max_y = (self.height - Graphics.height * 1.0 / TILE_HEIGHT) * REAL_RES_Y
+            @display_x = [0, [@display_x, _max_x].min].max
+            @display_y = [0, [@display_y, _max_y].min].max
+          end
+          $MapFactory.setMapsInRange if $MapFactory
+        end
+      end
+      class Game_Player
+        def update_screen_position(last_real_x, last_real_y)
+          return if !(@moved_last_frame || @moved_this_frame) || self.map.scrolling?
+          self.map.__mk_set_display(@real_x - SCREEN_CENTER_X, @real_y - SCREEN_CENTER_Y)
+        end
+      end
+      MKXPDebug.log("[DISPXY] update_screen_position fundido (1x setMapsInRange/frame)") rescue nil
+    end
+  rescue => __edxy
+    MKXPDebug.log("[DISPXY] falhou: #{__edxy.class}: #{__edxy.message}") rescue nil
+  end
+  # [PATIDLE] update_pattern early-out provado em characters parados
+  begin
+    if Object.const_defined?(:Game_Character) &&
+       Game_Character.instance_methods.include?(:update_pattern) &&
+       !Game_Character.instance_methods.include?(:__mk_up_orig)
+      class Game_Character
+        alias_method :__mk_up_orig, :update_pattern
+        def update_pattern
+          return if !@moved_this_frame && !@moved_last_frame && !@step_anime &&
+                    (@anime_count || 0) == 0
+          __mk_up_orig
+        end
+      end
+      MKXPDebug.log("[PATIDLE] update_pattern early-out em characters parados") rescue nil
+    end
+  rescue => __epat
+    MKXPDebug.log("[PATIDLE] falhou: #{__epat.class}: #{__epat.message}") rescue nil
+  end
+  # ---- FIM PLAYERPACK ------------------------------------------------------------------
+
+  # ---- [PRIOSYNC] seam no CustomTilemap#refresh (sprites de priotiles) ------------
+  # Fast-path: quando o rect de priotiles NAO muda e nada de tileset/autotile/
+  # visibilidade mudou, os ~70 sprites so' precisam de x/y/z novos (funcao pura
+  # de tx,ty,prio,ox,oy,bridge) -> 1 chamada nativa em vez de ~70x addTile
+  # (~8-10 dispatches cada). tone/color: o update() do 075 ja' re-sincroniza
+  # TODOS os @tiles quando @oldtone/@oldcolor mudam ANTES do refresh; bitmap/
+  # src: rect igual => mesmos ids nas mesmas posicoes; frames de autotile:
+  # @autotiles.changed forca o slow-path. Default VERIFY ($MKXP_PRIO_SYNC=2):
+  # corre o vanilla E compara — liga-se (=1) com log limpo.
+  begin
+    _ps_ok = (Sprite.__mkxp_prio_sync([], [], 0, 0, 32, 32, false) == true) rescue false
+    if Object.const_defined?(:CustomTilemap) && _ps_ok && !$__priosync_installed
+      $__priosync_installed = true
+      $MKXP_PRIO_SYNC = 2 if $MKXP_PRIO_SYNC.nil?
+      class CustomTilemap
+        # [2026-07-05c] SEM sonda por instance_method (envenenada pelo
+        # method_missing universal — foi por isso que o seam nunca redefiniu o
+        # metodo na 1a sessao). $__priosync_installed (fora) e' a idempotencia;
+        # NameError do alias cai no rescue exterior.
+        alias_method :__ps_orig_refresh, :refresh
+          def __ps_capture
+            @__ps_sprites = nil
+            return if @usedsprites || !@priotilesfast || @priotilesfast.empty?
+            _zin = (@__ps_zinfo ||= {})
+            _spr = []; _data = []; _i = 0
+            @priotilesfast.each do |_p|
+              _s = @tiles[_i]; _i += 2
+              return if !_s || (_s.disposed? rescue true)
+              _id = _p[3]
+              _zi = _zin[_id]
+              if !_zi
+                _t  = (GameData::TerrainTag.try_get(@terrain_tags[_id]) rescue nil)
+                _br = ((_t && _t.bridge) ? 1 : 0)
+                _rf = ((_t && _t.shows_reflections) ? 1 : 0)
+                _zi = [_rf, _br, (@priorities[_id] || 0)]
+                _zin[_id] = _zi
+              end
+              _spr.push(_s)
+              _data.push(_p[0], _p[1], _zi[0], _zi[1], _zi[2])
+            end
+            @__ps_sprites = _spr
+            @__ps_data = _data
+            @__ps_rect = @priotilesrect
+            @__ps_vis  = @visible
+          end
+          def __ps_fastable?
+            _q = ($__ps_why ||= Hash.new(0))
+            if !@__ps_sprites || !@layer0 || @usedsprites
+              _q[:sem_capture] += 1
+              return false
+            end
+            if @tilesetChanged || @autotiles.changed || @visible != @__ps_vis
+              _q[:flags] += 1
+              return false
+            end
+            if !@__ps_rect.equal?(@priotilesrect)
+              _q[:rect_obj] += 1
+              return false
+            end
+            _xs = @map_data.xsize; _ys = @map_data.ysize
+            _minX = ((@ox / @tileWidth) - 1).clamp(0, _xs - 1)
+            _maxX = (((@ox + @viewport.rect.width) / @tileWidth) + 1).clamp(0, _xs - 1)
+            _minY = ((@oy / @tileHeight) - 1).clamp(0, _ys - 1)
+            _maxY = (((@oy + @viewport.rect.height) / @tileHeight) + 1).clamp(0, _ys - 1)
+            _r = @priotilesrect
+            if _r[0] == _minX && _r[1] == _minY && _r[2] == _maxX && _r[3] == _maxY
+              _q[:ok] += 1
+              true
+            else
+              _q[:rect_calc] += 1
+              false
+            end
+          end
+          def refresh(autotiles = false)
+            _m = $MKXP_PRIO_SYNC
+            $__ps_n = ($__ps_n || 0) + 1
+            if ($__ps_n % 300) == 1 && $__ps_why
+              MKXPDebug.log("[PRIOSYNC|PORQUE] #{$__ps_why.inspect} capture=#{@__ps_sprites ? @__ps_sprites.size : 'nil'} fast=#{@priotilesfast ? @priotilesfast.size : 'nil'} used=#{@usedsprites.inspect}") rescue nil
+            end
+            if !autotiles && _m != false && _m != 2 && __ps_fastable?
+              @layer0.visible = @visible
+              if refreshLayer0(false)
+                refreshFlashSprite
+                _br = (($PokemonGlobal.bridge > 0) rescue false)
+                if Sprite.__mkxp_prio_sync(@__ps_sprites, @__ps_data,
+                                           @ox, @oy, @tileWidth, @tileHeight, _br)
+                  @oldOx = @ox
+                  @oldOy = @oy
+                  return
+                end
+              end
+            end
+            _fast_was = (!autotiles && _m == 2 && __ps_fastable?)
+            __ps_orig_refresh(autotiles)
+            if _fast_was
+              _br = (($PokemonGlobal.bridge > 0) rescue false)
+              (Sprite.__mkxp_prio_sync(@__ps_sprites, @__ps_data,
+                                       @ox, @oy, @tileWidth, @tileHeight, _br, 2) rescue nil)
+            end
+            (__ps_capture rescue nil)
+          end
+      end
+      MKXPDebug.log("[PRIOSYNC] seam instalado (modo=#{$MKXP_PRIO_SYNC.inspect}; 1=on 2=verify false=off)") rescue nil
+    else
+      MKXPDebug.log("[PRIOSYNC] NAO instalado (nativo=#{_ps_ok})") rescue nil
+    end
+  rescue => _eps
+    MKXPDebug.log("[PRIOSYNC] falhou: #{_eps.class}: #{_eps.message.to_s[0,80]}") rescue nil
+  end
+  # ---- FIM PRIOSYNC --------------------------------------------------------------------
+
+  # ---- [TTGET] GameData::TerrainTag.try_get memoizado -----------------------------
+  # O addTile do CustomTilemap chama try_get POR TILE POR FRAME (~70x) e cada
+  # try_get faz validate (Hash+Array novos). O registry e' IMUTAVEL em runtime
+  # -> cache por chave = mesmo objeto devolvido, zero validates repetidos.
+  # Sonda pelo padrao provado: alias dentro de rescue + flag global.
+  begin
+    if !$__ttg_on && Object.const_defined?(:GameData)
+      class << GameData::TerrainTag
+        alias_method :__ttg_orig, :try_get
+        def try_get(_k)
+          _c = ($__ttg_cache ||= {})
+          if _c.key?(_k)
+            _c[_k]
+          else
+            _c[_k] = __ttg_orig(_k)
+          end
+        end
+      end
+      $__ttg_on = true
+      MKXPDebug.log("[TTGET] TerrainTag.try_get memoizado (registry imutavel)") rescue nil
+    end
+  rescue Exception => _ett
+    MKXPDebug.log("[TTGET] indisponivel: #{_ett.class}: #{_ett.message.to_s[0,60]}") rescue nil
+  end
+  # ---- FIM TTGET ---------------------------------------------------------------------
+
+  # ---- [TTMAP] Game_Map#terrain_tag memoizado (nucleo) --------------------------------
+  # Chamado dezenas de vezes por passo (passabilidade do player+NPCs, escadas do
+  # plugin 0068 via pbFollowEventAcrossMaps, ledges, footsteps): cada chamada e'
+  # loop de 3 camadas x Table#[] splat + try_get. data/@terrain_tags sao
+  # imutaveis em gameplay; o resultado so' depende de (map,x,y,countBridge) e do
+  # estado $PokemonGlobal.bridge==0 -> vai tudo na chave. Cache GLOBAL aninhada
+  # por map_id (Game_Map e' marshalado — NUNCA ivars), limpa em onMapChange.
+  # Chave interna aritmetica pequena (sem shifts largos: seguro mesmo em INT32).
+  # Gate $MKXP_TTMAP=false reverte.
+  begin
+    if $MKXP_TTMAP != false && !$__ttmap_on && Object.const_defined?(:Game_Map)
+      class Game_Map
+        alias_method :__ttm_orig, :terrain_tag
+        def terrain_tag(x, y, countBridge = false)
+          if x.is_a?(Integer) && y.is_a?(Integer) &&
+             x >= -16 && x < 4080 && y >= -16 && y < 4080
+            _br = 0
+            _br = 1 if $PokemonGlobal && ($PokemonGlobal.bridge rescue 0).to_i > 0
+            _k = ((x + 16) * 4096 + (y + 16)) * 4 + (countBridge ? 2 : 0) + _br
+            _c = (($__ttm_cache ||= {})[@map_id] ||= {})
+            if _c.key?(_k)
+              _c[_k]
+            else
+              _c[_k] = __ttm_orig(x, y, countBridge)
+            end
+          else
+            __ttm_orig(x, y, countBridge)
+          end
+        end
+      end
+      $__ttm_cache = {}
+      (Events.onMapChange += proc { $__ttm_cache.clear }) rescue nil
+      $__ttmap_on = true
+      MKXPDebug.log("[TTMAP] Game_Map#terrain_tag memoizado (global por mapa, chave inclui bridge)") rescue nil
+    end
+  rescue Exception => _etm
+    MKXPDebug.log("[TTMAP] indisponivel: #{_etm.class}: #{_etm.message.to_s[0,60]}") rescue nil
+  end
+  # ---- FIM TTMAP ---------------------------------------------------------------------
+
+  # ---- [BOOTGC] 1 GC.start no arranque do Scene_Map ----------------------------------
+  # O boot deixa ~1.4M objetos vivos com o GC incremental atrasado -> full-GC
+  # de EMERGENCIA (~centenas de ms) rebenta a meio do gameplay inicial. Um
+  # GC.start unico no 1o Scene_Map#main (durante o fade-in, invisivel) arruma
+  # o heap antes do gameplay. Gate $MKXP_BOOTGC=false reverte.
+  begin
+    if $MKXP_BOOTGC != false && !$__bootgc_on && Object.const_defined?(:Scene_Map)
+      class Scene_Map
+        alias_method :__bgc_orig_main, :main
+        def main
+          unless $__bootgc_done
+            $__bootgc_done = true
+            GC.start rescue nil
+            MKXPDebug.log("[BOOTGC] GC.start no 1o Scene_Map#main (heap do boot arrumado)") rescue nil
+          end
+          __bgc_orig_main
+        end
+      end
+      $__bootgc_on = true
+      MKXPDebug.log("[BOOTGC] instalado") rescue nil
+    end
+  rescue Exception => _ebg
+    MKXPDebug.log("[BOOTGC] indisponivel: #{_ebg.class}: #{_ebg.message.to_s[0,60]}") rescue nil
+  end
+  # ---- FIM BOOTGC --------------------------------------------------------------------
+
+  # ---- [ADDTILE-FAST] slow-frame do refresh: addTile com metade dos dispatches ----
+  # Nos 25% de frames em que o rect muda (fronteira de celula x2 tilemaps), o
+  # refresh vanilla refaz addTile p/ ~75-125 sprites: ~8-10 dispatches cada
+  # (visible=,x=,y=,z= + terrain/priority + tone=,color= + get*Tile) = 15-20ms
+  # NUM frame — o serrilhado que resta na rua. Corpo EXATO do 075 com:
+  # __mkxp_tile_set (4 setters -> 1 dispatch), zinfo [terrain_data,priority]
+  # cacheado por id (dados imutaveis; TTGET ja' memoiza o try_get por baixo).
+  # Gate $MKXP_ADDTILE_FAST=false reverte.
+  begin
+    if $MKXP_ADDTILE_FAST != false && !$__addtile_fast_on &&
+       Object.const_defined?(:CustomTilemap) &&
+       (Sprite.instance_methods.include?(:__mkxp_tile_set) rescue false)
+      class CustomTilemap
+        alias_method :__atf_orig_addTile, :addTile
+        def addTile(tiles, count, xpos, ypos, id)
+          # cache POR INSTANCIA (tilesets diferentes = terrains diferentes p/ o
+          # mesmo id); tilemaps nao sao marshalados -> ivar seguro.
+          # [v2] INVALIDA quando as TABELAS trocam de identidade (o TSC troca
+          # @terrain_tags/@priorities DEPOIS de celulas ja' cacheadas -> zinfo
+          # stale por id = z errado = casas atras do chao; raiz do bug 07-05).
+          _tt_id = @terrain_tags.__id__
+          _pr_id = @priorities.__id__
+          if @__atf_tt != _tt_id || @__atf_pr != _pr_id
+            @__atf_z = {}
+            @__atf_tt = _tt_id
+            @__atf_pr = _pr_id
+          end
+          _zc = @__atf_z
+          _zi = _zc[id]
+          if _zi.nil?
+            _t = GameData::TerrainTag.try_get(@terrain_tags[id])
+            _zc[id] = _zi = [_t, @priorities[id]]
+          end
+          terrain_tag_data = _zi[0]
+          priority = _zi[1]
+          if id >= 384   # Tileset tile
+            if count >= tiles.length
+              sprite = CustomTilemapSprite.new(@viewport)
+              tiles.push(sprite, 0)
+            else
+              sprite = tiles[count]
+              tiles[count + 1] = 0
+            end
+            sprite.tone  = @tone
+            sprite.color = @color
+            getRegularTile(sprite, id)
+          else           # Autotile
+            if count >= tiles.length
+              sprite = CustomTilemapSprite.new(@viewport)
+              tiles.push(sprite, 1)
+            else
+              sprite = tiles[count]
+              tiles[count + 1] = 1
+            end
+            sprite.tone = @tone
+            getAutotile(sprite, id)
+          end
+          if terrain_tag_data.shows_reflections
+            _z2 = -100
+          elsif $PokemonGlobal.bridge > 0 && terrain_tag_data.bridge
+            _z2 = 1
+          else
+            _z2 = (priority == 0) ? 0 : ypos + priority * 32 + 32
+          end
+          sprite.__mkxp_tile_set(@visible, xpos, ypos, _z2)
+          count += 2
+          return count
+        end
+      end
+      $__addtile_fast_on = true
+      MKXPDebug.log("[ADDTILE-FAST] addTile com batch-setter + zinfo cache (slow-frames a metade)") rescue nil
+    end
+  rescue Exception => _eat
+    MKXPDebug.log("[ADDTILE-FAST] indisponivel: #{_eat.class}: #{_eat.message.to_s[0,60]}") rescue nil
+  end
+  # ---- FIM ADDTILE-FAST ----------------------------------------------------------------
+
   # ---- [SAVE-CLEAN] quarentena automatica de saves 0-byte (anti-crash do menu) --
   # PROVADO no log 20:07: o ecra de gravar le TODOS os slots p/ mostrar a info
   # (pbSaveScreen -> getSaveInfoBoxContents -> read_from_file -> Marshal.load) e um
@@ -7356,7 +8436,8 @@ begin
           _id = (@id rescue '?')
           begin
             __mkxp_orig_valload(value)
-            MKXPDebug.log("[SAVELOAD] valor '#{_id}' OK (classe=#{value.class})") rescue nil
+            # [LOG-LEAN] "valor X OK" por-valor removido (18 linhas/load); so' os
+            # que REBENTAM ficam (logados no rescue abaixo, que nomeiam o culpado)
           rescue => _e
             MKXPDebug.log("[SAVELOAD] valor '#{_id}' REBENTOU: #{_e.class}: #{_e.message.to_s[0,90]} (classe recebida=#{value.class}) -> NAO atribuido!") rescue nil
             raise
@@ -7624,14 +8705,16 @@ begin
         raise
       end
     end
-    MKXPDebug.log("[NAMEIN] hook GLOBAL #{meth} OK")
+    # [LOG-LEAN] "hook GLOBAL X OK" por-metodo removido (6 linhas de boot; o hook
+    # so' importa quando CHAMADO, e ai loga na mesma). Falhas de install idem:
+    # pbChooseGender/pbNameEntry nao existem neste jogo = NameError esperado.
     true
   end
   [:pbEnterText, :pbEnterPlayerName, :pbTrainerName, :pbEnterPokemonName, :pbChooseGender, :pbNameEntry].each do |m|
     begin
       __mkxp_hook_global(m)
     rescue => e
-      MKXPDebug.log("[NAMEIN] hook GLOBAL #{m} falhou: #{e.class}: #{e.message}")
+      # [LOG-LEAN] silencioso (pbChooseGender/pbNameEntry ausentes = esperado)
     end
   end
   # Hook generico a um metodo de INSTANCIA de uma classe. Apanha caminhos
@@ -7799,7 +8882,13 @@ end
  * so' para falhar e' a maior fatia do tempo de boot. Saltar da' o mesmo estado
  * funcional muito mais rapido. Poe a 0 para voltar a tentar carregar tudo. */
 #ifndef MKXP_SKIP_BROKEN_PLUGINS
-#define MKXP_SKIP_BROKEN_PLUGINS 1
+#define MKXP_SKIP_BROKEN_PLUGINS 0   /* [2026-07-05] EBDX compila 100% OK (compile-only provou 485/485) -> DES-SALTADO p/ testar runtime (era saltado por suposto SyntaxError que nao existe) */
+#endif
+/* [EBDX-DIAG 2026-07-05] compila (compile-only, SEM executar) os scripts do plugin
+ * saltado p/ CAPTURAR os SyntaxErrors exatos (sem cascata/crash), 1x no boot. Serve
+ * para a proxima sessao saber que corrigir. Poe a 0 depois de capturados. */
+#ifndef MKXP_DIAG_EBDX
+#define MKXP_DIAG_EBDX 0   /* [QUIET 2026-07-12] 1->0: SyntaxErrors do EBDX ja' capturados/corrigidos. Repor 1 p/ recapturar. */
 #endif
 
 /* Garante que toda a estrutura de pastas da cache existe (idempotente).
@@ -7874,6 +8963,7 @@ static bool mkxp_cache_try_load(mrb_state *mrb, const char *cache_path,
          * dava) e era tolerada antes; tratamos e consideramos "carregado".    */
         show_error(mrb, script_name);
         mrb->exc = 0;
+        g_plugin_exec_failed = true;   /* [PLUGIN-RETRY] p/ re-correr no 2o passo */
     }
     mrb_gc_arena_restore(mrb, arena);
     return true;
@@ -8161,7 +9251,7 @@ static bool mkxp_plugin_compile_dump_run(mrb_state* mrb, const char* cache_path,
 
     /* 2) Executar o MESMO proc ja' compilado (equivale a ter corrido o texto). */
     mrb_vm_run(mrb, proc, mrb_top_self(mrb), 0);
-    if (mrb->exc) { show_error(mrb, script_name); mrb->exc = 0; }
+    if (mrb->exc) { show_error(mrb, script_name); mrb->exc = 0; g_plugin_exec_failed = true; }
 
     mrbc_context_free(mrb, c);
     mrb_gc_arena_restore(mrb, arena);
@@ -8199,7 +9289,7 @@ static const mrb_data_type MkxpFileType = { "File", mkxp_fileh_free };
 static void mkxp_file_log_write(MkxpFileH *h) {
     if (!h || h->wrote == 0) return;
     extern FILE *g_dbglog;
-    if (g_dbglog) {
+    if (g_dbglog && g_log_verbose) {
         fprintf(g_dbglog, "[SAVE-PROVA] gravado '%s' (%zu bytes)\n", h->path, h->wrote);
         fflush(g_dbglog);
     }
@@ -8571,6 +9661,51 @@ static void run_plugin_scripts(mrb_state* mrb, const char* game_path) {
     int num_plugins = (int)RARRAY_LEN(plugins);
     DBGLOG("[PLUGINS] %d plugins a carregar\n", num_plugins);
 
+    /* [TRAINER-FULLNAME 2026-07-12] o plugin 'Scripted Battles' (e outros)
+     * referencia Trainer#fullname no LOAD, mas o Trainer base (135_Trainer.rb)
+     * so' tem #name -> NameError no boot ('undefined method fullname') e o
+     * plugin fica meio-carregado (log: '4 ainda com erro'). O #fullname e'
+     * normalmente adicionado por um script EBDX que carrega DEPOIS -> ordem
+     * fragil. Aqui, ENTRE os base-scripts e os plugins (Trainer ja' existe,
+     * nenhum plugin correu), definimos um #fullname robusto: "<tipo> <nome>"
+     * quando ha' tipo, senao o nome cru. Se o EBDX definir o seu depois,
+     * prevalece (carrega mais tarde). Generico p/ qualquer Essentials. */
+    mrb_load_string(mrb,
+        "begin;"
+        " if Object.const_defined?(:Trainer);"
+        "  class Trainer;"
+        "   def fullname;"
+        "    begin;"
+        "     _tt=(self.trainer_type rescue nil);"
+        "     _tn=(GameData::TrainerType.try_get(_tt).name rescue nil) if _tt;"
+        "     (_tn && !_tn.to_s.empty?) ? (_tn.to_s+' '+self.name.to_s) : self.name.to_s;"
+        "    rescue Exception; (self.name.to_s rescue ''); end;"
+        "   end;"
+        "  end;"
+        " end;"
+        "rescue Exception; end");
+    if (mrb->exc) { mrb->exc = 0; }
+    DBGLOG("[TRAINER-FULLNAME] Trainer#fullname garantido antes dos plugins\n");
+
+    /* [TTF-FONTEXIST 2026-07-12] o pbTryFonts (080_MessageConfig) so' usa
+     * "Power Green" se Font.exist?("Power Green") for true; o motor nao definia
+     * Font.exist? -> caia sempre no fallback "arial" -> o [TTF] pedia 'arial'
+     * (que nao existe) e voltava a' fonte do sistema. Definimos Font.exist? p/
+     * devolver true a qualquer nome nao-vazio: o pbTryFonts passa a devolver o
+     * nome REAL ("Power Green"), que chega ao @font.@name; o desenho TTF carrega
+     * game/Fonts/<nome>.ttf e, se nao existir, cai no BCFNT (seguro). Escolhe
+     * sempre o 1o da lista = a fonte principal pretendida, como no PC. */
+    mrb_load_string(mrb,
+        "begin;"
+        " if Object.const_defined?(:Font);"
+        "  class << Font;"
+        "   def exist?(n); n.is_a?(String) && !n.empty?; end;"
+        "   def exists?(n); n.is_a?(String) && !n.empty?; end;"
+        "  end;"
+        " end;"
+        "rescue Exception; end");
+    if (mrb->exc) { mrb->exc = 0; }
+
     int ok_scripts = 0, fail_scripts = 0;
 
 #if MKXP_PLUGIN_CACHE
@@ -8623,6 +9758,47 @@ static void run_plugin_scripts(mrb_state* mrb, const char* game_path) {
             for (int k = 0; kSkip[k]; k++)
                 if (strcmp(pname, kSkip[k]) == 0) { skip = true; break; }
             if (skip) {
+#if MKXP_DIAG_EBDX
+                /* compile-only (no_exec) de cada script do plugin saltado -> captura
+                 * os SyntaxErrors SEM executar (sem cascata/crash). show_error loga
+                 * classe+mensagem+ficheiro. 'WARNING' no prefixo passa o filtro. */
+                {
+                    int _dok = 0, _derr = 0;
+                    DBGLOG("[EBDX-DIAG] WARNING a compilar (compile-only, sem executar) '%s' p/ capturar erros...\n", pname);
+                    for (int _si = 0; _si < nscr; _si++) {
+                        mrb_value _scr = mrb_ary_entry(scripts_val, _si);
+                        if (!mrb_array_p(_scr) || RARRAY_LEN(_scr) < 2) continue;
+                        mrb_value _sp = mrb_ary_entry(_scr, 0);
+                        mrb_value _cd = mrb_ary_entry(_scr, 1);
+                        if (!mrb_string_p(_cd)) continue;
+                        char _sn[128] = "ebdx_script";
+                        if (mrb_string_p(_sp)) {
+                            const char *_s = RSTRING_PTR(_sp); const char *_b = _s;
+                            for (const char *_c = _s; *_c; _c++) if (*_c == '/' || *_c == '\\') _b = _c + 1;
+                            snprintf(_sn, sizeof(_sn), "%s", _b);
+                        }
+                        uLongf _dl = ((int)RSTRING_LEN(_cd) > 0 ? (int)RSTRING_LEN(_cd) : 1) * 4;
+                        std::vector<Bytef> _dc(_dl);
+                        int _r = uncompress(_dc.data(), &_dl, (const Bytef*)RSTRING_PTR(_cd), (uLong)RSTRING_LEN(_cd));
+                        while (_r == Z_BUF_ERROR) { _dl *= 2; _dc.resize(_dl); _r = uncompress(_dc.data(), &_dl, (const Bytef*)RSTRING_PTR(_cd), (uLong)RSTRING_LEN(_cd)); }
+                        if (_r != Z_OK) { DBGLOG("[EBDX-DIAG] WARNING uncompress falhou '%s'\n", _sn); continue; }
+                        _dc.resize(_dl);
+                        mrbc_context *_cxt = mrbc_context_new(mrb);
+                        mrbc_filename(mrb, _cxt, _sn);
+                        _cxt->no_exec = TRUE;   /* compilar SEM executar */
+                        mrb_load_nstring_cxt(mrb, (const char*)_dc.data(), _dc.size(), _cxt);
+                        if (mrb->exc) {
+                            char _ctx[220];
+                            snprintf(_ctx, sizeof(_ctx), "EBDX-DIAG WARNING compile '%s'", _sn);
+                            show_error(mrb, _ctx);
+                            mrb->exc = 0;
+                            _derr++;
+                        } else _dok++;
+                        mrbc_context_free(mrb, _cxt);
+                    }
+                    DBGLOG("[EBDX-DIAG] WARNING RESUMO '%s': %d compilam OK, %d com ERRO de compilacao\n", pname, _dok, _derr);
+                }
+#endif
                 DBGLOG("[PLUGINS] SKIP '%s' (%d scripts) -- plugin partido, "
                        "saltado p/ acelerar boot\n", pname, nscr);
                 continue;
@@ -8680,6 +9856,21 @@ static void run_plugin_scripts(mrb_state* mrb, const char* game_path) {
             /* patch especifico de plugins: NAO mexe em defined? (o MODTS
              * precisa dele). Ver patch_plugin_script. */
             uint64_t pl_t1 = prof_tick();
+            /* [EBDX-DEFINED-FIX 2026-07-05] RAIZ dos aliases partidos do EBDX: usa
+             * o idioma `alias X_ebdx X unless defined?(X_ebdx)`, mas no mruby
+             * `defined?(metodo_indefinido)` LEVANTA em vez de dar nil -> a linha
+             * rebenta e o alias/override nunca instala (getFormattedText/
+             * pbSpriteSetAnimFrame/pbStartOver/... partidos = batalha errada). O
+             * motor ja' troca defined?(X)->nil nos scripts-base, mas NAO nos plugins
+             * (o MODTS precisa de defined?). Aplicamos a troca APENAS ao EBDX. */
+            if (strcmp(pname, "Elite Battle: DX") == 0 && !decomp.empty()) {
+                /* [DEFINED-RESCUE] antes era replace_defined_keyword (defined?->nil),
+                 * mas isso matava o guard `unless defined?(X_ebdx)` -> o PLUGIN-RETRY
+                 * re-instalava o alias -> ataque/item a DUPLICAR. Agora envolve em
+                 * `(defined?(X) rescue nil)`: instala na 1a passagem, mas o guard
+                 * bloqueia a 2a (retry) -> idempotente, sem duplicacao. */
+                wrap_defined_rescue(decomp);
+            }
             patch_plugin_script(decomp, (uLong)decomp.size(), sname);
             double pl_patch_ms = prof_ticks_to_ms(prof_tick() - pl_t1);
 
@@ -8688,6 +9879,7 @@ static void run_plugin_scripts(mrb_state* mrb, const char* game_path) {
             double pl_exec_ms = 0.0, pl_compile_ms = 0.0;
             uint64_t pl_t2 = prof_tick();   /* inicio da fase exec/compile (fora do #if p/ robustez) */
             bool executed = false;          /* fora do #if: o fallback abaixo precisa dela sempre */
+            g_plugin_exec_failed = false;   /* [PLUGIN-RETRY] reset por-script */
 
 #if MKXP_PLUGIN_CACHE
             /* Chave de ficheiro: NNNN_nome (indice sequencial preserva ordem). */
@@ -8760,6 +9952,7 @@ static void run_plugin_scripts(mrb_state* mrb, const char* game_path) {
                     show_error(mrb, ctx);
                     mrb->exc = 0;
                     fail_scripts++;
+                    g_plugin_exec_failed = true;   /* [PLUGIN-RETRY] */
                 } else {
                     ok_scripts++;
                 }
@@ -8767,7 +9960,56 @@ static void run_plugin_scripts(mrb_state* mrb, const char* game_path) {
             pl_compile_ms = prof_ticks_to_ms(prof_tick() - pl_t2);
             prof_script_record(sname, pl_bytes, pl_hit,
                                pl_decomp_ms, pl_patch_ms, pl_exec_ms, pl_compile_ms);
+            /* [PLUGIN-RETRY] guarda o fonte dos scripts que falharam na execucao
+             * (ordem-de-load: alias :M_ebdx :M com M ainda nao definido) p/ re-correr
+             * no fim, quando M ja' existe. Evita duplicar Compiler (compile_all faz
+             * compilacao PBS pesada) e scripts de modos opcionais. */
+            if (g_plugin_exec_failed
+                && !strstr(sname, "Compiler")
+                && !strstr(sname, "Nuzlocke")
+                && !strstr(sname, "Randomizer")) {
+                g_plugin_retry.push_back(std::make_pair(std::string(sname),
+                    std::string((const char*)decomp.data(), decomp.size())));
+            }
         }
+    }
+
+    /* [PLUGIN-RETRY 2026-07-05] 2o PASSO: re-corre os scripts que falharam por
+     * ordem-de-load, agora que TODOS os plugins carregaram (os metodos base ja'
+     * existem -> os alias :M_ebdx :M passam a funcionar). Sao overrides/aliases
+     * (idempotentes na maioria); os problematicos (Compiler/modos) ficam de fora. */
+    if (!g_plugin_retry.empty()) {
+        /* Trainer#fullname nao existe neste jogo (EBDX Scripted Battles espera-o e
+         * faz alias :fullname_ebdx :fullname -> falha). Define-o = name p/ o alias
+         * passar no retry (a override do EBDX corre a seguir e decora sobre este). */
+        {
+            int _ar = mrb_gc_arena_save(mrb);
+            mrb_load_string(mrb,
+                "unless (Trainer.method_defined?(:fullname) rescue true); "
+                "class Trainer; def fullname; (self.name rescue '') end; end; end");
+            if (mrb->exc) mrb->exc = 0;
+            mrb_gc_arena_restore(mrb, _ar);
+        }
+        DBGLOG("[PLUGIN-RETRY] WARNING 2o passo: a re-correr %d scripts que falharam por ordem-de-load...\n",
+               (int)g_plugin_retry.size());
+        int _rok = 0, _rerr = 0;
+        for (size_t _i = 0; _i < g_plugin_retry.size(); _i++) {
+            const std::string &_nm = g_plugin_retry[_i].first;
+            const std::string &_sc = g_plugin_retry[_i].second;
+            int _ar = mrb_gc_arena_save(mrb);
+            mrb_load_nstring(mrb, _sc.data(), _sc.size());
+            if (mrb->exc) {
+                /* [PLUGIN-FAIL] nomear os plugins que ficam meio-carregados p/ os
+                 * corrigir um a um no proximo ciclo. So' o NOME (sem funcall na
+                 * excecao — pode interferir); o show_error abaixo da' a mensagem. */
+                DBGLOG("[PLUGIN-FAIL] RETRY '%s' ainda falha\n", _nm.c_str());
+                char _cx[200]; snprintf(_cx, sizeof(_cx), "RETRY '%s'", _nm.c_str());
+                show_error(mrb, _cx); mrb->exc = 0; _rerr++;
+            } else _rok++;
+            mrb_gc_arena_restore(mrb, _ar);
+        }
+        DBGLOG("[PLUGIN-RETRY] WARNING 2o passo concluido: %d OK, %d ainda com erro\n", _rok, _rerr);
+        g_plugin_retry.clear();
     }
 
     mrb_gc_unregister(mrb, plugins);
@@ -9115,6 +10357,29 @@ end
         else DBGLOG("[DEFINED-EARLY] defined?/const_missing instalados ANTES dos plugins\n");
     }
 
+    /* [COMPILER-STUB 2026-07-10, GAP #4] o script base Compiler esta' SKIPADO (pesado,
+     * dados ja' pre-compilados) mas os plugins 0001/0060 (EBDX) fazem
+     * `alias compile_all_old compile_all` no LOAD -> NameError -> o plugin inteiro
+     * falha. Modulo minimo ANTES dos plugins: compile_all/main no-op +
+     * needCompiling?=false (nunca recompila; os .dat de 2026-06-12 sao a verdade). */
+    {
+        static const char *compiler_stub = R"CSTUB(
+begin
+  unless defined?(Compiler) && Compiler.respond_to?(:compile_all)
+    module Compiler
+      def self.compile_all(*a); end
+      def self.main(*a); end
+      def self.needCompiling?(*a); false; end
+      def self.compile_pbs_files(*a); end
+    end
+  end
+rescue; end
+)CSTUB";
+        mrb_load_string(mrb, compiler_stub);
+        if (mrb->exc) mrb->exc = 0;
+        DBGLOG("[COMPILER-STUB] Compiler minimo definido ANTES dos plugins (alias 0001/0060 passam)\n");
+    }
+
     run_plugin_scripts(mrb, game_path);
 
     /* ── CALLMENU-DIAG: wrapper de backtrace INNER a' sonda ───────────────────
@@ -9243,6 +10508,12 @@ end
      * (iteracao); romfs e' o baked-in. Confirmar no log: banner VWRAP=true e
      * [TMDBG] @tileset=512x1024 nos interiores. Desactivar: renomear o ficheiro. */
     {
+        /* [MKXP-EARLY 2026-07-05] RAIZ-MÃE provada por sonda: o guard do fix
+         * ("if $MKXP == true") era avaliado AQUI (t=4.31s) mas o $MKXP so' era
+         * forcado no check_entry (t=4.54s) -> o patch da classe NUNCA aplicou
+         * em sessao nenhuma (o banner de load saia na mesma). Forcar ANTES. */
+        mrb_gv_set(mrb, mrb_intern_lit(mrb, "$MKXP"), mrb_true_value());
+        DBGLOG("[MKXP-EARLY] $MKXP=true forcado ANTES do tilemap_fix (build 2026-07-05b)\n");
         FILE *vf = fopen("sdmc:/mkxp/pokemon_tilemap_fix.rb", "rb");
         if (!vf) vf = fopen("romfs:/pokemon_tilemap_fix.rb", "rb");
         if (vf) {
@@ -9277,11 +10548,14 @@ end
             fseek(sf, 0, SEEK_END); long ssz = ftell(sf); fseek(sf, 0, SEEK_SET);
             char *sbuf = (char*)malloc(ssz + 1);
             fread(sbuf, 1, ssz, sf); fclose(sf); sbuf[ssz] = 0;
+            DBGLOG("[PROBE] WARNING a carregar debug_probe.rb (%ld bytes) primeiro_char=0x%02x\n",
+                   ssz, (unsigned char)sbuf[0]);
             mrb_load_string(mrb, sbuf); free(sbuf);
             if (mrb->exc) { show_error(mrb, "debug_probe"); mrb->exc = 0; }
-            else DBGLOG("[PROBE] debug_probe.rb carregado\n");
+            else DBGLOG("[PROBE] WARNING debug_probe.rb carregado OK\n");
+            if (g_dbglog) fflush(g_dbglog);
         } else {
-            DBGLOG("[PROBE] debug_probe.rb nao encontrado -- modo normal\n");
+            DBGLOG("[PROBE] WARNING debug_probe.rb NAO ENCONTRADO -- modo normal\n");
         }
     }
 
@@ -9374,9 +10648,24 @@ static void mkxp_register_bad_map(const char *fname) {
     }
 }
 
+extern "C" unsigned mkxp_strip_battle_giants(void);   /* [BATTLE-GIANTS] def em bitmap_binding_3ds.cpp */
+extern "C" void mkxp_set_in_battle(int);              /* [BATTLE-ARENA] idem */
+
 int binding_3ds_run(const char *game_path) {
     dbglog_open();
     DBGLOG("binding_3ds_run: %s\n", game_path);
+    /* [MEMREGION 2026-07-12] Prova direta do ganho do CIA. Sob HBL/.3dsx o pool
+     * APPLICATION e' ~64MB (teto artificial do Homebrew Launcher); sob CIA com
+     * SystemMode:96MB + ResourceLimitCategory:Application passa a ~96MB (Old 3DS)
+     * / ~124MB (New 3DS). fprintf direto p/ saltar o boot-lean (aparece SEMPRE). */
+    if (g_dbglog) {
+        u32 _app_tot  = osGetMemRegionSize(MEMREGION_APPLICATION);
+        u32 _app_used = osGetMemRegionUsed(MEMREGION_APPLICATION);
+        fprintf(g_dbglog, "[MEMREGION] APPLICATION total=%luKB (~%luMB) used=%luKB free=%luKB  <- 64MB=.3dsx/HBL, 96MB+=CIA\n",
+                (unsigned long)(_app_tot/1024), (unsigned long)(_app_tot/1048576),
+                (unsigned long)(_app_used/1024), (unsigned long)((_app_tot-_app_used)/1024));
+        fflush(g_dbglog);
+    }
     /* Resultado do ndspInit() (feito em main.cpp, antes deste log abrir). Se for
      * R_FAILED, NAO ha som -- o DSP nao processa (no log: "0 buffers reciclados"
      * + canais de SE sempre cheios). Causa quase sempre: falta o dspfirm.cdc. */
@@ -9701,6 +10990,39 @@ end
         },
         MRB_ARGS_NONE());
 
+    /* [GC-LIVE 2026-07-11] expõe mrb->gc.live ao Ruby p/ o probe tracer isolar a
+     * FONTE do churn de 1.5M objetos por batalha (todas as hipoteses estruturais
+     * — marshal, frames do battler — foram empiricamente refutadas). Um hook
+     * mede o delta em volta de metodos-chave da batalha e nomeia o culpado. */
+    mrb_define_method(mrb, mrb->kernel_module,
+        "__mkxp_gc_live",
+        [](mrb_state *mrb2, mrb_value) -> mrb_value {
+            return mrb_fixnum_value((mrb_int)mrb2->gc.live);
+        },
+        MRB_ARGS_NONE());
+
+    /* [BATTLE-GIANTS] o probe chama isto na entrada da batalha p/ libertar os
+     * ~16MB dos tilesets gigantes do overworld (escondido) para a cena de
+     * batalha. Recarregam a' saida. Devolve KB libertados. */
+    mrb_define_method(mrb, mrb->kernel_module,
+        "__mkxp_strip_battle_giants",
+        [](mrb_state *mrb2, mrb_value) -> mrb_value {
+            return mrb_fixnum_value((mrb_int)mkxp_strip_battle_giants());
+        },
+        MRB_ARGS_NONE());
+
+    /* [BATTLE-ARENA] o probe marca ENTRADA (true, na batalha) e o tick do mapa
+     * marca SAIDA (false). Enquanto true, a arena de 16MB livre pode servir o
+     * battlebg/assets de batalha que senao ficavam magenta (overworld por tras). */
+    mrb_define_method(mrb, mrb->kernel_module,
+        "__mkxp_set_battle",
+        [](mrb_state *mrb2, mrb_value) -> mrb_value {
+            mrb_bool v = 0; mrb_get_args(mrb2, "b", &v);
+            mkxp_set_in_battle(v ? 1 : 0);
+            return mrb_nil_value();
+        },
+        MRB_ARGS_REQ(1));
+
     /* __mkxp_localtime: data/hora REAL do RTC do 3DS via time()/localtime().
      * CAUSA RAIZ (provada por nm libmruby.a -> 0 simbolos de Time): este build do
      * mruby NAO tem o gem mruby-time, logo a constante Time cai no const_missing
@@ -9772,6 +11094,11 @@ unless Object.const_defined?(:Time)
       h12 = @hour % 12; h12 = 12 if h12 == 0
       ampm = @hour < 12 ? "AM" : "PM"
       s = fmt.to_s.dup
+      # [TIMEFIX-LOCALE 2026-07-11] %x/%X/%c saiam LITERAIS na caixa do save
+      # slot (Auto_Multi_Save 0102:504). Expandir ANTES dos simples.
+      s = s.gsub("%c", "%d/%m/%Y %H:%M:%S")
+      s = s.gsub("%x", "%d/%m/%Y")
+      s = s.gsub("%X", "%H:%M:%S")
       s = s.gsub("%Y", @year.to_s)
       s = s.gsub("%m", pad2.call(@month))
       s = s.gsub("%d", pad2.call(@day))
@@ -9845,7 +11172,7 @@ end
                 return mrb_nil_value();
             }
 
-            DBGLOG("[load_data] req='%s' -> '%s'\n", fname ? fname : "(nil)", path);
+            /* [LOG-LEAN] req= por-ficheiro removido (ruido de boot; flush SD) */
 
 #if MKXP_RXDATA_CACHE
             /* --- tentativa de leitura da cache de rxdata -------------------
@@ -9866,7 +11193,7 @@ end
 
                     FILE *cf = fopen(g_rxcache_pending, "rb");
                     if (cf) {
-                        DBGLOG("[RXCACHE] HIT '%s'\n", fname);
+                        /* [LOG-LEAN] HIT silencioso (era 1 linha/ficheiro) */
                         mrb_value cv = mrb_nil_value();
                         bool ok = true;
                         /* IMPORTANTE: marshalLoadInt NAO lanca excecao C++ quando o
@@ -9884,7 +11211,7 @@ end
                             mrb2->exc = NULL;             /* descarta o erro pendente */
                         }
                         if (ok && !mrb_nil_p(cv)) {
-                            DBGLOG("[RXCACHE]   load OK (sem re-parse da fonte)\n");
+                            /* [LOG-LEAN] load-OK silencioso */
                             g_rxcache_pending[0] = 0;   /* ja' resolvido */
                             return cv;
                         }
@@ -9931,10 +11258,16 @@ end
                 mrb_raise(mrb2, mrb_class_get(mrb2, "RuntimeError"),
                           "load_data: cannot open file");
             }
-            { long pz; fseek(fp,0,SEEK_END); pz=ftell(fp); fseek(fp,0,SEEK_SET);
-              DBGLOG("[load_data] aberto (%s, %ld bytes)\n", src, pz); }
+            { long pz; fseek(fp,0,SEEK_END); pz=ftell(fp); fseek(fp,0,SEEK_SET); (void)pz; (void)src;
+              /* [LOG-LEAN] "aberto" por-ficheiro removido */ }
 
             mrb_value v = mrb_nil_value();
+            /* [BIGLOAD 2026-07-11] o log 22:33 mostrou 2x GC de ~1.5M objetos
+             * orfaos POR BATALHA — churn catastrofico de fonte NAO confirmada.
+             * Medir gc.live ANTES/DEPOIS de cada load_data isola definitivamente
+             * qual ficheiro cria a explosao (hipotese: PkmnAnimations.rxdata).
+             * So' loga quando o delta e' enorme (>100k) -> zero ruido normal. */
+            int _bl_live0 = g_mkxp_mrb ? (int)g_mkxp_mrb->gc.live : 0;
             try {
                 v = marshalLoadInt(mrb2, fp);
             } catch (...) {
@@ -9944,6 +11277,18 @@ end
                           "load_data: marshal error");
             }
             fclose(fp);
+            if (g_dbglog && g_mkxp_mrb) {
+                int _bl_d = (int)g_mkxp_mrb->gc.live - _bl_live0;
+                if (_bl_d > 100000) {
+                    const char *_shape = mrb_array_p(v) ? "Array" : (mrb_hash_p(v) ? "Hash" :
+                                        (mrb_nil_p(v) ? "nil" : "obj"));
+                    long _alen = mrb_array_p(v) ? (long)RARRAY_LEN(v) : -1;
+                    fprintf(g_dbglog, "[BIGLOAD] '%s' criou %d objetos (live %d->%d) -> %s(len=%ld) "
+                            "== FONTE DO CHURN se >200k e repete\n",
+                            fname ? fname : "?", _bl_d, _bl_live0, (int)g_mkxp_mrb->gc.live, _shape, _alen);
+                    fflush(g_dbglog);
+                }
+            }
 
             /* diagnostico do resultado: tipo + forma */
             if (mrb_array_p(v)) {
@@ -10131,6 +11476,15 @@ begin
     def delete(*a); 0; end unless respond_to?(:delete)
     alias_method :rmdir,  :delete rescue nil
     alias_method :unlink, :delete rescue nil
+  end
+rescue; end
+begin
+  # [DEPRECATE-STUB 2026-07-09] Module#deprecate_constant e' builtin do CRuby que o
+  # mruby nao tem. O 253_Pokemon_Deprecated chama-o no corpo da classe (L102) ->
+  # sem isto, o load do script abortava a meio (era 1 das razoes do skip). No-op:
+  # a depreciacao e' so' um aviso de dev, sem efeito funcional.
+  class Module
+    def deprecate_constant(*a); nil; end unless method_defined?(:deprecate_constant)
   end
 rescue; end
 )PREFIX");

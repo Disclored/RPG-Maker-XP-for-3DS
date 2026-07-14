@@ -82,11 +82,60 @@
  * com os ~28 MB libertados pelo pool, mantem margem sobre o ponto de OOM.
  * Reversível: se o log mostrar OOM de malloc (falha num malloc pequeno), baixar
  * para 40 ou 36. */
-#define LINEAR_HEAP_MB 44u
+/* ATUALIZAÇÃO 3 [MEM-REBAL 2026-07-11]: o [EBDX-SETUP v2] tornou residentes os
+ * dados de batalha (1527 especies/65 trainers/121 cenarios ≈ varios MB de
+ * objetos mruby) e o malloc (~20 MB no perfil Old-3DS: 64-44) SATUROU em
+ * definitivo (GC-OOM em espiral, "libertou 0"). Cada Bitmap que falhava malloc
+ * passou a viver PERMANENTEMENTE no linear (fallback ALLOC-OOM) -> os 44 MB de
+ * linear tambem esgotaram (log 11:50: linear_livre=1697KB) -> C3D_TexInit
+ * falha -> battlers KILL-TEXINVALID + atlas do tilemap FRAGMENTADO (CHAO_PRETO)
+ * + decode do 'Outside' impossivel.
+ * REEQUILIBRIO em conjunto com o limiar 4444 baixado 16->8 MB (bitmap_binding):
+ * os tilesets gigantes passam TODOS a metade (Outside 7.9, Town 8.0, Route 14.5
+ * em 4444) -> o caso dois-vizinhos vale ~16(arena)+8+4(atlas)+~8(texturas)=36MB
+ * -> 38 MB de linear chegam COM folga, e o malloc ganha +6 MB (20->26 no
+ * Old-3DS; no New 3DS/Azahar em modo N3DS a folga e' enorme de qualquer forma).
+ * Reversivel: magenta de tileset-vizinho -> subir p/ 40; OOM malloc -> ver
+ * [MEM-REBAL] no ebdx-battle-system.md antes de mexer. */
+/* ATUALIZAÇÃO 4 [ATLAS-ETERNO]: com a arena (16) e a textura do atlas (4)
+ * GARANTIDAS no boot, o linear geral so' precisa de: 2o tileset gigante 4444
+ * (~8MB; o maior, Route 14.5, vai para a arena) + texturas pequenas (+VRAM de
+ * transbordo) + transientes. 34 chega; e o malloc sobe p/ ~30MB, onde tem de
+ * caber mruby+dados EBDX+pixels dos bitmaps (o ALLOC-FATAL do buffer 2.3MB do
+ * atlas no log 12:2Xh era o malloc a 26 ainda curto). Se voltar magenta de
+ * tileset-vizinho: 36. Se OOM malloc: o proximo passo ja' NAO e' este knob —
+ * e' empacotar .cia com exheader N3DS (124MB) ou reduzir residencia EBDX. */
+#define LINEAR_HEAP_MB 38u
 
 /* Símbolo "weak" do libctru: ao definir um valor forte aqui, o libctru reserva
- * exatamente este tamanho para o heap linear e dá todo o restante ao malloc. */
+ * exatamente este tamanho para o heap linear e dá todo o restante ao malloc.
+ * VALOR ESTÁTICO = fallback do .3dsx (96MB): 38 linear / 58 malloc. */
 u32 __ctru_linear_heap_size = LINEAR_HEAP_MB * 1024u * 1024u;
+
+/* [LINEAR-RUNTIME 2026-07-12] RAIZ do magenta+8FPS (log lido linha-a-linha):
+ * exaustão SISTÉMICA do linear (351 BMP|MISS no overworld). As texturas precisam
+ * de LINEAR (GPU); o CIA (124MB) tinha +28MB mas TODOS no malloc -> não ajudava.
+ * Aqui: se houver memória estendida (CIA, região>=118MB) repartir os +28MB de
+ * forma EQUILIBRADA -> linear 52 / malloc 72 (ambos +14 vs .3dsx). Corre num
+ * constructor de prioridade alta; o log [MEMREGION] mostra o linear REAL alocado
+ * -> se ficar 38 no CIA, o constructor é tardio e passo ao override de
+ * __system_allocateHeaps. NÃO mexe no .3dsx (região 96MB -> fica 38). */
+/* [ISOLAMENTO 2026-07-12] DESLIGADO p/ teste do arquiteto: reverter ao 38MB
+ * estatico e confirmar se a corrupcao (estatica) e' mesmo do crescimento do
+ * linear ou de outra mudanca de hoje. Re-ligar removendo o `#if 0`. */
+#if 0
+__attribute__((constructor(101)))
+static void mkxp_linear_from_region(void) {
+    u32 app = osGetMemRegionSize(MEMREGION_APPLICATION);
+    /* [REBAL 2026-07-12b] 52MB partiu a composicao do ecra de cima (malloc 72MB
+     * estrangulou os b->pixels). Recuo p/ 44MB linear / 80MB malloc: malloc perto
+     * dos 86 que funcionavam (so' -6), linear +6 sobre o .3dsx. Magenta 351->0 ja'
+     * com o teto do linear; se voltar magenta com 44, a via e' VRAM (nao mais split). */
+    if (app >= 118u * 1024u * 1024u)       __ctru_linear_heap_size = 44u * 1024u * 1024u; /* CIA 124MB */
+    else if (app >= 108u * 1024u * 1024u)  __ctru_linear_heap_size = 42u * 1024u * 1024u; /* ~112MB */
+    /* else fica LINEAR_HEAP_MB (.3dsx 96MB) */
+}
+#endif  /* [ISOLAMENTO] constructor desligado -> linear = 38MB estatico em ambos */
 
 /* NOTA: NÃO definimos __ctru_heap_size de propósito. Deixá-lo a 0 (default do
  * libctru) faz o malloc receber TODA a memória APPLICATION que sobra depois da

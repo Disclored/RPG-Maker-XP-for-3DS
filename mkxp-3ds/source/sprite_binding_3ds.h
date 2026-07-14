@@ -16,6 +16,16 @@ struct Sprite3DS {
                     chave primaria e' (has_vp ? vp_z : z). Sem isto, sprites
                     sem viewport (ex. janela de mensagem com z=99999) caiam
                     atras de qualquer sprite com viewport.z>0 (intro pictures). */
+    bool is_battler;      /* [BATTLER-MARK 2026-07-10] marcado pelo probe via
+                    MKXPDebug.mark_battler(sprite) — identificacao DETERMINISTICA
+                    dos battlers da batalha (fim das heuristicas de tamanho que
+                    colidiam com arte do titulo/sombras). Gate do BLITDIAG e do
+                    TITLE-SWEEP. calloc'd=false por omissao. */
+    bool is_plane;        /* [PLANE-WRAP 2026-07-10] marcado pelo stub Ruby do
+                    Plane (compat_stubs, @__psprite) via MKXPDebug.mark_plane:
+                    o blit final TILA o bitmap por todo o ecra logico 512x384
+                    (semantica RGSS de Plane — fog/panorama com wrap + scroll
+                    ox/oy). calloc'd=false por omissao. */
     unsigned int reg_seq; /* [ZSORT-REGTIE] ordem de criacao (contador monotono,
                     atribuido no spr_init). Usado SO' como desempate quando a
                     chave primaria e' >= 99990 (topo: menus vp.z=99999 e janelas

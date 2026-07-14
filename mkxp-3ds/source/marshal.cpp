@@ -17,6 +17,7 @@
 #include <vector>
 #include <unordered_map>
 #include <string>
+#include <3ds.h>   /* [MARSHAL-LINEAR] linearAlloc/linearFree p/ o buffer de ficheiro */
 #include "profile_3ds.h"
 
 /* ---- logging partilhado com binding_3ds.cpp ---------------------- */
@@ -27,7 +28,21 @@
    ficam com timestamp e da' para medir quanto cada load demorou. */
 extern FILE *g_dbglog;
 extern void  dbglog_stamp(double *out_total_s, double *out_delta_ms);
+extern bool  g_log_verbose;   /* [LIMPEZA] espelha $MKXP_VERBOSE */
+/* [LIMPEZA 2026-07-05] as linhas por-mapa (Table reconstruido/load OK/dump->port)
+ * enchem o log a cada carregamento (SAVE-REPAIR carrega dezenas). Suprimidas salvo
+ * $MKXP_VERBOSE. ERROS e NESTED-AUTODEF passam sempre. */
+static inline bool mz_suppressed(const char *fmt){
+    if (g_log_verbose || !fmt) return false;
+    static const char *BL[] = {
+        "[marshal] Table", "[marshal] load OK", "[marshal] dump->port",
+        "[PROFILE|marshal]", 0
+    };
+    for (int i=0; BL[i]; i++) if (strstr(fmt, BL[i])) return true;
+    return false;
+}
 #define MZLOG(fmt, ...) do { \
+        if (mz_suppressed(fmt)) break; \
         double __ts_t, __ts_d; dbglog_stamp(&__ts_t, &__ts_d); \
         printf("[t=%8.3fs d=%7.1fms] " fmt, __ts_t, __ts_d, ##__VA_ARGS__); \
         if (g_dbglog) { fprintf(g_dbglog, "[t=%8.3fs d=%7.1fms] " fmt, __ts_t, __ts_d, ##__VA_ARGS__); fflush(g_dbglog); } \
@@ -282,6 +297,7 @@ static mrb_value read_str_val_notrack(ReadCtx *c){
 }
 static mrb_value read_value(ReadCtx *c);
 static struct RClass *class_from_path(mrb_state *mrb, mrb_value path);   /* [UCLASS] fwd */
+static mrb_value read_userdef(ReadCtx *c);                               /* [IU-USERDEF] fwd */
 static mrb_value read_array(ReadCtx *c){
     mrb_state *mrb=c->mrb; int len=read_fixnum(c);
     check_len(c,len,"array");   /* cada elemento ocupa >=1 byte */
@@ -375,6 +391,18 @@ static mrb_value read_ivar(ReadCtx *c){
          * (I C :PBAnimations [...]). read_uclass regista no pool internamente. */
         obj=read_uclass(c);
         already_tracked=true;
+    } else if(inner_type==TYPE_USERDEF){
+        /* [IU-USERDEF 2026-07-08] 'Iu' = IVAR(USERDEF): o messages.dat (2.9MB, a
+         * fonte de TODOS os nomes de item/move/especie) tem 400x
+         *   I u :OrderedHash <payload> ivars{ :@keys => [...] }
+         * (CRuby anexa o ivar @keys ao resultado do _load). Sem este ramo, o 1o
+         * OrderedHash lancava "IVAR: inner type desconhecido 'u'" -> o load inteiro
+         * abortava -> @@messages vazio -> pbGetMessage=0 -> nomes "0" + cascata de
+         * erros de tipo na batalha. Ordem de pool = CRuby: o resultado do _load
+         * regista 1 slot (abaixo, via !already_tracked); os valores dos ivars
+         * registam-se depois no loop de descarte (read_value f-los-a). O @keys
+         * descartado e' redundante: OrderedHash._load ja' preenche @keys via []=. */
+        obj=read_userdef(c);
     } else {
         switch(inner_type){
             case TYPE_NIL:    obj=mrb_nil_value();  break;
@@ -393,6 +421,14 @@ static mrb_value read_ivar(ReadCtx *c){
     if(!already_tracked) c->objects.add(obj);
 
     int n=read_fixnum(c);
+    /* [IVAR-SANITY2 2026-07-11] o read_object ja' guardava a sua contagem de
+     * ivars; este read_ivar (tag 'I') NAO -> um n gigante por desync criava
+     * milhoes de objetos de lixo no loop ate' o check_len de um read aninhado
+     * disparar (candidato ao churn de 1.5M). Cada par ocupa >=2 bytes. */
+    if(n < 0 || (long)n*2 > (long)(c->rb->size - c->rb->pos))
+        throw MarshalException(MarshalException::MKXPError,
+            "IVAR: ivar-count insano %d (restam %ld bytes) -- stream desalinhado",
+            n, (long)(c->rb->size - c->rb->pos));
     for(int i=0;i<n;i++){
         /* ler e descartar -- normalmente :E => true (encoding UTF-8) */
         read_value(c); read_value(c);
@@ -418,10 +454,42 @@ static struct RClass *class_from_path(mrb_state *mrb, mrb_value path){
         return it->second;   /* HIT valido: O(1), sem const_get */
 
     /* MISS: resolver via const_get (caro no 3DS, mas so' 1x por classe). */
-    char *p=s,*b=s; mrb_value klass=mrb_obj_value(mrb->object_class);
+    char *p=s,*b=s;
+    struct RClass *outer = mrb->object_class;      /* namespace corrente */
+    mrb_value klass = mrb_obj_value(outer);
     while(*p&&*p!='"'){
         while(*p&&*p!=':'&&*p!='"') p++;
-        klass=mrb_const_get(mrb,klass,mrb_intern(mrb,b,p-b));
+        mrb_sym csym = mrb_intern(mrb,b,(size_t)(p-b));
+        mrb_value seg = mrb_nil_value();
+        /* [NESTED-AUTODEF 2026-07-05] RAIZ do "allocation failure" de System(10KB)
+         * e Animations(43KB): compat_stubs define RPG::System e RPG::AudioFile mas
+         * NAO as classes ANINHADAS (RPG::System::Words/TestBattler,
+         * RPG::Animation::Frame/Timing). mrb_const_get numa aninhada inexistente caia
+         * no const_missing do probe -> devolvia um valor NAO-classe -> mrb_obj_ptr ->
+         * mrb_obj_alloc(klass) com cls->tt invalido -> raise "allocation failure" pura
+         * (gc.c:561), abortando o load inteiro (ficava $data_system/$data_animations
+         * nil). Fix: usar mrb_const_defined (NAO dispara const_missing) e, se a
+         * aninhada nao existir, DEFINI-LA vazia sob o namespace atual -- os scripts
+         * ja' fazem RPG::Animation::Timing.new a contar que exista. */
+        if(mrb_const_defined(mrb, klass, csym)){
+            seg = mrb_const_get(mrb, klass, csym);
+        }
+        enum mrb_vtype st = (enum mrb_vtype)mrb_type(seg);
+        if(st != MRB_TT_CLASS && st != MRB_TT_MODULE && st != MRB_TT_SCLASS){
+            /* inexistente OU nao-classe: cria classe vazia sob 'outer' (se ja' existia
+             * como nao-classe, cai para Object para nao rebentar no define). */
+            if(mrb_const_defined(mrb, klass, csym)){
+                seg = mrb_obj_value(mrb->object_class);   /* raro: const existe mas nao e' classe */
+            }else{
+                std::string leaf(b,(size_t)(p-b));
+                struct RClass *nc = mrb_define_class_under(mrb, outer, leaf.c_str(), mrb->object_class);
+                MZLOG("[marshal] NESTED-AUTODEF: classe aninhada '%.*s' nao existia -> definida vazia sob namespace (evita 'allocation failure')\n",
+                      (int)(p-b), b);
+                seg = mrb_obj_value(nc);
+            }
+        }
+        klass = seg;
+        outer = mrb_class_ptr(klass);
         if(p[0]==':'){ if(p[1]!=':') return 0; p+=2; b=p; }
     }
     struct RClass *result=(struct RClass*)mrb_obj_ptr(klass);
@@ -446,9 +514,31 @@ static mrb_value read_object(ReadCtx *c){
         klass=mrb->object_class;
     }
     PROF_BEGIN(PROF_MARSHAL_ALLOC);
+    /* [ALLOC-DIAG 2026-07-05] mrb_obj_alloc(MRB_TT_OBJECT, klass) levanta o mruby
+     * "allocation failure" quando a classe tem instance_tt != OBJECT (classe nativa
+     * MRB_TT_DATA/etc). Foi o que abateu Animations(43KB)+System(10KB) enquanto
+     * ficheiros de 1.8MB carregam OK -> NAO era memoria, era a classe. Logamos o
+     * nome+tt+posicao exatos e caimos para Object (ivars certos, sem crash) em vez
+     * de rebentar o load inteiro (deixava $data_system/$data_animations a nil). */
+    {
+        enum mrb_vtype _itt = (enum mrb_vtype)MRB_INSTANCE_TT(klass);
+        if(_itt != MRB_TT_OBJECT && _itt != MRB_TT_FALSE){
+            const char *cn = mrb_class_name(mrb,klass);
+            MZLOG("[marshal] ALLOC-NATIVE-TT: classe '%s' instance_tt=%d (nao OBJECT) @pos=%d/%d -> fallback Object (era o 'allocation failure')\n",
+                  cn?cn:"<?>", (int)_itt, (int)c->rb->pos, (int)c->rb->size);
+            klass = mrb->object_class;
+        }
+    }
     mrb_value obj=mrb_obj_value(mrb_obj_alloc(mrb,MRB_TT_OBJECT,klass));
     PROF_END(PROF_MARSHAL_ALLOC);
     c->objects.add(obj); int n=read_fixnum(c);
+    /* [IVAR-SANITY] contagem de ivars tem de caber no que resta (cada par ocupa
+     * >=2 bytes); um n gigante aqui denuncia um desync antes do alloc. */
+    if(n < 0 || (long)n*2 > (long)(c->rb->size - c->rb->pos))
+        throw MarshalException(MarshalException::MKXPError,
+            "objeto '%s': ivar-count insano %d (restam %ld bytes) -- stream desalinhado",
+            (mrb_class_name(mrb,klass)?mrb_class_name(mrb,klass):"<?>"), n,
+            (long)(c->rb->size - c->rb->pos));
     for(int i=0;i<n;i++){
         mrb_value nm=read_value(c), vl=read_value(c);
         if(mrb_symbol_p(nm)){
@@ -548,7 +638,9 @@ static mrb_value build_table_from_dump(mrb_state *mrb, struct RClass *klass, mrb
     mrb_obj_iv_set(mrb,mrb_obj_ptr(obj),s_tbl_sym_data,arr);
     mrb_gc_arena_restore(mrb,arena);
     s_tbl_built++;
-    if(s_tbl_built<=3 || total>4096)
+    /* [LOG-LEAN] era `<=3 || total>4096` -> os mapas tem dezenas de Tables >4096
+     * cells, todas logadas por-tabela (flood de boot). So' as 2 primeiras. */
+    if(s_tbl_built<=2)
         MZLOG("[marshal] Table#%d reconstruido: x=%d y=%d z=%d cells=%d len_arr=%d (buf=%d bytes)\n",
               s_tbl_built,(int)xsize,(int)ysize,(int)zsize,(int)total,(int)RARRAY_LEN(arr),(int)len);
     return obj;
@@ -610,8 +702,23 @@ static mrb_value read_userdef(ReadCtx *c){
               cname?cname:"?",(int)RSTRING_LEN(data));
         throw MarshalException(MarshalException::TypeError,"class needs '_load'");
     }
-    MZLOG("[marshal] userdef '%s' via _load (%d bytes)\n",cname?cname:"?",(int)RSTRING_LEN(data));
-    return mrb_funcall(mrb,mrb_obj_value(klass),"_load",1,data);
+    /* [LOG-LEAN IU] 400x OrderedHash no messages.dat inundariam o log: 2 primeiros. */
+    static int s_udef_load_logged=0;
+    if(s_udef_load_logged<2){ s_udef_load_logged++;
+        MZLOG("[marshal] userdef '%s' via _load (%d bytes)\n",cname?cname:"?",(int)RSTRING_LEN(data)); }
+    mrb_value r=mrb_funcall(mrb,mrb_obj_value(klass),"_load",1,data);
+    /* [IU-USERDEF] se o _load Ruby levantar (ex.: Marshal.load aninhado falha), o
+     * mrb_funcall devolve lixo com mrb->exc posto -- SEM este check o valor errado
+     * entrava no pool e o load "passava" com dados corrompidos silenciosos. */
+    if(mrb->exc){
+        mrb_value ex=mrb_obj_value(mrb->exc); mrb->exc=0;
+        mrb_value msg=mrb_funcall(mrb,ex,"message",0);
+        MZLOG("[marshal] ERRO: '%s'._load levantou: %s\n",cname?cname:"?",
+              mrb_string_p(msg)?RSTRING_PTR(msg):"?");
+        throw MarshalException(MarshalException::TypeError,
+              "'%s'._load raised",cname?cname:"?");
+    }
+    return r;
 }
 static mrb_value read_value(ReadCtx *c){
     mrb_state *mrb=c->mrb; int arena=mrb_gc_arena_save(mrb);
@@ -875,11 +982,27 @@ bool marshalDumpInt(mrb_state *mrb, FILE *fp, mrb_value val){
 }
 
 mrb_value marshalLoadInt(mrb_state *mrb, FILE *fp){
-    /* read whole file into buffer */
+    /* read whole file into buffer.
+     * [MARSHAL-LINEAR 2026-07-11] era std::vector (malloc): com o heap saturado
+     * pelos dados EBDX residentes, Map*.rxdata ~1MB nao alocava -> "marshal
+     * falhou em Map194/139/043" + 21s de GC-thrash + mundo preto (log 11:35).
+     * Buffer TRANSIENTE -> malloc com fallback linearAlloc (dezenas de MB
+     * livres), mesmo padrao do [M2READ-LINEAR]/[LIBPNG-LINEAR]. */
     fseek(fp,0,SEEK_END); long sz=ftell(fp); fseek(fp,0,SEEK_SET);
-    std::vector<char> buf(sz);
-    fread(buf.data(),1,sz,fp);
-    ReadBuf rb(buf.data(),sz); ReadCtx c; c.rb=&rb; c.mrb=mrb;
+    if (sz <= 0) return mrb_nil_value();
+    bool buf_linear = false;
+    char *bufp = (char*)malloc((size_t)sz);
+    if (!bufp) { bufp = (char*)linearAlloc((size_t)sz); if (bufp) buf_linear = true; }
+    if (!bufp) {
+        MZLOG("[marshal] FALHA: sem memoria p/ buffer de %ld bytes (malloc+linear)\n", sz);
+        return mrb_nil_value();
+    }
+    struct BufGuard {
+        char *p; bool lin;
+        ~BufGuard() { if (p) { if (lin) linearFree(p); else free(p); } }
+    } guard { bufp, buf_linear };
+    fread(bufp,1,sz,fp);
+    ReadBuf rb(bufp,sz); ReadCtx c; c.rb=&rb; c.mrb=mrb;
     s_tbl_built=0; s_udef_seen=0;
     /* try/catch para registar EXATAMENTE onde o marshal falha (tipo + posicao).
      * Sem isto, a MarshalException propagava-se como excecao C++ pura e o erro
@@ -912,8 +1035,11 @@ mrb_value marshalLoadInt(mrb_state *mrb, FILE *fp){
         uint64_t frees_made  = g_prof_frees        - prof_frees0;
         g_prof_bytes_parsed += (uint64_t)sz;
 
-        MZLOG("[marshal] load OK (%ld bytes): userdefs=%d tables=%d top_type=%d\n",
-              sz,s_udef_seen,s_tbl_built,(int)mrb_type(v));
+        /* [LOG-LEAN] so' ficheiros grandes (>64KB) — os pequenos (.dat de config,
+         * saves triviais) eram 1 linha/ficheiro de boot sem valor diagnostico. */
+        if (sz > 64*1024)
+            MZLOG("[marshal] load OK (%ld bytes): userdefs=%d tables=%d top_type=%d\n",
+                  sz,s_udef_seen,s_tbl_built,(int)mrb_type(v));
         /* Relatorio de profiling SO' para ficheiros grandes (>50KB) -- os
          * pequenos nao interessam e poluiriam o log. Mostra ms/byte, ms/obj e
          * o BREAKDOWN (alloc vs ivset vs class) que localiza os ~2ms/objeto. */

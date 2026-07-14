@@ -4,6 +4,7 @@
 #include <mruby/data.h>
 #include <mruby/value.h>
 #include <mruby/string.h>
+#include <mruby/variable.h>   /* [TONE-DUAL] mrb_iv_get p/ Tone/Color Ruby-puros */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,11 +34,44 @@ extern "C" void *mkxp_etc_rect_ptr(mrb_state *mrb, mrb_value v) {
     if (DATA_TYPE(v) != &RectType) return NULL;
     return DATA_PTR(v);
 }
+/* [TONE-DUAL 2026-07-11 — P0 transversal, achado da auditoria] O compat_stubs
+ * REDEFINE Color/Tone#initialize (t=0.5s, DEPOIS do binding nativo) -> TODOS
+ * os Tone/Color criados pelo jogo sao TT_OBJECT Ruby-puros (so ivars) -> estes
+ * ptr devolviam NULL -> SCREENFX (tint de ecra: 2046 usos!), VPFX, SPRFX
+ * (tone/color por sprite) e o flash de captura NUNCA disparavam apesar de
+ * implementados. Fallback: ler os ivars p/ um struct estatico por-chamada
+ * (valido ate a chamada seguinte; todos os consumidores copiam logo os campos).
+ * Caso nativo continua zero-custo. */
+static inline float mkxp_iv_f(mrb_state *mrb, mrb_value v, mrb_sym sy) {
+    mrb_value x = mrb_iv_get(mrb, v, sy);
+    if (mrb_fixnum_p(x)) return (float)mrb_fixnum(x);
+    if (mrb_float_p(x))  return (float)mrb_float(x);
+    return 0.0f;
+}
 extern "C" void *mkxp_etc_tone_ptr(mrb_state *mrb, mrb_value v) {
-    (void)mrb;
-    if (mrb_type(v) != MRB_TT_DATA) return NULL;
-    if (DATA_TYPE(v) != &ToneType) return NULL;
-    return DATA_PTR(v);
+    if (mrb_type(v) == MRB_TT_DATA)
+        return (DATA_TYPE(v) == &ToneType) ? DATA_PTR(v) : NULL;
+    if (mrb_type(v) != MRB_TT_OBJECT) return NULL;
+    static mrb_sym sy_r = 0, sy_g = 0, sy_b = 0, sy_gy = 0;
+    if (!sy_r) { sy_r = mrb_intern_lit(mrb, "@red");  sy_g  = mrb_intern_lit(mrb, "@green");
+                 sy_b = mrb_intern_lit(mrb, "@blue"); sy_gy = mrb_intern_lit(mrb, "@gray"); }
+    static Tone tf;
+    tf.r = mkxp_iv_f(mrb, v, sy_r); tf.g = mkxp_iv_f(mrb, v, sy_g);
+    tf.b = mkxp_iv_f(mrb, v, sy_b); tf.gray = mkxp_iv_f(mrb, v, sy_gy);
+    return &tf;
+}
+/* [SCREENFX 2026-07-10] idem p/ Color (flash do ecra + sprite.color). */
+extern "C" void *mkxp_etc_color_ptr(mrb_state *mrb, mrb_value v) {
+    if (mrb_type(v) == MRB_TT_DATA)
+        return (DATA_TYPE(v) == &ColorType) ? DATA_PTR(v) : NULL;
+    if (mrb_type(v) != MRB_TT_OBJECT) return NULL;   /* [TONE-DUAL] */
+    static mrb_sym sy_r = 0, sy_g = 0, sy_b = 0, sy_a = 0;
+    if (!sy_r) { sy_r = mrb_intern_lit(mrb, "@red");  sy_g = mrb_intern_lit(mrb, "@green");
+                 sy_b = mrb_intern_lit(mrb, "@blue"); sy_a = mrb_intern_lit(mrb, "@alpha"); }
+    static Color cf;
+    cf.r = mkxp_iv_f(mrb, v, sy_r); cf.g = mkxp_iv_f(mrb, v, sy_g);
+    cf.b = mkxp_iv_f(mrb, v, sy_b); cf.a = mkxp_iv_f(mrb, v, sy_a);
+    return &cf;
 }
 
 static inline float clampf(float v,float lo,float hi){return v<lo?lo:v>hi?hi:v;}

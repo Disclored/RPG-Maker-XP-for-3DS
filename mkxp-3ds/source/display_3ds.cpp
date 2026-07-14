@@ -13,7 +13,20 @@ extern FILE *g_dbglog;
 /* OTIMIZACAO 3DS: flush periodico (cada 64 escritas) em vez de a cada printf,
  * para evitar I/O sincrono ao cartao SD por frame. Contador global partilhado. */
 extern int g_dbglog_flushc;
-#define printf(fmt, ...) do { if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); \
+#include <cstring>
+extern bool g_log_verbose;
+extern bool g_boot_done;
+/* [BOOT-LEAN] durante o boot, os printf deste ficheiro (DISPLAY, TEX, etc.) so'
+ * passam se forem plugins/GameData/erros -- o resto e' ruido de arranque. */
+static inline bool __raw_suppress(const char *fmt){
+    if (g_log_verbose || !fmt) return false;
+    /* erros passam sempre */
+    if (strstr(fmt,"FALH")||strstr(fmt,"ERRO")||strstr(fmt,"WARN")||strstr(fmt,"CRASH")) return false;
+    /* no boot tambem plugins + dados; em RUNTIME (overworld) NADA -> 0 escritas SD */
+    if (!g_boot_done && (strstr(fmt,"[PLUGINS]")||strstr(fmt,"[Game.init]"))) return false;
+    return true;
+}
+#define printf(fmt, ...) do { if (!__raw_suppress(fmt) && g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); \
     if (++g_dbglog_flushc >= 512) { g_dbglog_flushc = 0; dbg_flush(); } } } while(0)
 
 #define TOP_W 400
@@ -139,6 +152,23 @@ static bool evict_idle_textures(DS3Texture* self, unsigned want_bytes, int frame
     return freed > 0;
 }
 
+/* [TEX-PRESSURE 2026-07-05] Valvula PREVENTIVA: o CACHE-SAFE-DISPOSE (fix do
+ * Gilbert) deixou os bitmaps de cache vivos -> as TEXTURAS acumulam sem teto
+ * (SUPERDBG: 25MB vivas, linear a 1.5MB, FPS 6-9 por asfixia; no 3DS real nem
+ * arranca). O evict on-demand so' corria no PANICO de alloc. Aqui: chamada
+ * 1x/120 frames pelo grph_update — se linear < 6MB, evicta texturas idle
+ * (>=120f sem blit; re-upload lazy, invisivel) ate' libertar 4MB. */
+extern "C" void display_3ds_evict_pressure(int frame_now) {
+    if (linearSpaceFree() >= 6u * 1024u * 1024u) return;
+    bool ok = evict_idle_textures(nullptr, 4u * 1024u * 1024u, frame_now);
+    extern FILE *g_dbglog;
+    if (g_dbglog && g_log_verbose) {
+        fprintf(g_dbglog, "[TEX-PRESSURE] linear=%.0fKB -> evict preventivo %s\n",
+                linearSpaceFree() / 1024.0, ok ? "OK" : "(nada idle p/ libertar)");
+        fflush(g_dbglog);
+    }
+}
+
 /* ── [TEXCENSUS] A medicao DECISIVA (advisor): das ~102 texturas vivas, QUAIS sao?
  * Leak (velhas, cena anterior, idle ha' muito) -> evictar resolve. Working-set vivo
  * (recentes, desenhadas agora) -> so' REDUZIR resolve. Dump das top 20 por tamanho com
@@ -227,8 +257,8 @@ void mkxp_mem_census(const char* tag, unsigned need_bytes) {
         tag ? tag : "?", need_bytes/1024.0, lin_free/1024.0, lin_big/1024.0,
         mfree/1024.0, s_tex_alive, s_tex_bytes/1024.0,
         evictable, evict_bytes/1024.0, vramSpaceFree()/1024.0, veredito);
-    printf("%s", buf);
-    if (g_dbglog) { fprintf(g_dbglog, "%s", buf); dbg_flush(); }
+    printf("%s", buf);   /* [LOG-LEAN] printf JA' e' macro->g_dbglog; fprintf duplicado removido */
+    if (g_dbglog) dbg_flush();
 }
 
 /* ── [EVICT-LIN] Eviccao de EMERGENCIA p/ caber um tileset grande (4444) ──────
@@ -287,7 +317,7 @@ unsigned display_3ds_evict_linear(unsigned want_bytes) {
     const char* ok = (big_after >= want_bytes) ? "CABE agora" : "AINDA NAO cabe (fragmentado)";
     printf("[TEX|EVICT-LIN] evictou %d tex (~%.0fKB) | maior_bloco %.0f->%.0fKB | precisa %.0fKB -> %s\n",
            freed, freed_bytes/1024.0, big_before/1024.0, big_after/1024.0, want_bytes/1024.0, ok);
-    if (g_dbglog) {
+    if (g_dbglog && g_log_verbose) {
         fprintf(g_dbglog, "[TEX|EVICT-LIN] evictou %d tex (~%.0fKB pot) | linear_livre %.0f->%.0fKB "
                 "(ganho=%.0fKB) | maior_bloco %.0f->%.0fKB | precisa %.0fKB -> %s\n",
                 freed, freed_bytes/1024.0, lin_before/1024.0, lin_after/1024.0,
@@ -318,8 +348,18 @@ int display_3ds_blit_count() { return s_blit_total; }
  * display_3ds_init
  * [DBG] Verifica se render targets foram criados. NULL aqui = ecrã preto garantido.
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* [ATLAS-ETERNO 2026-07-11] a textura do atlas do tilemap (1024x1024 POT, 4MB)
+ * e' criada UMA vez aqui (linear virgem -> sucesso garantido) e partilhada por
+ * todos os pedidos 832x704 (ver create_texture). Nunca e' C3D_TexDelete'ada. */
+C3D_Tex g_atlas_tex;
+bool g_atlas_tex_ok = false;
+bool g_atlas_tex_busy = false;
+
 void display_3ds_init() {
     printf("[DISPLAY|INIT] a criar render targets...\n");
+    g_atlas_tex_ok = C3D_TexInit(&g_atlas_tex, 1024, 1024, GPU_RGBA8);
+    printf("[ATLAS-ETERNO] textura 1024x1024 (4MB) criada no boot -> %s\n",
+           g_atlas_tex_ok ? "OK" : "FALHOU");
     s_top    = C2D_CreateScreenTarget(GFX_TOP,    GFX_LEFT);
     s_bottom = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
 
@@ -342,7 +382,47 @@ void display_3ds_init() {
  * display_3ds_begin_frame
  * [DBG] Verifica render target antes de usar. Detecta se init falhou.
  * ═══════════════════════════════════════════════════════════════════════════ */
+int g_bd_battle_frame_flag = 0;   /* [BLITDIAG v4] posto pelo sprite_binding (assinatura real do battler) */
+/* [SPRFX] estado por-blit (posto por sprites_draw_all; neutro por omissao) */
+float g_blit_angle = 0.0f; bool g_blit_mirror = false;
+unsigned char g_blit_color[4] = {0,0,0,0};
+float g_blit_tone[3] = {0,0,0};
+
+/* [BLEND-MODE 2026-07-10] blend_type RGSS por blit (0=normal 1=aditivo 2=sub).
+ * O campo existia no Sprite3DS mas NUNCA chegava ao GPU -> as animacoes de
+ * ataque (glows/beams, blend=1) e sombras custom (blend=2) desenhavam como
+ * alpha normal (caixas bacas). C2D bufferiza quads: mudar a equacao exige
+ * C2D_Flush() -- so' acontece na MUDANCA de modo (frames normais: 0 flushes).
+ * s_gpu_blend=-1 no inicio de frame forca re-aplicar (C2D pode repor estado). */
+int g_blit_blend = 0;
+static int s_gpu_blend = -1;
+static inline void mkxp_apply_blend(void) {
+    if (g_blit_blend == s_gpu_blend) return;
+    C2D_Flush();
+    switch (g_blit_blend) {
+    case 1:  /* aditivo: dst + src*alpha */
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD,
+                       GPU_SRC_ALPHA, GPU_ONE,
+                       GPU_SRC_ALPHA, GPU_ONE);
+        break;
+    case 2:  /* subtrativo: dst - src*alpha (reverse subtract) */
+        C3D_AlphaBlend(GPU_BLEND_REVERSE_SUBTRACT, GPU_BLEND_ADD,
+                       GPU_SRC_ALPHA, GPU_ONE,
+                       GPU_ZERO, GPU_ONE);
+        break;
+    default: /* normal: src-over */
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD,
+                       GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
+                       GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
+        break;
+    }
+    s_gpu_blend = g_blit_blend;
+}
+
 void display_3ds_begin_frame() {
+    /* [BLEND-MODE] estado GPU desconhecido no inicio do frame -> forca
+     * re-aplicacao no 1o blit (e garante neutro herdado de frames anteriores). */
+    g_blit_blend = 0; s_gpu_blend = -1;
     /* Super Debug: sincronizar o contador de frame global para todas as
      * categorias poderem carimbar a que frame pertence o evento. */
     dbg_set_frame(s_frame_count);
@@ -354,7 +434,8 @@ void display_3ds_begin_frame() {
         super_snapshot();
 
     /* [DBG] Frame 0,1,2 + cada 300: confirmar que o render está a arrancar */
-    if (s_frame_count < 3 || s_frame_count % 300 == 0) {
+    extern bool g_log_verbose;
+    if (g_log_verbose && (s_frame_count < 3 || s_frame_count % 1800 == 0)) {   /* [LOG-LEAN] */
         printf("[DISPLAY|FRAME] begin #%d "
                "(tex_ok=%d tex_fail=%d blit_total=%d)\n",
                s_frame_count, s_tex_created, s_tex_failed, s_blit_total);
@@ -424,7 +505,8 @@ void display_3ds_end_frame() {
      * tambem vai para o g_dbglog) e dava fflush a cada 60 frames, o que custava
      * escrita SINCRONA ao SD com frequencia. Mantemos UM fflush aqui para a
      * forense (a 1x/300f o custo e' irrelevante). */
-    if ((s_frame_count % 300) == 0) {
+    extern bool g_log_verbose;
+    if (g_log_verbose && (s_frame_count % 300) == 0) {
         extern FILE *g_dbglog;
         if (g_dbglog) {
             fprintf(g_dbglog, "[HEARTBEAT] vivo -- frame %d\n", s_frame_count);
@@ -459,7 +541,8 @@ void display_3ds_end_frame() {
     }
 
     /* [DBG] Frame 1,2,3 + cada 300: relatório de blits */
-    bool do_log = (s_frame_count <= 3 || s_frame_count % 300 == 0);
+    extern bool g_log_verbose;
+    bool do_log = g_log_verbose && (s_frame_count <= 3 || s_frame_count % 1800 == 0);   /* [LOG-LEAN] */
 
     if (do_log) {
         printf("[DISPLAY|FRAME] end #%d: blits=%d skipped=%d\n",
@@ -506,7 +589,7 @@ void display_3ds_end_frame() {
     PROF_END(PROF_FRAME_RENDER);     /* fecha o render */
     g_prof_blits += (uint64_t)s_blit_count;
 
-    if ((s_frame_count % 60) == 0 && s_frame_count > 0) {
+    if ((s_frame_count % 300) == 0 && s_frame_count > 0) {
         double upd_ms = prof_ticks_to_ms(g_prof_zones[PROF_FRAME_UPDATE].total_ticks);
         double rnd_ms = prof_ticks_to_ms(g_prof_zones[PROF_FRAME_RENDER].total_ticks);
         uint64_t upd_n = g_prof_zones[PROF_FRAME_UPDATE].count;
@@ -522,8 +605,7 @@ void display_3ds_end_frame() {
             upd_avg > rnd_avg ? "LOGICA Ruby" : "RENDER C++",
             (unsigned long long)g_prof_objs_created,
             (unsigned long long)g_prof_frees);
-        printf("%s", line);
-        if (g_dbglog) { fprintf(g_dbglog, "%s", line); dbg_flush(); }
+        if (g_dbglog) { fprintf(g_dbglog, "%s", line); dbg_flush(); }   /* [LOG-LEAN] printf removido (stdout duplicava no log) */
         /* reset das zonas de frame para a media ser dos ULTIMOS 60 frames, nao
          * acumulada desde o boot (senao a media fica "achatada" e nao reflete o
          * estado atual, ex: menu vs mapa). */
@@ -578,10 +660,47 @@ DS3Texture* display_3ds_create_texture(int w, int h, const unsigned char* rgba, 
 
     /* [DBG] Log das primeiras 10 texturas sempre */
     static int s_tex_log_count = 0;
-    bool do_log = (s_tex_log_count < 10);
+    extern bool g_log_verbose;
+    bool do_log = g_log_verbose && (s_tex_log_count < 10);
     if (do_log) {
         printf("[TEX|CREATE] #%d: src=%dx%d → POT=%dx%d (%.1fKB VRAM)\n",
                s_tex_log_count + 1, w, h, tw, th, (tw*th*4)/1024.0f);
+    }
+
+    /* [ATLAS-ETERNO 2026-07-11] o ATLAS do tilemap (janela 832x704 -> POT
+     * 1024x1024 = 4MB) e' A textura que pintava o chao — e falhava por
+     * fragmentacao do linear no meio da sessao (437x KILL-TEXINVALID 832x704 =
+     * mapa preto), porque e' recriada a cada mudanca de mapa. Solucao
+     * DETERMINISTICA: a textura e' criada UMA vez no display_3ds_init (linear
+     * virgem, sucesso garantido) e PARTILHADA: qualquer pedido 832x704 recebe-a
+     * (busy-flag evita dupla posse); o destroy liberta a posse SEM C3D_TexDelete
+     * -> existe para sempre, imune a fragmentacao. */
+    extern C3D_Tex g_atlas_tex; extern bool g_atlas_tex_ok, g_atlas_tex_busy;
+    if (w == 832 && h == 704 && g_atlas_tex_ok && !g_atlas_tex_busy) {
+        tex->tex = g_atlas_tex;
+        tex->is_shared_atlas = true;
+        g_atlas_tex_busy = true;
+        tex->valid = true;
+        tex->pot_bytes = (unsigned)(tw * th * 4);
+        tex->create_frame = s_frame_count;
+        s_tex_created++; s_tex_alive++;
+        if (s_tex_alive > s_tex_alive_peak) s_tex_alive_peak = s_tex_alive;
+        s_tex_bytes += tex->pot_bytes;
+        if (s_tex_bytes > s_tex_bytes_peak) s_tex_bytes_peak = s_tex_bytes;
+        s_tex_hist[tex_bucket(tex->pot_bytes)]++;
+        /* upload dos pixels (mesmo caminho in-place do LAYER0-REUSE) */
+        display_3ds_update_texture(tex, w, h, rgba);
+        return tex;
+    }
+    /* [ATLAS-HANDOFF] fim do silencio: se um 832x704 chega aqui com o atlas
+     * OCUPADO, alguem nao largou a posse (ex.: buffer estacionado no L0CACHE
+     * antes do __drop_texture) — nomear o estado evita outra sessao de caca. */
+    if (w == 832 && h == 704 && g_atlas_tex_ok && g_atlas_tex_busy) {
+        static int s_atlas_busy_logs = 0;
+        if (s_atlas_busy_logs < 6) {
+            s_atlas_busy_logs++;
+            printf("[ATLAS-ETERNO] AVISO: pedido 832x704 com o atlas OCUPADO -> vai tentar textura normal 4MB (quem tem a posse nao a largou)\n");
+        }
     }
 
     /* [fix #5] TILESET COMPACTADO marcado pelo probe (prefer_vram): tentar VRAM
@@ -937,7 +1056,10 @@ void display_3ds_free_texture(DS3Texture* t) {
     if (t->valid) {
         /* VRAM e linear vêm de alocadores diferentes: libertar pelo caminho
          * certo (vramFree vs linearFree/C3D_TexDelete) evita corrupcao do heap. */
-        if (t->in_vram) {
+        if (t->is_shared_atlas) {
+            /* [ATLAS-ETERNO] a textura pertence ao boot; so' libertar a POSSE. */
+            g_atlas_tex_busy = false;
+        } else if (t->in_vram) {
             if (t->tex.data) vramFree(t->tex.data);
             t->tex.data = nullptr;
             s_tex_vram_live--;
@@ -1228,36 +1350,95 @@ void display_3ds_blit(DS3Texture* t,
         (u16)(int)((v_top - v_bottom) * th + 0.5f),
         u0, v_top, u1, v_bottom
     };
+    /* [SPRFX 2026-07-10] angle/mirror/color/tone POR SPRITE — os campos existiam
+     * no struct (setters RGSS ok) mas NUNCA eram aplicados no desenho. Globais
+     * postos por sprites_draw_all antes do blit e repostos depois (neutro=~0 custo). */
+    if (g_blit_mirror) { float utmp = sub.left; sub.left = sub.right; sub.right = utmp; }
     C2D_Image img = { &t->tex, &sub };
     C2D_DrawParams p = { {fdx, fdy, fdw, fdh}, {0.0f, 0.0f}, 0.5f, 0.0f };
+    if (g_blit_angle != 0.0f) {
+        /* citro2d roda em torno de pos+center; compensa o pos p/ girar no CENTRO
+         * do quad. So' mexe quando ha' angulo (center!=0 com angle=0 desloca). */
+        p.center.x = fdw * 0.5f; p.center.y = fdh * 0.5f;
+        p.pos.x += p.center.x;   p.pos.y += p.center.y;
+        p.angle = -g_blit_angle * 0.017453293f;   /* graus RGSS (anti-horario) -> rad */
+    }
 
-    /* FIX BRANCO: C2D_PlainImageTint(..., 1.0f) usava blend=1.0, o que SUBSTITUI
-     * os pixels da imagem pela cor da tinta (branco) -> a imagem aparecia como
-     * um retangulo branco com a forma/opacidade certa mas sem o conteudo.
-     * Solucao: blend=0.0 em cada canto (mantem RGB original) e usar so o alpha
-     * do tint para a opacidade. */
+    /* FIX BRANCO (historico): blend=0 mantem o RGB; alpha do tint = opacidade.
+     * [SPRFX] color (mistura p/ a cor, peso=alpha — flash de captura) e tone
+     * (aprox: positivo mistura p/ a cor do tone, negativo escurece) -> blend. */
+    float tblend = 0.0f, tr = 1.0f, tg = 1.0f, tb = 1.0f;
+    if (g_blit_color[3] > 0) {
+        tblend = g_blit_color[3] / 255.0f;
+        tr = g_blit_color[0] / 255.0f; tg = g_blit_color[1] / 255.0f; tb = g_blit_color[2] / 255.0f;
+    } else if (g_blit_tone[0] != 0.0f || g_blit_tone[1] != 0.0f || g_blit_tone[2] != 0.0f) {
+        float mx = g_blit_tone[0]; if (g_blit_tone[1] > mx) mx = g_blit_tone[1]; if (g_blit_tone[2] > mx) mx = g_blit_tone[2];
+        float mn = g_blit_tone[0]; if (g_blit_tone[1] < mn) mn = g_blit_tone[1]; if (g_blit_tone[2] < mn) mn = g_blit_tone[2];
+        if (mx > 0.0f) {
+            tblend = (mx / 255.0f) * 0.85f;
+            tr = (g_blit_tone[0] > 0 ? g_blit_tone[0] : 0) / mx;
+            tg = (g_blit_tone[1] > 0 ? g_blit_tone[1] : 0) / mx;
+            tb = (g_blit_tone[2] > 0 ? g_blit_tone[2] : 0) / mx;
+        } else if (mn < 0.0f) {
+            tblend = (-mn / 255.0f); tr = tg = tb = 0.0f;
+        }
+    }
     C2D_ImageTint tint;
-    u32 tcol = C2D_Color32f(1.0f, 1.0f, 1.0f, alpha);
+    u32 tcol = C2D_Color32f(tr, tg, tb, alpha);
     for (int ci = 0; ci < 4; ci++) {
         tint.corners[ci].color = tcol;
-        tint.corners[ci].blend = 0.0f;
+        tint.corners[ci].blend = tblend;
     }
+    mkxp_apply_blend();   /* [BLEND-MODE] */
+    /* [EVICT-USO 2026-07-11] carimbar o USO no DRAW: o last_blit_frame so' era
+     * escrito no UPLOAD -> texturas estaticas (charsets desenhados todos os
+     * frames sem re-upload) pareciam "idle" aos 120 frames e o TEX-PRESSURE
+     * evictava-as EM USO (log 22:07: os 6 handles de personagens trocados apos
+     * cada evict preventivo = re-uploads em loop, trabalho por frame perdido). */
+    t->last_blit_frame = s_frame_count;
     C2D_DrawImage(img, &p, &tint);
 }
 
 void display_3ds_fill_rect(float x, float y, float w, float h,
                            unsigned char r, unsigned char g,
                            unsigned char b, unsigned char a) {
+    /* [BLEND-MODE] overlays (SCREENFX/TRANS-FADE) sao sempre src-over; se o
+     * ultimo blit deixou o GPU em aditivo, repor (g_blit_blend ja esta a 0). */
+    mkxp_apply_blend();
     C2D_DrawRectSolid(x, y, 0.5f, w, h, C2D_Color32(r, g, b, a));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * display_3ds_blit_ex — versão com destino dw/dh separado (zoom != 1.0)
  * ═══════════════════════════════════════════════════════════════════════════ */
+/* [BLITDIAG 2026-07-09] switch runtime $MKXP_BLITDIAG=true (probe linha 1; espelhado
+ * em binding). Regista CADA blit de sprites tamanho-battler (192x192) E databox
+ * (160x136, o controlo que APARECE): ordem-no-frame, tex ptr/valid, quad destino,
+ * src, alpha. Compara battler vs databox no MESMO frame -> revela se o battler e'
+ * desenhado antes do fundo (overdraw intra-frame), tex errada, ou quad fora.
+ * Desligar: $MKXP_BLITDIAG=false (ou remover a linha do probe). Cap 200 linhas. */
+bool g_blitdiag = false;
 void display_3ds_blit_ex(DS3Texture* t,
                           float dx, float dy, float dw, float dh,
                           float sx, float sy, float sw, float sh,
                           float alpha) {
+    /* filtro v2: TUDO >=136px em ambas as dims (battler 192/346/401, databox 160x136,
+     * backdrop 512x384, tilemap 832x704) -> ve-se a ORDEM intra-frame completa. */
+    if (g_blitdiag && t && t->width >= 136 && t->height >= 136) {
+        extern FILE *g_dbglog; static int bd_n = 0; static int bd_seq = 0, bd_fr = -1;
+        /* v4: o flag vem do sprite_binding (assinatura REAL do battler: bitmap
+         * 192x192 + viewport batalha + z 5..50). O titulo (arte 346/401, paineis
+         * 328) ja' NAO consome o cap — so' a batalha a serio e' registada. */
+        extern int g_bd_battle_frame_flag;
+        bool bd_battle_frame = (g_bd_battle_frame_flag != 0);
+        if (bd_fr != s_frame_count) { bd_fr = s_frame_count; bd_seq = 0; }
+        bd_seq++;
+        if (bd_battle_frame && bd_n < 600 && g_dbglog) { bd_n++;
+            fprintf(g_dbglog, "[BLITDIAG] f=%d seq=%d tex=%p %dx%d valid=%d dst=(%.0f,%.0f %.0fx%.0f) src=(%.0f,%.0f %.0fx%.0f) a=%.2f\n",
+                    s_frame_count, bd_seq, (void*)t, t->width, t->height, t->valid?1:0,
+                    dx, dy, dw, dh, sx, sy, sw, sh, alpha);
+            fflush(g_dbglog); }
+    }
     if (!t) {
         s_blit_skipped++;
         if (s_blit_skipped <= 5) {
@@ -1356,19 +1537,51 @@ void display_3ds_blit_ex(DS3Texture* t,
         (u16)(int)((v_top - v_bottom) * th + 0.5f),
         u0, v_top, u1, v_bottom
     };
+    /* [SPRFX 2026-07-10] angle/mirror/color/tone POR SPRITE — os campos existiam
+     * no struct (setters RGSS ok) mas NUNCA eram aplicados no desenho. Globais
+     * postos por sprites_draw_all antes do blit e repostos depois (neutro=~0 custo). */
+    if (g_blit_mirror) { float utmp = sub.left; sub.left = sub.right; sub.right = utmp; }
     C2D_Image img = { &t->tex, &sub };
     C2D_DrawParams p = { {fdx, fdy, fdw, fdh}, {0.0f, 0.0f}, 0.5f, 0.0f };
+    if (g_blit_angle != 0.0f) {
+        /* citro2d roda em torno de pos+center; compensa o pos p/ girar no CENTRO
+         * do quad. So' mexe quando ha' angulo (center!=0 com angle=0 desloca). */
+        p.center.x = fdw * 0.5f; p.center.y = fdh * 0.5f;
+        p.pos.x += p.center.x;   p.pos.y += p.center.y;
+        p.angle = -g_blit_angle * 0.017453293f;   /* graus RGSS (anti-horario) -> rad */
+    }
 
-    /* FIX BRANCO: C2D_PlainImageTint(..., 1.0f) usava blend=1.0, o que SUBSTITUI
-     * os pixels da imagem pela cor da tinta (branco) -> a imagem aparecia como
-     * um retangulo branco com a forma/opacidade certa mas sem o conteudo.
-     * Solucao: blend=0.0 em cada canto (mantem RGB original) e usar so o alpha
-     * do tint para a opacidade. */
+    /* FIX BRANCO (historico): blend=0 mantem o RGB; alpha do tint = opacidade.
+     * [SPRFX] color (mistura p/ a cor, peso=alpha — flash de captura) e tone
+     * (aprox: positivo mistura p/ a cor do tone, negativo escurece) -> blend. */
+    float tblend = 0.0f, tr = 1.0f, tg = 1.0f, tb = 1.0f;
+    if (g_blit_color[3] > 0) {
+        tblend = g_blit_color[3] / 255.0f;
+        tr = g_blit_color[0] / 255.0f; tg = g_blit_color[1] / 255.0f; tb = g_blit_color[2] / 255.0f;
+    } else if (g_blit_tone[0] != 0.0f || g_blit_tone[1] != 0.0f || g_blit_tone[2] != 0.0f) {
+        float mx = g_blit_tone[0]; if (g_blit_tone[1] > mx) mx = g_blit_tone[1]; if (g_blit_tone[2] > mx) mx = g_blit_tone[2];
+        float mn = g_blit_tone[0]; if (g_blit_tone[1] < mn) mn = g_blit_tone[1]; if (g_blit_tone[2] < mn) mn = g_blit_tone[2];
+        if (mx > 0.0f) {
+            tblend = (mx / 255.0f) * 0.85f;
+            tr = (g_blit_tone[0] > 0 ? g_blit_tone[0] : 0) / mx;
+            tg = (g_blit_tone[1] > 0 ? g_blit_tone[1] : 0) / mx;
+            tb = (g_blit_tone[2] > 0 ? g_blit_tone[2] : 0) / mx;
+        } else if (mn < 0.0f) {
+            tblend = (-mn / 255.0f); tr = tg = tb = 0.0f;
+        }
+    }
     C2D_ImageTint tint;
-    u32 tcol = C2D_Color32f(1.0f, 1.0f, 1.0f, alpha);
+    u32 tcol = C2D_Color32f(tr, tg, tb, alpha);
     for (int ci = 0; ci < 4; ci++) {
         tint.corners[ci].color = tcol;
-        tint.corners[ci].blend = 0.0f;
+        tint.corners[ci].blend = tblend;
     }
+    mkxp_apply_blend();   /* [BLEND-MODE] */
+    /* [EVICT-USO 2026-07-11] carimbar o USO no DRAW: o last_blit_frame so' era
+     * escrito no UPLOAD -> texturas estaticas (charsets desenhados todos os
+     * frames sem re-upload) pareciam "idle" aos 120 frames e o TEX-PRESSURE
+     * evictava-as EM USO (log 22:07: os 6 handles de personagens trocados apos
+     * cada evict preventivo = re-uploads em loop, trabalho por frame perdido). */
+    t->last_blit_frame = s_frame_count;
     C2D_DrawImage(img, &p, &tint);
 }

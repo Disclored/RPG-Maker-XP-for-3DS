@@ -17,7 +17,24 @@ extern FILE *g_dbglog;
  * escritas (contador global partilhado); o resto fica em buffer. Em caso de
  * crash perdem-se no maximo ~64 linhas de log -- troca aceitavel pelo ganho. */
 extern int g_dbglog_flushc;
-#define printf(fmt, ...) do { if (g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); \
+#include <cstring>
+
+/* [SPRFX/SCREENFX] helpers type-checked de etc_binding */
+extern "C" void *mkxp_etc_tone_ptr(mrb_state*, mrb_value);
+extern "C" void *mkxp_etc_color_ptr(mrb_state*, mrb_value);
+extern "C" void *mkxp_etc_rect_ptr(mrb_state*, mrb_value);   /* [VP-REGISTRY] */
+#include <mruby/array.h>                                      /* [VP-REGISTRY] */
+extern bool g_log_verbose;
+extern bool g_boot_done;
+/* [BOOT-LEAN] durante o boot, os printf deste ficheiro (GFX, WD, etc.) so' passam
+ * se forem plugins/GameData/erros. */
+static inline bool __raw_suppress(const char *fmt){
+    if (g_log_verbose || !fmt) return false;
+    if (strstr(fmt,"FALH")||strstr(fmt,"ERRO")||strstr(fmt,"WARN")||strstr(fmt,"CRASH")) return false;
+    if (!g_boot_done && (strstr(fmt,"[PLUGINS]")||strstr(fmt,"[Game.init]"))) return false;
+    return true;
+}
+#define printf(fmt, ...) do { if (!__raw_suppress(fmt) && g_dbglog) { fprintf(g_dbglog, fmt, ##__VA_ARGS__); \
     if (++g_dbglog_flushc >= 64) { g_dbglog_flushc = 0; dbg_flush(); } } } while(0)
 
 /* OTIMIZACAO 3DS: controla os logs por-frame do grph_update. 0 = silencioso
@@ -55,6 +72,7 @@ static bool s_frozen      = false;
 static int  s_fade_left  = 0;
 static int  s_fade_total = 0;
 static long long g_last_present_us = 0;   /* limitador de FPS por relogio (us) */
+extern "C" void display_3ds_evict_pressure(int);   /* [TEX-PRESSURE] valvula preventiva */
 
 /* FIX vsync judder (precipicio 30->20fps): ver bloco de pacing em grph_update.
  * true  = pacing suave (frames lentos seguem ja', sem o salto 35ms->50ms);
@@ -155,6 +173,65 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
         mrb_raise(mrb, E_RUNTIME_ERROR, "aptMainLoop: quit requested");
     }
 
+    /* [EPOCH-CLOCK] avanca o relogio de recencia do GIANT-LRU/OOM-STRIP mesmo
+     * quando ninguem compoe (batalha/menus) — sem isto "parado" era indetectavel. */
+    { extern void mkxp_epoch_tick(void); mkxp_epoch_tick(); }
+
+    /* [CHURN-WATCH 2026-07-11] vigia catch-all do churn de 1.5M objetos/batalha:
+     * loga quando gc.live CRUZA 800k (subida), 1x por cruzamento, com o frame.
+     * Correlaciona com os marcos [MFD] da batalha para localizar a fase que
+     * explode, mesmo que nao seja o setPokemonBitmap ([CHURN-TRACE]). Barato:
+     * 1 leitura de campo + comparacao por frame. */
+    extern mrb_state *g_mkxp_mrb;
+    if (g_mkxp_mrb && g_dbglog) {
+        static bool s_cw_high = false;
+        int _cw_live = (int)g_mkxp_mrb->gc.live;
+        if (!s_cw_high && _cw_live > 800000) {
+            s_cw_high = true;
+            fprintf(g_dbglog, "[CHURN-WATCH] gc.live CRUZOU 800k (=%d) no frame %d -- fase que explode\n",
+                    _cw_live, s_frame_count);
+            fflush(g_dbglog);
+        } else if (s_cw_high && _cw_live < 400000) {
+            s_cw_high = false;   /* re-arma apos o GC baixar */
+        }
+    }
+
+    /* [GC-CEILING 2026-07-11] TETO RIGIDO no TOPO GARANTIDO do grph_update (a
+     * valvula normal de 720k vive dentro do bloco de render, SALTADO no titulo/
+     * transicoes — por isso o [CHURN-WATCH] apanhou 1.39M sem GC). Aqui corre
+     * SEMPRE: acima de 1M, full_gc JA', ignorando o cooldown. So' dispara em
+     * churn patologico (titulo/batalha/EBDX) -> zero custo no jogo normal (<720k),
+     * mata o pico de 1.4M que esgota o malloc (magenta/OOM) e o stall do sweep
+     * gigante. Gate $__gc_ceiling=false reverte. */
+    if (g_mkxp_mrb) {
+        bool _gc_ceiling = true;
+        { mrb_value _v = mrb_gv_get(g_mkxp_mrb, mrb_intern_cstr(g_mkxp_mrb, "$__gc_ceiling"));
+          if (!mrb_nil_p(_v)) _gc_ceiling = mrb_test(_v); }
+        static int s_ceil_cool = 0;
+        if (s_ceil_cool > 0) s_ceil_cool--;
+        if (_gc_ceiling && s_ceil_cool == 0 && (size_t)g_mkxp_mrb->gc.live > 1000000) {
+            size_t _cb = (size_t)g_mkxp_mrb->gc.live;
+            mrb_full_gc(g_mkxp_mrb);
+            s_ceil_cool = 8;   /* min 8 frames entre tetos (evita thrash mas cobre bursts) */
+            if (g_dbglog) {
+                fprintf(g_dbglog, "[GC|TETO] vivos=%u > 1M -> full_gc -> %u (recolheu %d) [frame %d]\n",
+                        (unsigned)_cb, (unsigned)g_mkxp_mrb->gc.live,
+                        (int)((long)_cb - (long)g_mkxp_mrb->gc.live), s_frame_count);
+                fflush(g_dbglog);
+            }
+        }
+    }
+
+    /* [GFXSPLIT 2026-07-05] fatias EXATAS do grph_update (o FRAMEBUDGET provou
+     * gfx=26-28ms/frame com render+swap ~9 -> 14-18ms escondidos AQUI dentro).
+     * A=fixes/checks do topo; B=render(begin+draw+end); C=GC-idle+pacing+resto.
+     * Report 1x/600 frames no g_dbglog. Tick->ms: /268123.48 */
+    u64 _gs_t0 = svcGetSystemTick();
+    u64 _dperf_t0 = 0, _dperf_t1 = 0, _dperf_t2 = 0;   /* hoisted: o if do render foi partido */
+    static double s_gs_a = 0, s_gs_b = 0, s_gs_c = 0;
+    static double s_gs_gc = 0, s_gs_sleep = 0;   /* sub-fatias: GC (idle+slack) e vblank+sleep do cap */
+    static int s_gs_n = 0;
+
     /* [SAVETIME-FIX retry 2026-07-02] Anti-crash "comparison of Integer with Time"
      * no TITULO (Scene_Intro->closeTitle->get_newest_save_slot). Um save legado tem
      * Player#last_time_saved como Integer (epoch); a comparacao usa Integer#> que nao
@@ -212,19 +289,14 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
         }
     }
 
-    /* [FIX-INPUT-TRANSITION] toggle runtime: le 1x/frame o global Ruby e propaga ao
-     * input_binding (gap-flush). nil/ausente = ON. */
-    {
-        extern bool g_input_flush_on;
-        mrb_value _fv = mrb_gv_get(mrb, mrb_intern_cstr(mrb, "$MKXP_INPUT_FLUSH_ON_TRANSITION"));
-        g_input_flush_on = (mrb_nil_p(_fv) || mrb_test(_fv));
-    }
-
-    /* FIX INPUT: NAO chamar hidScanInput() aqui. O inputBindingUpdate() ja faz
-     * hidScanInput() internamente (via input_3ds_poll). Dois scans seguidos no
-     * mesmo frame fazem o segundo devolver keysDown=0 -> os triggers (ex: botao A
-     * = Input::USE para avancar o titulo) sao limpos antes do jogo os ler. */
-    inputBindingUpdate();
+    /* [INPUT-MOVIDO 2026-07-05] O poll de input (inputBindingUpdate: hidScanInput
+     * + latches) custava ~2-4ms REAIS na fatia critica do frame (GFXSPLIT:
+     * fixes_topo=4.4ms — no Azahar o HID emulado e' caro). O poll so' precisa de
+     * acontecer ANTES do proximo scene.update — movido para DEPOIS do render
+     * (ver [INPUT-POLL-TARDIO] abaixo), onde se sobrepoe ao tempo que ia ser
+     * cap_sleep: nos frames rapidos os ms saem de graca. Semantica intacta:
+     * o main loop e' Graphics.update -> Input.update -> scene.update, por isso
+     * o poll no FIM do grph_update continua a preceder a leitura do jogo. */
 
     /* ── [FCRAM] VÁLVULA DE SEGURANÇA anti-OOM de OBJETOS (crash do roupeiro) ───
      * O full_gc no freeze (grph_freeze) limpa o lixo ENTRE cenas. Mas um menu
@@ -290,22 +362,55 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
         printf("[GFX|BUG]   → Graphics.freeze() foi chamado durante init, sem transition() depois.\n");
     }
 
-    if (!s_frozen) {
+    extern bool g_log_verbose;   /* [LIMPEZA] gate dos diagnosticos runtime C-puros */
+
+    /* [FRAMESKIP 2026-07-11, padrao Better Fast-Forward provado em Essentials]
+     * Quando a LOGICA Ruby estourou o orcamento (frame anterior >40ms), salta a
+     * COMPOSICAO deste ciclo (a logica continua; o LCD mantem o frame anterior)
+     * — em vez de slow-motion, o jogo larga 1 frame visual e mantem o ritmo.
+     * Nunca salta: durante freeze/transicao (o present e' o efeito), 2 frames
+     * seguidos (half-rate minimo), ou os primeiros 300 frames (boot/intro).
+     * Kill-switch: $MKXP_FRAMESKIP=false. */
+    bool skip_render = false;
+    {
+        static int fs_on = -1;
+        if (fs_on < 0) {
+            mrb_value fv = mrb_gv_get(mrb, mrb_intern_lit(mrb, "$MKXP_FRAMESKIP"));
+            fs_on = (!mrb_nil_p(fv) && !mrb_test(fv)) ? 0 : 1;   /* default ON */
+        }
+        static u64 fs_last_tick = 0;
+        static bool fs_skipped_last = false;
+        u64 now = svcGetSystemTick();
+        double frame_ms = fs_last_tick ? (double)(now - fs_last_tick) / 268123.48 : 0.0;
+        fs_last_tick = now;
+        if (fs_on == 1 && !s_frozen && s_frame_count > 300 &&
+            frame_ms > 40.0 && !fs_skipped_last) {
+            skip_render = true;
+            fs_skipped_last = true;
+        } else {
+            fs_skipped_last = false;
+        }
+    }
+
+    if (!s_frozen && !skip_render) {
         /* [DBG-B] Antes de draw: confirmar que o render target existe */
-        if (s_frame_count < 3 || s_frame_count % 300 == 0) {
+        if (g_log_verbose && (s_frame_count < 3 || s_frame_count % 300 == 0)) {
             printf("[GFX|RENDER] frame %d → begin_frame + sprites_draw_all + end_frame\n",
                    s_frame_count);
         }
 
+        u64 _gs_t1 = svcGetSystemTick();
+        s_gs_a += (double)(_gs_t1 - _gs_t0) / 268123.48;
+        _gs_t0 = _gs_t1;   /* reutiliza p/ medir o render */
         display_3ds_begin_frame();
 
         /* [DBG-B] sprites_draw_all é uma caixa negra — meter probe antes/depois */
         int pre_blit = display_3ds_blit_count();   /* ← adicionar accessor em display_3ds */
-        u64 _dperf_t0 = osGetTime();   /* [DIAG-PERF] ms */
+        _dperf_t0 = osGetTime();   /* [DIAG-PERF] ms */
         tilemaps_draw_all();
-        u64 _dperf_t1 = osGetTime();   /* [DIAG-PERF] */
+        _dperf_t1 = osGetTime();   /* [DIAG-PERF] */
         sprites_draw_all();
-        u64 _dperf_t2 = osGetTime();   /* [DIAG-PERF] */
+        _dperf_t2 = osGetTime();   /* [DIAG-PERF] */
         /* DUMP-DE-FRAME (botao Y): despeja todos os sprites DESTE frame, ja'
          * ordenados por z. So' corre quando o utilizador pediu (flag do input).
          * Limita a alguns despejos por sessao para nao encher o SD se ficar
@@ -337,7 +442,145 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
             s_fade_left--;
         }
 
-        if (s_frame_count < 3 || s_frame_count % 300 == 0) {
+        /* [SCREENFX 2026-07-10] tone + flash do $game_screen — 2139 usos no jogo
+         * (Tint/Flash Screen de eventos) eram NO-OP no 3DS: cutscenes sem anoitecer,
+         * sem flashes de relampago, sem escurecer de caves. Overlay pos-sprites:
+         *  - tone negativo -> retangulo preto (escurece);
+         *  - tone positivo -> retangulo da cor do tone (aprox de clarear; sem blend
+         *    aditivo no fill_rect, o alpha e' escalado a 55% p/ nao "lavar");
+         *  - flash_color (alpha>0) -> retangulo da cor (o proprio jogo decai o alpha).
+         * Custo: 1 gv_get + 2 iv_get por frame; rects so' quando ativos.
+         * (shake fica p/ ciclo proprio: exige transladar o alvo, nao um overlay.) */
+        /* [SCREENFX v2 2026-07-11] o bloco direto do $game_screen foi DESLIGADO:
+         * o Essentials ja propaga tudo para viewports (065_Spriteset_Map:120/144/
+         * 145 -> viewport1.ox=shake, viewport1.tone=tone, viewport3.color=flash)
+         * e agora o [VP-REGISTRY] + [TONE-DUAL] + [VPOFS] aplicam-no pelo caminho
+         * RGSS-correto -- manter o overlay direto duplicaria o tint/flash (2x
+         * mais escuro que o Windows). Reativavel p/ diagnostico: $MKXP_GSFX=true. */
+        {
+            static int gsfx_on = -1;
+            if (gsfx_on < 0) {
+                mrb_value gf = mrb_gv_get(mrb, mrb_intern_lit(mrb, "$MKXP_GSFX"));
+                gsfx_on = (!mrb_nil_p(gf) && mrb_test(gf)) ? 1 : 0;   /* default OFF */
+            }
+            static mrb_sym sy_gs = 0, sy_tn = 0, sy_fc = 0;
+            if (!sy_gs) { sy_gs = mrb_intern_lit(mrb, "$game_screen");
+                          sy_tn = mrb_intern_lit(mrb, "@tone");
+                          sy_fc = mrb_intern_lit(mrb, "@flash_color"); }
+            mrb_value gs = (gsfx_on == 1) ? mrb_gv_get(mrb, sy_gs) : mrb_nil_value();
+            if (!mrb_nil_p(gs) && mrb_type(gs) == MRB_TT_OBJECT) {
+                float SW = (float)display_3ds_screen_width();
+                float SH = (float)display_3ds_screen_height();
+                struct TF { float r,g,b,gray; };
+                struct CF { float r,g,b,a; };
+                mrb_value tv = mrb_iv_get(mrb, gs, sy_tn);
+                TF *tn = (TF*)(mrb_nil_p(tv) ? NULL : mkxp_etc_tone_ptr(mrb, tv));
+                if (tn) {
+                    float mn = tn->r; if (tn->g < mn) mn = tn->g; if (tn->b < mn) mn = tn->b;
+                    float mx = tn->r; if (tn->g > mx) mx = tn->g; if (tn->b > mx) mx = tn->b;
+                    if (mn < -1.0f) {   /* escurecer (ex: noite/cave: tone -60ss) */
+                        unsigned char a = (unsigned char)(-mn > 255 ? 255 : -mn);
+                        display_3ds_fill_rect(0, 0, SW, SH, 0, 0, 0, a);
+                    }
+                    if (mx > 1.0f) {    /* clarear/tingir (ex: por-do-sol +40,-20,-40) */
+                        unsigned char r = (unsigned char)(tn->r > 0 ? (tn->r > 255 ? 255 : tn->r) : 0);
+                        unsigned char g = (unsigned char)(tn->g > 0 ? (tn->g > 255 ? 255 : tn->g) : 0);
+                        unsigned char b = (unsigned char)(tn->b > 0 ? (tn->b > 255 ? 255 : tn->b) : 0);
+                        unsigned char a = (unsigned char)((mx > 255 ? 255 : mx) * 0.55f);
+                        display_3ds_fill_rect(0, 0, SW, SH, r, g, b, a);
+                    }
+                }
+                mrb_value fv = mrb_iv_get(mrb, gs, sy_fc);
+                CF *fc = (CF*)(mrb_nil_p(fv) ? NULL : mkxp_etc_color_ptr(mrb, fv));
+                if (fc && fc->a > 1.0f) {
+                    display_3ds_fill_rect(0, 0, SW, SH,
+                        (unsigned char)(fc->r > 255 ? 255 : fc->r),
+                        (unsigned char)(fc->g > 255 ? 255 : fc->g),
+                        (unsigned char)(fc->b > 255 ? 255 : fc->b),
+                        (unsigned char)(fc->a > 255 ? 255 : fc->a));
+                }
+            }
+            /* [VP-REGISTRY 2026-07-11, substitui o VPFX] color/tone de TODOS os
+             * viewports vivos. O VPFX so' lia $scene.@viewport — que NUNCA existe
+             * (Scene_Map/Intro/Credits nao teem @viewport) -> 176 call-sites de
+             * pbFadeOutIn (fade de entrada/saida de TODAS as cenas/lojas/menus,
+             * 080:549-576) + fades do EBDX (0090/0092/0095) ficavam sem efeito.
+             * O compat regista cada Viewport em $__mkxp_vps ao nascer; aqui
+             * percorremos a lista (poucos por cena), lemos @color/@tone via os
+             * ptr dual-path ([TONE-DUAL] cobre Ruby-puro) e desenhamos overlay
+             * no RECT do viewport (le @rect por ivars; fallback fullscreen). */
+            {
+                static mrb_sym sy_vps = 0, sy_col = 0, sy_tn2 = 0, sy_rc = 0,
+                               sy_rx = 0, sy_ry = 0, sy_rw = 0, sy_rh = 0, sy_disp = 0;
+                if (!sy_vps) { sy_vps = mrb_intern_lit(mrb, "$__mkxp_vps");
+                               sy_col = mrb_intern_lit(mrb, "@color");
+                               sy_tn2 = mrb_intern_lit(mrb, "@tone");
+                               sy_rc  = mrb_intern_lit(mrb, "@rect");
+                               sy_rx  = mrb_intern_lit(mrb, "@x");
+                               sy_ry  = mrb_intern_lit(mrb, "@y");
+                               sy_rw  = mrb_intern_lit(mrb, "@width");
+                               sy_rh  = mrb_intern_lit(mrb, "@height");
+                               sy_disp= mrb_intern_lit(mrb, "@disposed"); }
+                mrb_value vlist = mrb_gv_get(mrb, sy_vps);
+                if (mrb_array_p(vlist)) {
+                    float SW = (float)display_3ds_screen_width();
+                    float SH = (float)display_3ds_screen_height();
+                    struct CF2 { float r,g,b,a; };
+                    struct TF2 { float r,g,b,gray; };
+                    mrb_int vn = RARRAY_LEN(vlist);
+                    for (mrb_int vi = 0; vi < vn; vi++) {
+                        mrb_value vp = mrb_ary_ref(mrb, vlist, vi);
+                        if (mrb_nil_p(vp) || mrb_type(vp) != MRB_TT_OBJECT) continue;
+                        if (mrb_test(mrb_iv_get(mrb, vp, sy_disp))) continue;
+                        /* rect do viewport (Ruby-puro ou nativo via ivars do compat) */
+                        float rx = 0, ry = 0, rw = SW, rh = SH;
+                        mrb_value ro = mrb_iv_get(mrb, vp, sy_rc);
+                        if (!mrb_nil_p(ro)) {
+                            void *rp = mkxp_etc_rect_ptr(mrb, ro);
+                            if (rp) { struct RI { int x,y,w,h; }; RI *r = (RI*)rp;
+                                      rx=(float)r->x; ry=(float)r->y; rw=(float)r->w; rh=(float)r->h; }
+                            else if (mrb_type(ro) == MRB_TT_OBJECT) {
+                                mrb_value xx = mrb_iv_get(mrb, ro, sy_rx);
+                                mrb_value yy = mrb_iv_get(mrb, ro, sy_ry);
+                                mrb_value ww = mrb_iv_get(mrb, ro, sy_rw);
+                                mrb_value hh = mrb_iv_get(mrb, ro, sy_rh);
+                                if (mrb_fixnum_p(xx)) rx = (float)mrb_fixnum(xx);
+                                if (mrb_fixnum_p(yy)) ry = (float)mrb_fixnum(yy);
+                                if (mrb_fixnum_p(ww)) rw = (float)mrb_fixnum(ww);
+                                if (mrb_fixnum_p(hh)) rh = (float)mrb_fixnum(hh);
+                            }
+                        }
+                        if (rw <= 0 || rh <= 0) continue;
+                        mrb_value cv = mrb_iv_get(mrb, vp, sy_col);
+                        CF2 *vc = (CF2*)(mrb_nil_p(cv) ? NULL : mkxp_etc_color_ptr(mrb, cv));
+                        if (vc && vc->a > 1.0f) {
+                            display_3ds_fill_rect(rx, ry, rw, rh,
+                                (unsigned char)(vc->r > 255 ? 255 : vc->r),
+                                (unsigned char)(vc->g > 255 ? 255 : vc->g),
+                                (unsigned char)(vc->b > 255 ? 255 : vc->b),
+                                (unsigned char)(vc->a > 255 ? 255 : vc->a));
+                        }
+                        mrb_value tv2 = mrb_iv_get(mrb, vp, sy_tn2);
+                        TF2 *vt = (TF2*)(mrb_nil_p(tv2) ? NULL : mkxp_etc_tone_ptr(mrb, tv2));
+                        if (vt) {
+                            float mn2 = vt->r; if (vt->g < mn2) mn2 = vt->g; if (vt->b < mn2) mn2 = vt->b;
+                            float mx2 = vt->r; if (vt->g > mx2) mx2 = vt->g; if (vt->b > mx2) mx2 = vt->b;
+                            if (mn2 < -1.0f)
+                                display_3ds_fill_rect(rx, ry, rw, rh, 0, 0, 0,
+                                    (unsigned char)(-mn2 > 255 ? 255 : -mn2));
+                            if (mx2 > 1.0f)
+                                display_3ds_fill_rect(rx, ry, rw, rh,
+                                    (unsigned char)(vt->r > 0 ? (vt->r > 255 ? 255 : vt->r) : 0),
+                                    (unsigned char)(vt->g > 0 ? (vt->g > 255 ? 255 : vt->g) : 0),
+                                    (unsigned char)(vt->b > 0 ? (vt->b > 255 ? 255 : vt->b) : 0),
+                                    (unsigned char)((mx2 > 255 ? 255 : mx2) * 0.55f));
+                        }
+                    }
+                }
+            }
+        }
+
+        if (g_log_verbose && (s_frame_count < 3 || s_frame_count % 300 == 0)) {
             printf("[GFX|RENDER] frame %d → sprites_draw_all fez %d blits novos\n",
                    s_frame_count, post_blit - pre_blit);
             if (post_blit == pre_blit) {
@@ -348,6 +591,24 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
         }
 
         display_3ds_end_frame();
+        {
+            u64 _gs_t2 = svcGetSystemTick();
+            s_gs_b += (double)(_gs_t2 - _gs_t0) / 268123.48;
+            _gs_t0 = _gs_t2;
+        }
+    }
+
+    /* [INPUT-POLL-TARDIO 2026-07-05] poll de input APOS o render (frame ja' no
+     * GPU): o custo (~2-4ms no emulador) sobrepoe-se ao periodo que ia ser
+     * cap_sleep. Corre TODOS os frames (frozen incluido — fora do if acima). */
+    {
+        extern bool g_input_flush_on;
+        mrb_value _fv = mrb_gv_get(mrb, mrb_intern_cstr(mrb, "$MKXP_INPUT_FLUSH_ON_TRANSITION"));
+        g_input_flush_on = (mrb_nil_p(_fv) || mrb_test(_fv));
+        inputBindingUpdate();
+    }
+    if (!s_frozen) {
+        /* (continua o caminho normal: flash/pos-render) */
 
         /* ── [GC|ORCAMENTADO] drena a old-gen em fatias previsiveis ──────────────
          * Com majorgc_old_threshold=3.000.000 (binding_3ds ~5568) o mruby NUNCA corre
@@ -393,8 +654,7 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
                     linearSpaceFree()/1024.0, linear_biggest_block()/1024,
                     vramSpaceFree()/1024.0, (unsigned)tcnt, tbytes/1024.0, (unsigned)(tvram/1024),
                     s_frame_count);
-                printf("%s", sb);
-                if (g_dbglog) { fprintf(g_dbglog, "%s", sb); dbg_flush(); }
+                if (g_log_verbose && g_dbglog) { fprintf(g_dbglog, "%s", sb); dbg_flush(); }   /* [LOG-LEAN] */
                 s_acc = 0; s_n = 0;
             }
         }
@@ -410,9 +670,9 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
             s_acc_spr += (double)(_dperf_t2 - _dperf_t1);
             s_acc_end += (double)(_dperf_t3 - _dperf_t2);
             if (++s_acc_n >= 120) {
-                fprintf(g_dbglog, "[DIAG-PERF] media/120f: tilemaps=%.1fms sprites=%.1fms swap+sync=%.1fms\n",
-                        s_acc_tm / s_acc_n, s_acc_spr / s_acc_n, s_acc_end / s_acc_n);
-                dbg_flush();
+                if (g_log_verbose)
+                    fprintf(g_dbglog, "[DIAG-PERF] media/120f: tilemaps=%.1fms sprites=%.1fms swap+sync=%.1fms\n",
+                            s_acc_tm / s_acc_n, s_acc_spr / s_acc_n, s_acc_end / s_acc_n);
                 s_acc_tm = s_acc_spr = s_acc_end = 0; s_acc_n = 0;
             }
         }
@@ -440,7 +700,7 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
     /* ── Watchdog ── */
     if (s_watchdog_active) {
         s_watchdog_count++;
-        if (s_watchdog_count % 60 == 0) {
+        if (g_log_verbose && s_watchdog_count % 600 == 0) {   /* [LOG-LEAN] era 60 */
             printf("[WD] frame %d/%d frozen=%d\n",
                    s_watchdog_count, s_watchdog_max, s_frozen);
             dbg_dump_scene(mrb, "watchdog");
@@ -505,7 +765,9 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
             if (_gci_on && s_gc_cooldown == 0 && (size_t)mrb->gc.live > 600000) {
                 size_t before = (size_t)mrb->gc.live;
                 long long _g0 = (long long)osGetTime();
+                u64 _gs_g0 = svcGetSystemTick();
                 mrb_full_gc(mrb);
+                s_gs_gc += (double)(svcGetSystemTick() - _gs_g0) / 268123.48;
                 long long _g1 = (long long)osGetTime();
                 s_gc_cooldown = 30;
                 printf("[FIX-GCIDLE] full_gc no idle: vivos %u -> %u (recolheu %d, %lldms) "
@@ -539,21 +801,48 @@ static mrb_value grph_update(mrb_state *mrb, mrb_value self) {
                 long long _slack_ms = (frame_us - elapsed) / 1000;
                 if (_slack_ms > 1) {
                     u64 _gc_dl = osGetTime() + (u64)(_slack_ms - 1);
+                    u64 _gs_s0 = svcGetSystemTick();
                     do {
                         mrb_incremental_gc(mrb);
                     } while (mrb->gc.state != MRB_GC_STATE_ROOT && osGetTime() < _gc_dl);
+                    s_gs_gc += (double)(svcGetSystemTick() - _gs_s0) / 268123.48;
                 }
             }
             /* frame rapido: vsync + dorme o resto ate' ao alvo (cap a 30) */
-            gspWaitForVBlank();
-            now_us  = (long long)osGetTime() * 1000LL;
-            elapsed = now_us - g_last_present_us;
-            if (elapsed > 0 && elapsed < frame_us)
-                svcSleepThread((frame_us - elapsed) * 1000LL);
+            {
+                u64 _gs_p0 = svcGetSystemTick();
+                gspWaitForVBlank();
+                now_us  = (long long)osGetTime() * 1000LL;
+                elapsed = now_us - g_last_present_us;
+                if (elapsed > 0 && elapsed < frame_us)
+                    svcSleepThread((frame_us - elapsed) * 1000LL);
+                s_gs_sleep += (double)(svcGetSystemTick() - _gs_p0) / 268123.48;
+            }
         }
         /* frame lento: sem espera extra -> evita o salto 35ms->50ms */
     }
     g_last_present_us = (long long)osGetTime() * 1000LL;
+    /* [TEX-PRESSURE] valvula preventiva (1x/120f; so' atua com linear < 6MB) */
+    if ((s_frame_count % 120) == 0) {
+        display_3ds_evict_pressure(s_frame_count);
+    }
+    {
+        u64 _gs_t3 = svcGetSystemTick();
+        s_gs_c += (double)(_gs_t3 - _gs_t0) / 268123.48;
+        if (++s_gs_n >= 600) {
+            extern FILE *g_dbglog;
+            if (g_dbglog) {
+                fprintf(g_dbglog, "[GFXSPLIT] media/600f: fixes_topo=%.2fms render=%.2fms cauda=%.2fms (da cauda: gc=%.2fms cap_sleep=%.2fms resto=%.2fms)\n",
+                        s_gs_a / 600.0, s_gs_b / 600.0, s_gs_c / 600.0,
+                        s_gs_gc / 600.0, s_gs_sleep / 600.0,
+                        (s_gs_c - s_gs_gc - s_gs_sleep) / 600.0);
+                fflush(g_dbglog);
+            }
+            s_gs_a = s_gs_b = s_gs_c = 0;
+            s_gs_gc = s_gs_sleep = 0;
+            s_gs_n = 0;
+        }
+    }
 
     return mrb_nil_value();
 }
