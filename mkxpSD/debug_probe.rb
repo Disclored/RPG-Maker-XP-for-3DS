@@ -1,4 +1,577 @@
-# $MKXP_TRY_CONTINUE = [x, y]  # (OFF)
+(MKXPDebug.log("[PROBE-TOP] WARNING probe a carregar") rescue nil)
+$MKXP_VERBOSE = false  # [2026-07-06] super debug DESLIGADO outra vez (ja' recolhi os dados da batalha; restaura FPS). =true p/ re-diagnosticar.
+# [DEP-DIAG 2026-07-09] one-shot NO TICK (pos-boot; no load do probe o boot-lean engole):
+# o 253 diz que Pokemon#egg? nao existe no LOAD dele, mas o host mruby prova que o 248
+# define egg?. Medir a verdade do PORT + validar o INTL-UNSKIP (pbGetMessage real).
+$__install_depdiag = lambda do
+  next if $__depdiag_done
+  $__depdiag_done = true
+  _pm = (Pokemon.method_defined?(:egg?) rescue "EXC")
+  _tm = (Trainer.method_defined?(:full_name) rescue "EXC")
+  _pn = (Pokemon.instance_methods.length rescue -1)
+  _im = (defined?(MessageTypes) ? "SIM" : "nao")
+  _msg = (pbGetMessage(MessageTypes::Items, 1) rescue "EXC").inspect
+  (MKXPDebug.log("[DEP-DIAG] WARNING pos-boot: Pokemon#egg?=#{_pm} n_metodos=#{_pn} | Trainer#full_name=#{_tm} | MessageTypes=#{_im} | pbGetMessage(Items,1)=#{_msg}") rescue nil)
+end
+# chamar TAMBEM ja' no load (o "WARNING" fura o boot-lean; o tick e' a rede p/ runtime)
+($__install_depdiag.call rescue nil)
+$MKXP_TREEREN = false  # [2026-07-05] diagnostico por-tile OFF (custava FPS); veredito ja' obtido = corte a jusante (draw/atlas), nao prioridade
+$MKXP_TREEDIAG = false if $MKXP_TREEDIAG.nil?  # varredura densa do atlas OFF (hitch ao entrar mapa); fix TSC-FORCE-ALL fica ativo. =true p/ re-diagnosticar
+$MKXP_PRIO_SYNC = 1   # validado: verify diff=0 em 2 ambientes (74k + 6k cmp)
+
+# [QUIET-LOG 2026-07-12] O motor de 5-Jul NAO tem o filtro noisy[] em C -> o probe
+# escreve ~900 linhas [MFD] por segundo ao sdmc (cada write custa ms) = stutters no
+# overworld. Filtro Ruby no chokepoint MKXPDebug.log: suprime tags diagnosticas
+# por-frame. MANTIDAS: FPS, FPSPROBE, DIAG-PERF, SAVE-REPAIR, SWITCHNAME/SSW, TSC*,
+# VWRAP, POKEDBG, GHOST-KILL, erros. $MKXP_VERBOSE=true OU $MKXP_QUIET_LOG=false revertem.
+begin
+  $__ql_noisy = ["[RUBYPROF", "[SAPDBG", "[GILBERTDIAG", "[ARVDBG", "[VWPATH",
+    "[VWCALL", "[TILEPROF", "[PERF-RESTO", "[PBMSG", "[PBCMW", "[OUTFITDIAG",
+    "[NAMEIN", "[APPEAR", "[KBDUMP", "[CHURN", "[HEARTBEAT", "[TILEANIM",
+    "[SPR|DUMP", "[SPR|SET_BMP", "[SPR|INIT", "[J3]", "[EBDXPROF",
+    "[BMP|WSKIN-TRUST", "[MISSING_PATCH", "[MISSING-PATCH", "[WSKIN",
+    "[BMP|FULLPATH", "[DIAG-SPRITE0", "[FIX-GRELHA7", "[GIF-FIX", "[WD ",
+    "[SUPERDBG"]
+  if $MKXP_QUIET_LOG != false && defined?(MKXPDebug) && MKXPDebug.respond_to?(:log)
+    class << MKXPDebug
+      unless method_defined?(:__ql_orig_log)
+        alias_method :__ql_orig_log, :log
+        def log(s)
+          begin
+            unless $MKXP_VERBOSE == true
+              _ss = s.to_s
+              _i = 0
+              while _i < $__ql_noisy.length
+                return nil if _ss.start_with?($__ql_noisy[_i])
+                _i += 1
+              end
+            end
+          rescue Exception
+          end
+          __ql_orig_log(s)
+        end
+      end
+    end
+    (MKXPDebug.__ql_orig_log("[QUIET-LOG] filtro Ruby instalado (#{$__ql_noisy.length} tags por-frame suprimidas; $MKXP_VERBOSE=true reverte)") rescue nil)
+  end
+rescue Exception => _eql
+  (MKXPDebug.log("[QUIET-LOG] falhou: #{_eql.class}: #{_eql.message}") rescue nil)
+end
+
+# [ITEMNAME-FIX] RAIZ: allocation failure no boot -> messages.dat carrega parcial
+# -> pbGetMessage(Items,id) devolve 0 p/ TODOS os nomes (itens/ataques/especies).
+# Mas cada GameData tem @real_name carregado do seu proprio .dat ("Potion").
+# Fallback: se o nome traduzido vier invalido (0/""/nil), usa real_name.
+# Instalado de forma diferida (GameData so existe apos Game.init, ~t=6.5s).
+$__install_inm = lambda do
+  if !$__itemname_fix_on && Object.const_defined?(:GameData)
+    done = 0
+    [:Item, :Move, :Ability, :Species, :Type, :TrainerType, :Nature,
+     :Ribbon, :BerryPlant, :Weather, :BattleWeather].each do |sym|
+      ok = (GameData.const_defined?(sym) rescue false)
+      if ok
+        klass = (GameData.const_get(sym) rescue nil)
+        if klass.is_a?(Class) && klass.method_defined?(:name) &&
+           klass.method_defined?(:real_name) && !klass.method_defined?(:__inm_orig_name)
+          klass.class_eval do
+            alias_method :__inm_orig_name, :name
+            def name
+              # [NAMEFIX v2 2026-07-05] o pacote de mensagens (pbGetMessage) esta'
+              # partido no port -> devolve "0" OU valores ERRADOS ("Pikachu" p/ a
+              # especie errada). O real_name (carregado do proprio .dat) e' o nome-
+              # base CORRETO. Preferimos SEMPRE o real_name; so' caimos para o
+              # pbGetMessage se o real_name faltar.
+              _rn = (real_name rescue nil)
+              if _rn.is_a?(String) && _rn != "" && _rn != "0"
+                _rn
+              else
+                _n = (__inm_orig_name rescue nil)
+                (_n.is_a?(String) && _n != "" && _n != "0") ? _n : (_rn || _n).to_s
+              end
+            end
+            # [NAMEFIX v3 2026-07-06] a msg "put away" usa portion_name/name_plural (NAO
+            # name) -> a Poke Ball ficava "0" mesmo com o fix de #name. Estender aos plurais.
+            if method_defined?(:name_plural) && !method_defined?(:__inm_orig_name_plural)
+              alias_method :__inm_orig_name_plural, :name_plural
+              def name_plural
+                _rp = (real_name_plural rescue nil)
+                return _rp if _rp.is_a?(String) && _rp != "" && _rp != "0"
+                _p = (__inm_orig_name_plural rescue nil)
+                return _p if _p.is_a?(String) && _p != "" && _p != "0"
+                (name rescue "").to_s   # fallback ao nome (ja' corrigido)
+              end
+            end
+            if method_defined?(:portion_name) && !method_defined?(:__inm_orig_portion_name)
+              alias_method :__inm_orig_portion_name, :portion_name
+              def portion_name
+                _rp = (real_portion_name rescue nil)
+                return _rp if _rp.is_a?(String) && _rp != "" && _rp != "0"
+                _p = (__inm_orig_portion_name rescue nil)
+                return _p if _p.is_a?(String) && _p != "" && _p != "0"
+                (name rescue "").to_s
+              end
+            end
+          end
+          done += 1
+        end
+      end
+    end
+    $__itemname_fix_on = true
+    (MKXPDebug.log("[ITEMNAME-FIX] instalado em #{done} classes GameData (fallback real_name)") rescue nil)
+  end
+end
+
+# [DUP-COUNTER 2026-07-06] Conta pbReceiveItem + pbMessage p/ decidir a MECANICA do
+# "tudo 2x": 2x (dois handlers a agir no mesmo trigger) vs Nx (trigger a disparar cada
+# frame). Loga CADA chamada com uma marca de tempo (Graphics.frame_count) + o item/texto
+# resumido. Instala 1x, guardado. Object/Kernel. Desligar: remover este bloco.
+$__install_dupcounter = lambda do
+  next if $__dupcounter_on
+  _has = (Object.private_method_defined?(:pbReceiveItem) || Object.method_defined?(:pbReceiveItem)) rescue false
+  if _has
+    Object.class_eval do
+      alias_method :__dup_orig_pbReceiveItem, :pbReceiveItem
+      def pbReceiveItem(item, *a, &b)
+        _fc = (Graphics.frame_count rescue -1)
+        _nm = (GameData::Item.try_get(item).id rescue item) rescue item
+        # [DUP-DEPTH] re-entrancia: se a 2a chamada entra ENQUANTO a 1a ainda esta' na
+        # stack (depth>1), o loop de mensagem da 1a re-dispara a 2a. depth=1 nas duas =
+        # sequencial (re-run). Cap grande.
+        $__dup_depth = ($__dup_depth || 0) + 1
+        (MKXPDebug.log("[DUP-DEPTH] WARNING pbReceiveItem ENTER depth=#{$__dup_depth} fc=#{_fc} item=#{_nm.inspect}") rescue nil)
+        # [DUP-LAYER] capturar QUEM chama: interpreter (obj_id/event/map/@index/tamanho lista)
+        # + backtrace. Se as 2 chamadas tiverem o MESMO interpreter+event mas re-executam a
+        # lista = bug do INTERPRETER (event @list a correr 2x). Se forem interpreters/@index
+        # diferentes = 2 disparos (input/mapa). Decide a CAMADA sem adivinhar.
+        _ctx = "?"
+        begin
+          # descer a cadeia de child_interpreter com CAP (o while sem cap congelou o jogo)
+          _it = ($game_map.interpreter rescue nil)
+          10.times do
+            _c = (_it.instance_variable_get(:@child_interpreter) rescue nil)
+            break if _c.nil?
+            _it = _c
+          end
+          if _it
+            _ev  = (_it.instance_variable_get(:@event_id) rescue "?")
+            _mid = (_it.instance_variable_get(:@map_id) rescue "?")
+            _idx = (_it.instance_variable_get(:@index) rescue "?")
+            _len = (_it.instance_variable_get(:@list).length rescue "?")
+            _ctx = "itp=#{_it.object_id} ev=#{_ev} map=#{_mid} idx=#{_idx} listlen=#{_len}"
+          end
+        rescue; end
+        _bt = (caller.first(5).map { |l| l[/[^\/\\]+:\d+/] || l }.join(" <- ") rescue "?")
+        (MKXPDebug.log("[DUP-COUNTER] WARNING pbReceiveItem fc=#{_fc} item=#{_nm.inspect} | #{_ctx} | bt=#{_bt}") rescue nil)
+        begin
+          __dup_orig_pbReceiveItem(item, *a, &b)
+        ensure
+          $__dup_depth = ($__dup_depth || 1) - 1
+        end
+      end
+    end
+    $__dupcounter_on = true
+    (MKXPDebug.log("[DUP-COUNTER] WARNING hook pbReceiveItem armado") rescue nil)
+  end
+end
+
+# [BATTLERVIS-FIX 2026-07-06] O send-out do EBDX deixa os battlers presos: player
+# com vis=false (visible=true nunca corre), opponent com opacidade ~5% (fade preso).
+# Provado pelo [BGATE]: player 346 a_centro=246 (TEM imagem) mas vis=false; opponent
+# 401 alpha=0.02. Fix guardado: no update, se o battler esta' no estado NORMAL (nao
+# desmaiado/substituto/escondido/lock e nao a piscar por dano @selected==2), forcar
+# @sprite.visible=true e opacity=255. Assim o battler com imagem aparece de facto.
+$__install_battlervis = lambda do
+  next if $__battlervis_on
+  if Object.const_defined?(:DynamicPokemonSprite) && DynamicPokemonSprite.method_defined?(:update)
+    DynamicPokemonSprite.class_eval do
+      alias_method :__bv_orig_update, :update unless method_defined?(:__bv_orig_update)
+      def update(*a, &b)
+        __bv_orig_update(*a, &b)
+        # rede de seguranca: com pokemon activo e nao desmaiado/substituto, garantir
+        # visivel+opaco (o motor nao aplica tom, por isso o tom nao importa).
+        begin
+          _s = (@sprite rescue nil)
+          if _s
+            # [BATTLERVIS-FIX] o battler do FOLLOWER fica com @pokemon=nil e bitmap 0x0 (a
+            # feature exclui o follower do send-out). Buscar o Pokemon ao @battle e carregar
+            # o grafico proprio (back=true p/ jogador=index par). Tb recarrega se o bitmap
+            # estiver vazio por outra razao. Cap 4 (anti-loop).
+            _b = (_s.bitmap rescue nil)
+            _empty = _b.nil? || ((_b.width rescue 0) < 8) || ((_b.height rescue 0) < 8)
+            if _empty && (@__bv_reloads ||= 0) < 4
+              @__bv_reloads += 1
+              _pk = (@pokemon rescue nil)
+              if _pk.nil? && @battle
+                _bt = (@battle.battlers[@index] rescue nil)
+                _pk = ((_bt.pokemon rescue nil) || (_bt.displayPokemon rescue nil)) rescue nil
+              end
+              if _pk
+                (self.setPokemonBitmap(_pk, ((@index rescue 1) % 2 == 0)) rescue nil)
+                (@pokemon = _pk) rescue nil
+                (MKXPDebug.log("[BATTLERVIS-FIX] WARNING recarga idx=#{(@index rescue '?')} pk=#{(_pk.species rescue '?')} -> #{(_s.bitmap.width rescue '?')}x#{(_s.bitmap.height rescue '?')}") rescue nil)
+              end
+            end
+            if !(@fainted rescue false) && !(@isSub rescue false)
+              (_s.visible = true) rescue nil
+              (_s.opacity = 255) rescue nil
+            end
+          end
+        rescue; end
+      end
+    end
+    $__battlervis_on = true
+    (MKXPDebug.log("[BATTLERVIS-FIX] WARNING hook DynamicPokemonSprite#update armado") rescue nil)
+  end
+end
+
+# [EBDXFIX 2026-07-06] DUAS raizes dos battlers invisiveis, achadas nos ficheiros:
+#  (1) PLAYER invisivel: EliteBattle.follower(battle) devolve 0 (indice do jogador)
+#      qd ha' Pokemon a seguir toggled -> o send-out (0089 L130 `next if i==follower`)
+#      SALTA o `visible=true` do battler do jogador. O "walk into battle" do follower
+#      esta' partido neste port. FIX: USE_FOLLOWER_EXCEPTION=false -> reveal normal.
+#  (2) OPPONENT em branco/pisca: BitmapEBDX#refresh (0064 L139) conta frames com
+#      `(f_bmp.width/f_bmp.height).ceil` -> no 3DS (dims com padding) a ULTIMA frame le'
+#      fora dos limites = BRANCO; a animacao idle cicla p/ ela -> pisca invisivel. FIX:
+#      desligar a animacao idle (fica na frame 0, com imagem; ataques via to_frame ok).
+$__install_ebdxfix = lambda do
+  next if $__ebdxfix_on
+  next unless Object.const_defined?(:EliteBattle) && Object.const_defined?(:BitmapEBDX)
+  (EliteBattle.const_set(:USE_FOLLOWER_EXCEPTION, false) rescue nil)
+  # override do METODO (mais fiavel que const_set, que pode nao pegar) -> follower=nil sempre
+  (class << EliteBattle; self; end).class_eval do
+    define_method(:follower) { |battle| nil }
+  end rescue nil
+  (BitmapEBDX.class_variable_set(:@@disableBitmapAnimation, true) rescue nil)
+  $__ebdxfix_on = true
+  (MKXPDebug.log("[EBDXFIX] WARNING follower-exception=off + bitmap-idle-anim=off (battlers visiveis)") rescue nil)
+end
+
+# [BATTLEDUMP 2026-07-06] identificar o sprite 512x384 OPACO no z=900 que TAPA os
+# battlers (achado no [BGATE]: vpz=99999 z=900 alpha=1.00 a_centro=255, desenhado por
+# cima do oponente z=100). Dump 1x de TODOS os @sprites da cena (+ 1 nivel de aninhados
+# como battlebg) com key/classe/z/vis/op/dims -> revela QUAL e' o overlay a tapar.
+$__install_battledump = lambda do
+  next if $__battledump_on
+  next unless Object.const_defined?(:PokeBattle_Scene) && PokeBattle_Scene.method_defined?(:pbGraphicsUpdate)
+  PokeBattle_Scene.class_eval do
+    alias_method :__bd_orig_pbGraphicsUpdate, :pbGraphicsUpdate unless method_defined?(:__bd_orig_pbGraphicsUpdate)
+    def pbGraphicsUpdate(*a, &b)
+      __bd_orig_pbGraphicsUpdate(*a, &b)
+      if !$__battledump_done && @sprites.is_a?(Hash)
+        $__battledump_done = true
+        _dump = lambda do |h, pre|
+          h.each do |k, s|
+            next if s.nil?
+            _z = (s.z rescue nil)
+            if !_z.nil?
+              _bw = (s.bitmap ? (s.bitmap.width rescue '?') : 'nil')
+              _bh = (s.bitmap ? (s.bitmap.height rescue '?') : 'nil')
+              (MKXPDebug.log("[BATTLEDUMP] WARNING #{pre}#{k} cls=#{(s.class rescue '?')} z=#{_z} vis=#{(s.visible rescue '?')} op=#{(s.opacity rescue '?')} bmp=#{_bw}x#{_bh}") rescue nil)
+            end
+            _inner = (s.instance_variable_get(:@sprites) rescue nil)
+            _dump.call(_inner, "#{pre}#{k}/") if _inner.is_a?(Hash) && pre.length < 2
+          end
+        end
+        (_dump.call(@sprites, "") rescue nil)
+      end
+    end
+  end
+  $__battledump_on = true
+  (MKXPDebug.log("[BATTLEDUMP] WARNING hook armado") rescue nil)
+end
+
+# [LIMPEZA 2026-07-05] diagnosticos ja' cumpridos -> OFF (menos escrita no SD):
+$MKXP_ITEMDBG   = false if $MKXP_ITEMDBG.nil?    # Potion confirmado (name="Potion")
+$MKXP_INTERPCMD = false if $MKXP_INTERPCMD.nil?  # top-comandos por-ms (ruidoso)
+# [OVERWORLD-SILENT 2026-07-05] user quer 0 escritas no SD durante a jogatina.
+# Desliga o scan POKEDBG (parava o trabalho Ruby por-frame E as escritas). O fix
+# SSW-REFRESH continua instalado (nao loga por-frame). Rearmar: $MKXP_POKEDBG=true.
+$MKXP_POKEDBG = false if $MKXP_POKEDBG.nil?
+
+# [POKEDBG] cirurgico p/ a pokebola que segue o player: 1x a cada ~30 updates,
+# capado a 15 logs. Lista os dependent events (sistema follower) com o grafico de
+# cada um + eventos do mapa com grafico tipo 'ball'/'item' perto do player (id,
+# pos, distancia, erased). Assim vemos se a bola e' um dependent event, um evento
+# nao-apagado, ou o follower a render mal. Off: $MKXP_POKEDBG=false.
+$__pokedbg_n = 0
+$__pokedbg_logs = 0
+$__pokedbg_lastsig = nil
+# [SSW-REFRESH-FIX] pbSetSelfSwitch (033) marca need_refresh via
+# $MapFactory.getMap(mapid,false) -- se essa instancia != $game_map vivo (comum no
+# port) OU hasMap? for false, o mapa vivo nunca refaz as paginas -> a bola do item
+# nao troca p/ a pagina vazia (fica visivel e reapanhavel = os 2 'Item get'). Fix:
+# forca $game_map.need_refresh quando a self-switch e' do mapa atual. Off: $MKXP_SSW_REFRESH=false.
+$__install_sswfix = lambda do
+  if !$__sswfix_on && Object.const_defined?(:Interpreter) && Interpreter.method_defined?(:pbSetSelfSwitch)
+    $__sswfix_on = true
+    begin
+      Interpreter.class_eval do
+        unless method_defined?(:__ssw_orig_pbSetSelfSwitch)
+          alias_method :__ssw_orig_pbSetSelfSwitch, :pbSetSelfSwitch
+          def pbSetSelfSwitch(eventid, switch_name, value, mapid = -1)
+            _r = __ssw_orig_pbSetSelfSwitch(eventid, switch_name, value, mapid)
+            begin
+              if $MKXP_SSW_REFRESH != false
+                _mid = (mapid && mapid >= 0) ? mapid : (@map_id rescue nil)
+                if $game_map && _mid && _mid == ($game_map.map_id rescue nil)
+                  $game_map.need_refresh = true
+                end
+              end
+            rescue; end
+            _r
+          end
+        end
+      end
+      (MKXPDebug.log("[SSW-REFRESH-FIX] pbSetSelfSwitch forca need_refresh no $game_map vivo") rescue nil)
+    rescue; end
+  end
+end
+# [POPIN-FIX 2026-07-05] portas/NPCs so' carregavam o sprite 2 tiles alem da borda
+# do ecra (Game_Event#should_update? range=2) -> apareciam de repente ("pop-in") ao
+# aproximar. Sobe a margem p/ 6 tiles -> carregam bem antes de entrarem no ecra.
+# Custo: uns eventos extra a atualizar (barato p/ eventos parados). Off: $MKXP_POPIN_RANGE.
+$__install_popfix = lambda do
+  if !$__popfix_on && Object.const_defined?(:Game_Event) && Game_Event.method_defined?(:should_update?)
+    $__popfix_on = true
+    begin
+      Game_Event.class_eval do
+        unless method_defined?(:__pop_orig_should_update?)
+          alias_method :__pop_orig_should_update?, :should_update?
+          def should_update?(recalc = false)
+            return @to_update if !recalc
+            return true if @trigger && (@trigger == 3 || @trigger == 4)
+            return true if @move_route_forcing
+            return true if @event.name[/update/i]
+            range = ($MKXP_POPIN_RANGE || 6)   # era 2 -> menos pop-in
+            return false if self.screen_x - @sprite_size[0] / 2 > Graphics.width + range * Game_Map::TILE_WIDTH
+            return false if self.screen_x + @sprite_size[0] / 2 < -range * Game_Map::TILE_WIDTH
+            return false if self.screen_y_ground - @sprite_size[1] > Graphics.height + range * Game_Map::TILE_HEIGHT
+            return false if self.screen_y_ground < -range * Game_Map::TILE_HEIGHT
+            return true
+          end
+        end
+      end
+      (MKXPDebug.log("[POPIN-FIX] should_update? range 2->#{$MKXP_POPIN_RANGE || 6} (portas/NPCs carregam mais cedo)") rescue nil)
+    rescue; end
+  end
+end
+# [TREEDIAG 2026-07-05] arvore cortada no RE-ENTRY: dispara 1x por ENTRADA de mapa
+# (reset por map_id) para comparar 1a entrada vs revisita. Discrimina a RAIZ: se a
+# copa "perdeu prioridade" na tabela remapeada -> TABELA corrompida; se a tabela
+# esta' OK mas a copa corta -> problema no RENDER (timing/atlas). So' mapas com TSC.
+# Precisa de $MKXP_VERBOSE=true p/ escrever (senao o silencio do overworld corta).
+$__treediag_lastmap = nil
+$__treediag_scan = lambda do
+  if $MKXP_TREEDIAG != false
+    _m = ($game_map.map_id rescue nil)
+    _cacheT = (($__tsc_cache && _m) ? $__tsc_cache[_m] : nil) rescue nil
+    if _m && _m != $__treediag_lastmap && _cacheT
+      $__treediag_lastmap = _m
+      begin
+        _gmT = $game_map; _dT = _gmT.data
+        _tsidT = (_gmT.instance_variable_get(:@map).tileset_id rescue nil)
+        _origPri = ($data_tilesets[_tsidT].priorities rescue nil)
+        _remPri  = _gmT.instance_variable_get(:@priorities)
+        _usT = _cacheT[:us]
+        _ncanopy = 0; _nlost = 0; _uniq = {}
+        if _dT && _origPri
+          _xs = _dT.xsize; _ys = _dT.ysize
+          (0..._ys).each do |_y|
+            (0..._xs).each do |_x|
+              [1, 2].each do |_z|
+                _t = (_dT[_x, _y, _z] rescue 0) || 0
+                next if _t < 384
+                _old = (_usT && _usT[_t - 384]) ? _usT[_t - 384] : _t
+                _po = (_origPri[_old] rescue 0) || 0
+                next if _po == 0
+                _ncanopy += 1
+                _pr = (_remPri ? (_remPri[_t] rescue 0) : 0) || 0
+                _nlost += 1 if _pr == 0
+                _uniq[_t] ||= _old   # tile-id unico de copa (novo=>antigo)
+              end
+            end
+          end
+        end
+        # amostra o ATLAS compactado nas tiles de copa unicas -> confirma se a copa
+        # tem MESMO pixels no atlas (raiz "jusante") ou se e' so' z/draw.
+        _bmpT = (_cacheT[:bmp] rescue nil)
+        _atlas_empty = 0; _atlas_total = 0; _emptyids = []
+        if _bmpT && _usT
+          _thh = (_bmpT.height rescue 0)
+          _grid = [0, 4, 8, 12, 16, 20, 24, 28, 31]   # denso (cobre bordas 0/31) p/ nao perder esparsos
+          _srcts = ($data_tilesets[_tsidT] rescue nil)
+          _srcbmp = nil
+          (_srcbmp = (RPG::Cache.tileset(_srcts.tileset_name) rescue nil)) if _srcts
+          _uniq.each do |_nid, _oldid|
+            _k = _nid - 384
+            next if _k < 0 || _thh <= 0
+            _cy = (_k >> 3) * 32; _col = _cy / _thh; _dx = _col * 256 + (_k & 7) * 32; _dy = _cy % _thh
+            _a = 0
+            _grid.each { |_gx| _grid.each { |_gy| _v = (_bmpT.get_pixel(_dx + _gx, _dy + _gy).alpha rescue 0); _a = _v if _v > _a } }
+            _atlas_total += 1
+            if _a == 0
+              _atlas_empty += 1
+              # a FONTE tem conteudo? (le a tile antiga direto do tileset gigante via get_pixel)
+              _sa = 0
+              if _srcbmp
+                _i = _oldid - 384; _sxb = (_i & 7) * 32; _syb = (_i >> 3) * 32
+                _grid.each { |_gx| _grid.each { |_gy| _v = (_srcbmp.get_pixel(_sxb + _gx, _syb + _gy).alpha rescue 0); _sa = _v if _v > _sa } }
+              end
+              _emptyids << "#{_oldid}(src=#{_sa > 0 ? 'CHEIA->fallback_falhou' : 'vazia->legitimo'})"
+            end
+          end
+        end
+        (MKXPDebug.log("[TREEDIAG] WARNING ENTRADA map=#{_m}: copa=#{_ncanopy} priolost=#{_nlost} | ATLAS unicas=#{_atlas_total} VAZIAS=#{_atlas_empty} ids=[#{_emptyids.join(',')}] -> #{_atlas_empty > 0 ? (_emptyids.any? { |s| s.include?('falhou') } ? 'FALLBACK FALHOU (fonte cheia)' : 'so tiles legitimamente vazios => corte e z/draw') : 'atlas OK => z/draw'}") rescue nil)
+      rescue => _e; (MKXPDebug.log("[TREEDIAG] err #{_e.class}: #{_e.message.to_s[0,50]}") rescue nil); end
+    end
+  end
+end
+$__pokedbg_scan = lambda do
+  ($__install_sswfix.call rescue nil)
+  ($__install_popfix.call rescue nil)
+  # [EBDX-METODOS] 1x pos-boot: os 6 aliases do EBDX falharam. Verifica se o metodo
+  # BASE existe (=> ordem-de-load, re-run resolve) ou nao (=> problema mais fundo).
+  if !$__ebdxm_done && Object.const_defined?(:Trainer)
+    $__ebdxm_done = true
+    begin
+      _o = Object
+      _chk = lambda { |recv, m, cls| (cls ? (recv.singleton_class.method_defined?(m) rescue false) : (recv.method_defined?(m) rescue false)) }
+      _r = []
+      _r << "getFormattedText=#{_chk.call(_o, :getFormattedText, false)}/_ebdx=#{_chk.call(_o, :getFormattedText_ebdx, false)}"
+      _r << "pbSpriteSetAnimFrame=#{_chk.call(_o, :pbSpriteSetAnimFrame, false)}/_ebdx=#{_chk.call(_o, :pbSpriteSetAnimFrame_ebdx, false)}"
+      _r << "Trainer#fullname=#{_chk.call(Trainer, :fullname, false)}/_ebdx=#{_chk.call(Trainer, :fullname_ebdx, false)}"
+      _r << "pbStartOver=#{_chk.call(_o, :pbStartOver, false)}/_ebdx_nuz=#{_chk.call(_o, :pbStartOver_ebdx_nuzlocke, false)}"
+      _r << "pbBattleOnStepTaken=#{_chk.call(_o, :pbBattleOnStepTaken, false)}/_ebdx_rnd=#{_chk.call(_o, :pbBattleOnStepTaken_ebdx_randomizer, false)}"
+      _r << "Compiler.compile_all=#{Object.const_defined?(:Compiler) ? _chk.call(Compiler, :compile_all, true) : 'sem-Compiler'}"
+      (MKXPDebug.log("[EBDX-METODOS] WARNING pos-boot: " + _r.join(' | ')) rescue nil)
+    rescue => _e; (MKXPDebug.log("[EBDX-METODOS] WARNING err #{_e.class}") rescue nil); end
+  end
+  ($__treediag_scan.call rescue nil)
+  # [STALE-SPRITE-FIX] limpa sprites-fantasma de eventos que foram p/ pagina vazia
+  # -> diz se e' orfao (spriteset nao-disposto), se o reload falha, se GHOST-KILL o
+  # devia matar. 120 frames, 1x/15f.
+  # [STALE-SPRITE-FIX 2026-07-05] RAIZ: o jogo faz @spritesets={} sem dispor
+  # (mesma familia dos 2-Gilberts) -> Sprite_Character orfaos do loop de update.
+  # Quando um evento vai p/ pagina vazia (item ball apanhado, porta, etc.), o sprite
+  # orfao fica CONGELADO com o grafico velho + posicao de ecra fixa -> "segue" o
+  # jogador. Deteta sprites cujo @character_name (cache) != '' mas o evento vivo tem
+  # grafico '' -> forca update (recarrega p/ transparente) e, se persistir, dispoe.
+  # Periodico (nao depende do pickup); early-exit barato. Off: $MKXP_STALEFIX=false.
+  # [DESLIGADO 2026-07-05] o ObjectSpace.each_object varria o heap INTEIRO (1.38M
+  # objs) a cada 20f -> matava o FPS. Movido p/ o MOTOR (GHOST-KILL, itera g_sprites
+  # direto = barato). Religar so' se o fix do motor falhar: $MKXP_STALEFIX=true.
+  if $MKXP_STALEFIX == true && Object.const_defined?(:Sprite_Character)
+    $__stale_n = ($__stale_n || 0) + 1
+    if ($__stale_n % 20) == 0
+      begin
+        ObjectSpace.each_object(Sprite_Character) do |sp|
+          _cnm = (sp.instance_variable_get(:@character_name) rescue '')
+          next if _cnm.nil? || _cnm.to_s == ''         # sprite ja' vazio -> ok
+          next if (sp.disposed? rescue true)
+          _ch = (sp.instance_variable_get(:@character) rescue nil)
+          next unless _ch.is_a?(Game_Event)
+          next unless (_ch.character_name rescue nil).to_s == ''   # evento vazio, sprite nao
+          (sp.update) rescue nil                          # recarrega -> transparente
+          if (sp.instance_variable_get(:@character_name).to_s != '' rescue false)
+            (sp.dispose) rescue nil                        # se persistir, dispoe o fantasma
+          end
+        end
+      rescue; end
+    end
+  end
+  if $MKXP_POKEDBG != false
+    $__pokedbg_n = $__pokedbg_n.to_i + 1
+    if ($__pokedbg_n % 20) == 0
+      begin
+        _px = ($game_player.x rescue -99); _py = ($game_player.y rescue -99)
+        _mid = ($game_map.map_id rescue -1)
+        _dep = ($PokemonGlobal.dependentEvents rescue nil)
+        _nd = (_dep.is_a?(Array) ? _dep.size : -1)
+        # rastreia TODAS as bolas do mapa (SEM limite de distancia) + o estado da
+        # self-switch A -> ve se sswA=true mas a bola persiste (=refresh falhou).
+        _balls = []
+        _evs = ($game_map.events rescue nil)
+        if _evs.is_a?(Hash)
+          _evs.each_value do |_ev|
+            _cn = (_ev.character_name rescue "").to_s
+            next unless _cn =~ /ball|item|pok/i
+            _eid = (_ev.id rescue 0)
+            _sw = ($game_self_switches[[_mid, _eid, "A"]] rescue '?')
+            _balls << "ev##{_eid} gfx='#{_cn}' @(#{_ev.x rescue '?'},#{_ev.y rescue '?'}) sswA=#{_sw} erased=#{(_ev.instance_variable_get(:@erased) rescue '?')}"
+          end
+        end
+        _sig = "#{_nd}|#{_balls.join(';')}"
+        if _sig != $__pokedbg_lastsig || $__pokedbg_logs.to_i < 6
+          $__pokedbg_lastsig = _sig
+          $__pokedbg_logs = $__pokedbg_logs.to_i + 1
+          _depstr = ""
+          if _dep.is_a?(Array)
+            _dep.each_with_index do |_d, _i|
+              _depstr += (_depstr.empty? ? "" : ",")
+              _depstr += (_d.is_a?(Array) ? "dep##{_i}='#{_d[6]}'(ev#{_d[1]})" : _d.inspect.to_s)
+            end
+          end
+          (MKXPDebug.log("[POKEDBG] deps=#{_nd}[#{_depstr}] player@(#{_px},#{_py}) | " + (_balls.empty? ? 'sem-bolas-no-mapa' : _balls.join(' | '))) rescue nil)
+        end
+      rescue; end
+    end
+  end
+end
+
+begin
+  if !$__ngf_on && Object.const_defined?(:Game_Player)
+    $__ngf_win = 0; $__ngf_lastmap = nil
+    class Game_Player
+      alias_method :__ngf_orig_update, :update
+      def update(*a, &b)
+        _r = __ngf_orig_update(*a, &b)
+        ($__install_inm.call rescue nil) if !$__itemname_fix_on
+        ($__install_dupcounter.call rescue nil) if !$__dupcounter_on
+        ($__install_battlervis.call rescue nil) if !$__battlervis_on
+        ($__install_ebdxfix.call rescue nil) if !$__ebdxfix_on
+        ($__install_battledump.call rescue nil) if !$__battledump_on
+        ($__install_depdiag.call rescue nil) if !$__depdiag_done
+        ($__pokedbg_scan.call rescue nil)
+        begin
+          if $MKXP_NEWGAME_FIX != false
+            _gm = ($game_map rescue nil)
+            _mid = (_gm.map_id rescue nil)
+            if _mid && _mid != $__ngf_lastmap
+              $__ngf_lastmap = _mid; $__ngf_win = 120
+            end
+            if _gm && ($__ngf_win || 0) > 0
+              $__ngf_win -= 1
+              _gm.need_refresh = true
+              (_gm.refresh) rescue nil
+
+            end
+          end
+        rescue Exception
+        end
+        _r
+      end
+    end
+    $__ngf_on = true
+    (MKXPDebug.log("[NEWGAME-FIX] instalado (forca refresh 120f apos mudanca de mapa)") rescue nil)
+  end
+rescue Exception => _engf
+  (MKXPDebug.log("[NEWGAME-FIX] indisponivel: #{_engf.class}") rescue nil)
+end
+
+
+# $MKXP_AUTOPILOT off
+$MKXP_BOOT_QUIET = true if $MKXP_BOOT_QUIET.nil?   # [LOG-LEAN] silencia dumps de boot obsoletos (PROBE-CONFIRM/CESCAN/TSC-verbose); =false reativa
+# [CASAS RESOLVIDO 2026-07-05] bissecao fechou: com verify=2 as casas CONTINUARAM
+# cortadas e diff=0 -> o vanilla e' que desenhava mal = o addTile redefinido
+# (ADDTILE-FAST) era o culpado. DESLIGADO abaixo; nao religar sem corrigir e
+# verificar (provavel: zinfo @__atf_z cacheia terrain/priority ANTES do TSC
+# remapear as tabelas -> zinfo stale por id).
+# $MKXP_ADDTILE_FAST reativado (v2: invalidacao por identidade das tabelas no binding)
+# [DIAG casas-invisiveis 2026-07-04] raio-X desarmado (fix TSC-NEIGHBOR aplicado);
+# rearmar os 3 se o proximo log ainda mostrar casas invisiveis:
+# $MKXP_TRY_CONTINUE = true
+# $MKXP_DIAG_TILEDRAW desligado (veredito abandonado; 239 linhas/sessao)
+# $MKXP_DIAG_ZSTAT = true
 # =============================================================================
 #  debug_probe.rb  —  LOGGER SUPER DETALHADO POR MAPA (frame-a-frame)
 # -----------------------------------------------------------------------------
@@ -875,32 +1448,8 @@ begin
           rescue; end
         end
 
-        # ═══ DIAGNOSTICO: [PICSHOW] (intro) + [EBDXPROF] (FPS) ═══════════════════
-        # Instaladores por-frame idempotentes (as classes/metodos do jogo so' existem
-        # em runtime). [PICSHOW] isola a foto do jogador em falta na intro (loga o NOME
-        # RESOLVIDO de cada Picture + estado do $Trainer -> apanha 'PlayerSprites/0').
-        # [EBDXPROF] isola QUAL efeito EBDX do Sprite_Character custa os 228ms.
-        unless $__picshow_done || $MKXP_PROBE_QUIET
-          begin
-            if Object.const_defined?(:Game_Picture) && Game_Picture.method_defined?(:show) &&
-               !Game_Picture.method_defined?(:__ps_orig_show)
-              Game_Picture.send(:alias_method, :__ps_orig_show, :show)
-              Game_Picture.send(:define_method, :show) do |*a|
-                begin
-                  _nm = (a[0].to_s rescue '')
-                  _last = (_nm.split('/').last.to_s rescue '')
-                  _num = (_last.length > 0 && _last == _last.to_i.to_s)
-                  if _nm.include?('PlayerSprites') || _nm.include?('intro') || _num
-                    (MKXPDebug.log("[PICSHOW] pic='#{_nm}' trainer_type=#{($Trainer.trainer_type.inspect rescue '?')} outfit=#{($Trainer.outfit rescue '?')}#{_num ? ' <- NUMERICO=provavel magenta' : ''}") rescue nil)
-                  end
-                rescue; end
-                __ps_orig_show(*a)
-              end
-              (MKXPDebug.log("[PICSHOW] hook Game_Picture#show instalado") rescue nil)
-              $__picshow_done = true
-            end
-          rescue; end
-        end
+        # [PICSHOW removido] era diagnostico da foto do jogador na intro (magenta);
+        # o fix real e' o METAFIX (override get_player). [EBDXPROF] (throttle FPS) mantido.
         unless $__ebdxprof_done
           begin
             $__ebdx_acc ||= Hash.new(0.0)
@@ -1010,38 +1559,6 @@ begin
                   alias_method :__od_command_117, :command_117
                   def command_117
                     _id = (@parameters[0] rescue nil)
-                    if _id && [34,173,212,20,21,139].include?(_id)
-                      (MKXPDebug.log("[OUTFIT] CallCE ##{_id} (cadeia roupa) depth=#{@depth rescue '?'}") rescue nil)
-                      # [ROUPDIAG] CE#173 = ClothesChangeUI (roupeiro). Agenda dumps Ruby de
-                      # sprites (classe/z/vp.z/vis/bmp WxH/cname) p/ identificar os sprites do
-                      # quarto (vasos/TV = Sprite_Character com cname) que ficam por cima do
-                      # menu E o sprite do outfit em falta (bmp=nil/errado). Off: $MKXP_ROUPDIAG=false.
-                      # [PERF 2026-07-02] 1x por SESSAO (era por abertura): cada dump de 65
-                      # sprites custava d=1.9-4.3s no 3DS (log 09:2x, o pior hitch do roupeiro).
-                      if _id == 173 && $MKXP_ROUPDIAG != false && !$__roup_dumped && (Object.const_defined?(:MAXDIAG) rescue false)
-                        $__roup_dumped = true
-                        $__roup_dump_left = 1
-                        (MAXDIAG.dump_sprites("ROUPEIRO-OPEN-CE173", true) rescue nil)
-                        (MKXPDebug.log("[ROUPDIAG] CE#173 (roupeiro) aberto -> dump unico de sprites (1x/sessao)") rescue nil)
-                      end
-                      # CE#34 e' chamado mas o corpo nunca corre (o filho nao executa
-                      # o cmd 0=CallCE#212). Aqui registo o ESTADO EXATO do interpretador
-                      # no momento da chamada -> diz que' flag bloqueia o filho. Tudo
-                      # num so' log para nao inundar.
-                      if _id == 34
-                        begin
-                          _st = "menu_calling=#{($game_temp.menu_calling rescue '?')} " \
-                                "msg_wait=#{(@message_waiting rescue '?')} " \
-                                "mrw=#{(@move_route_waiting rescue '?')} " \
-                                "wait=#{(@wait_count rescue '?')} " \
-                                "list=#{(@list ? @list.size : 'nil')} idx=#{(@index rescue '?')} " \
-                                "depth=#{(@depth rescue '?')} main=#{(@main rescue '?')} " \
-                                "ce34_data_ok=#{(!$data_common_events[34].nil? rescue '?')} " \
-                                "pl_mrf=#{($game_player.move_route_forcing rescue '?')}"
-                          (MKXPDebug.log("[OUTFIT] >> estado@CE34: #{_st}") rescue nil)
-                        rescue; end
-                      end
-                    end
                     _r = (__od_command_117 rescue (raise))
                     # ── CEFIX: o Marshal do mruby carrega o objeto CommonEvent mas deixa a
                     #    @list a NIL (o ficheiro esta' 100% OK em Ruby normal -- 0 listas nil
@@ -1067,32 +1584,50 @@ begin
                         if _fresh.is_a?(Array) && _fresh.size > 0
                           ($data_common_events[_id].list = _fresh) rescue nil   # corrigir a fonte p/ as proximas
                           (_ci.setup(_fresh, (@event_id rescue 0)) rescue nil)  # re-armar o filho ja' criado
-                          if (($__cefix_n ||= 0) < 60)
-                            $__cefix_n += 1
-                            (MKXPDebug.log("[CEFIX] CE##{_id} tinha @list nil -> lista RECONSTRUIDA a mao (#{_fresh.size} cmds), filho re-setup OK") rescue nil)
-                          end
-                        elsif (($__cefix_fail ||= 0) < 12)
-                          $__cefix_fail += 1
-                          (MKXPDebug.log("[CEFIX] CE##{_id}: @list nil e SEM reconstrucao a mao (so' tenho 34/173/212) -> se este CE for preciso, diz-me") rescue nil)
                         end
                       end
-                    rescue => _cee; (MKXPDebug.log("[CEFIX] erro: #{_cee.class}: #{_cee.message.to_s[0,90]}") rescue nil); end
-                    # Confirmar o estado FINAL do filho do CE#34 (depois do CEFIX)
-                    if _id == 34
-                      begin
-                        _ci3 = (@child_interpreter rescue nil)
-                        _cl3 = _ci3 ? (_ci3.instance_variable_get(:@list) rescue nil) : nil
-                        (MKXPDebug.log("[OUTFIT] >> filho CE34 (final pos-CEFIX): criado=#{!_ci3.nil?} running=#{(_ci3.running? rescue '?')} cmds=#{(_cl3 ? _cl3.size : 'nil')}") rescue nil)
-                      rescue; end
-                    end
+                    rescue; end
                     _r
                   end
                 end
                 unless method_defined?(:__od_execute_script)
                   alias_method :__od_execute_script, :execute_script
                   def execute_script(script)
+                    # [DUP-LAYER] script de evento que envolve item -> logar QUEM corre (self =
+                    # interpreter REAL, ao contrario de $game_map.interpreter). Se o MESMO
+                    # (event/index) aparecer 2x = a lista do evento re-executa = bug interpreter.
                     begin
-                      _rr = __od_execute_script(script)
+                      if script.is_a?(String) && script =~ /ReceiveItem|pbItemBall|receiveItem/i
+                        _fc = (Graphics.frame_count rescue -1)
+                        _ev = (@event_id rescue "?"); _mid = (@map_id rescue "?")
+                        _idx = (@index rescue "?"); _len = (@list.length rescue "?")
+                        _occ = (script.scan(/ReceiveItem/).length rescue -1)
+                        _ss  = (script.to_s.gsub("\n", " | ")[0, 400] rescue "?")
+                        (MKXPDebug.log("[DUP-LAYER] WARNING execute_script(item) fc=#{_fc} itp=#{object_id} ev=#{_ev} map=#{_mid} idx=#{_idx} listlen=#{_len} occ_ReceiveItem=#{_occ}") rescue nil)
+                        (MKXPDebug.log("[DUP-LAYER] WARNING   FULLSCRIPT=#{_ss.inspect}") rescue nil)
+                      end
+                    rescue; end
+                    begin
+                      # [FIX-DOUBLE-SCRIPT 2026-07-06] RAIZ do "tudo 2x" PROVADA: execute_script
+                      # ENTRA 1x (DUP-LAYER) mas o corpo corre 2x (pbReceiveItem 2x, depth=1,
+                      # ~136f = re-avaliacao apos a mensagem bloqueante). O base deste porte
+                      # re-avalia o script. FIX: avaliar UMA vez aqui e NAO chamar o base. eval
+                      # no contexto deste metodo (self=interpreter) -> metodos do interpreter
+                      # (pbStepOnSpot/...) E globais (pbReceiveItem) resolvem na mesma. Reversivel:
+                      # [REVERTIDO 2026-07-06] o eval-once partia as batalhas selvagens
+                      # (o base fornece contexto/binding que o eval cru nao replica). Default
+                      # AGORA = base (seguro). So' corre eval-once com $MKXP_SCRIPT_ONCE==true.
+                      if $MKXP_SCRIPT_ONCE != true
+                        _rr = __od_execute_script(script)
+                      else
+                        _rr = nil
+                        begin
+                          _rr = eval(script)
+                        rescue Exception => _se
+                          raise if _se.is_a?(SystemExit) || "#{_se.class}" == "Reset"
+                          (MKXPDebug.log("[FIX-DOUBLE-SCRIPT] WARNING script erro (fail-open): #{_se.class}: #{_se.message.to_s[0,120]}") rescue nil)
+                        end
+                      end
                       # [ROUPZFIX] o CE#173 (ClothesChangeUI) cria a UI toda com @viewport=nil
                       # e z=0. No 3DS, sprites SEM viewport ordenam pelo PROPRIO z (motor,
                       # sprite_binding_3ds.cpp:165), e os sprites do quarto (viewport z=0) teem
@@ -1108,33 +1643,18 @@ begin
                             next if _s.nil? || (_s.disposed? rescue true)
                             (_s.z = (_zmap[_k] || 99995)) rescue nil
                           end
-                          unless $__roupzfix_logged
-                            $__roupzfix_logged = true
-                            (MKXPDebug.log("[ROUPZFIX] UI do roupeiro (CE#173) elevada a z>=99990 (nil-viewport -> por cima do quarto/TV). keys=#{(@sprites.keys.inspect rescue '?')}") rescue nil)
-                          end
                         end
-                      rescue => _ze
-                        (MKXPDebug.log("[ROUPZFIX] rebentou: #{_ze.class}: #{_ze.message.to_s[0,80]}") rescue nil)
-                      end
+                      rescue; end
                       _rr
                     rescue Exception => _e
                       raise if _e.is_a?(SystemExit) || "#{_e.class}" == "Reset"
-                      if (($__od_errs ||= 0) < 30)
-                        $__od_errs += 1
-                        (MKXPDebug.log("[OUTFIT] Script ERRO: #{(_e.message rescue _e.class).to_s[0,240].gsub(/\s+/,' ')}") rescue nil)
-                      end
                       raise
                     end
                   end
                 end
               end
-              (MKXPDebug.log("[OUTFIT-DIAG] hooks instalados (command_117 + execute_script) em Interpreter") rescue nil)
-            else
-              (MKXPDebug.log("[OUTFIT-DIAG] Interpreter ausente -- hooks NAO instalados") rescue nil)
             end
-          rescue => _e
-            (MKXPDebug.log("[OUTFIT-DIAG] falhou: #{_e.class}: #{_e.message}") rescue nil)
-          end
+          rescue; end
         end
 
         # ─── FOLLOWGUARD: guard defensivo p/ o Following Pokemon EX (crashes B1/B2)
@@ -1649,6 +2169,18 @@ begin
                 alias_method :__gilbertxfer_orig_transfer, :transfer_player
                 def transfer_player(*a, &b)
                   __gilbertxfer_orig_transfer(*a, &b)
+                  # [INTRO-REFRESH 2026-07-05] o transfer p/ um mapa JA' PRE-CARREGADO
+                  # pelo MapFactory (mapas conectados) reutiliza os eventos sem os
+                  # re-refrescar -> autorun/parallel cujo switch foi ligado DEPOIS do
+                  # pre-load (ex: EV26 'INTRO' do map43, switch 50) fica com pagina
+                  # NIL e NUNCA arranca (jogador preso, nao fica transparente).
+                  # Forcar refresh re-avalia as paginas -> o autorun ativa. Idempotente.
+                  begin
+                    if $MKXP_INTRO_REFRESH == true && $game_map
+                      $game_map.need_refresh = true
+                      ($game_map.refresh) rescue nil
+                    end
+                  rescue Exception; end
                   return if $MKXP_GILBERT_XFER == false
                   begin
                     _dep = ($PokemonTemp.dependentEvents rescue nil)
@@ -1970,9 +2502,88 @@ begin
       unless method_defined?(:__dbgtrace_orig_update)
         alias_method :__dbgtrace_orig_update, :update
         def update(*a, &b)
+          # [PROBEPROF v2] mede o Scene_Map#update COMPLETO (inclui wrappers de
+          # plugins): PROFILE(39) - scene_upd = Graphics/Input/overhead C;
+          # scene_upd - FPSPROBE(20.3) = wrappers de plugins + nao-medido.
+          _su0 = Time.now
           __dbgtrace_orig_update(*a, &b)   # corre o update REAL (autorun incluido)
+          $__pp_su = ($__pp_su || 0.0) + (Time.now - _su0) * 1000.0
+          # [PROBEPROF] custo REAL do proprio probe por frame (o gap ~28ms entre
+          # PROFILE|frame e FPSPROBE tem de vir de algum lado)
+          ($__fb_install.call rescue nil) if !$__fbudget_on && $__fb_install
+          _pp0 = Time.now
           DBGTrace.per_frame(self)         # so' DEPOIS, logamos o estado
           (SUPERDBG.tick(self) rescue nil) # SUPERDBG: snapshot periodico + trainer + input
+          $__pp_a = ($__pp_a || 0.0) + (Time.now - _pp0) * 1000.0
+          $__pp_n = ($__pp_n || 0) + 1
+          # [MOVEDBG 2026-07-05 v2] New Game encrava no autowalk do intro (move-route
+          # do jogador pelo mapa). Robusto: so' precisa de $game_player; loga
+          # bloqueadores + estado do INTERPRETADOR (@index/comando) + passabilidade
+          # do tile a' frente (o move-route espera o player chegar; se o tile ficou
+          # impassavel apos pbBridgeOn/TSC, espera para sempre).
+          begin
+            $__mv_t = ($__mv_t || 0) + 1
+            _gp = ($game_player rescue nil)
+            if ($__mv_t % 60) == 0 && _gp
+              _mi = (pbMapInterpreter rescue nil)
+              _idx = (_mi ? (_mi.instance_variable_get(:@index) rescue '?') : 'no-interp')
+              _run = (pbMapInterpreterRunning? rescue '?')
+              _brd = ($PokemonGlobal.bridge rescue '?')
+              _tt = (($game_map.terrain_tag(_gp.x, _gp.y).id rescue '?') rescue '?')
+              _pass = (_gp.passable?(_gp.x, _gp.y, _gp.direction) rescue '?')
+              (MKXPDebug.log("[MOVEDBG] map=#{($game_map.map_id rescue '?')} p=(#{(_gp.x rescue '?')},#{(_gp.y rescue '?')}) mov=#{(_gp.moving? rescue '?')} dir=#{(_gp.direction rescue '?')} mrf=#{(_gp.move_route_forcing rescue '?')} | interp_run=#{_run} idx=#{_idx} | msg=#{($game_temp.message_window_showing rescue '?')} menu=#{($game_temp.in_menu rescue '?')} xfer=#{($game_temp.player_transferring rescue '?')} | bridge=#{_brd} terrain=#{_tt} passavel_frente=#{_pass}") rescue nil)
+            end
+          rescue Exception => _emv
+            (MKXPDebug.log("[MOVEDBG] erro: #{_emv.class}: #{_emv.message.to_s[0,50]}") rescue nil) if ($__mv_t % 300) == 0
+          end
+          # [ARVSPR 2026-07-05] 1x: estado REAL dos priotile sprites junto a arvore
+          # (fila/atlas provados perfeitos na revisita -> o corte e' sprite/draw)
+          begin
+            if !$__arvspr && ($game_map.map_id rescue 0) == 43 &&
+               ($game_player.x rescue 0).between?(35, 48) &&
+               ($game_player.y rescue 0).between?(15, 27)
+              $__arvspr = true
+              _ss = ($scene.instance_variable_get(:@spritesets) rescue nil)
+              _sp0 = (_ss ? _ss[43] : nil) rescue nil
+              _tl = (_sp0 ? _sp0.instance_variable_get(:@tilemap) : nil) rescue nil
+              _ct = (_tl ? (_tl.instance_variable_get(:@tilemap) || _tl) : nil) rescue nil
+              _ts = (_ct ? _ct.instance_variable_get(:@tiles) : nil) rescue nil
+              if _ts
+                _tot = 0; _vis = 0; _bnil = 0; _bdisp = 0; _amos = []
+                _i = 0
+                while _i < _ts.length
+                  _s2 = _ts[_i]
+                  if _s2 && _s2.is_a?(Sprite)
+                    _tot += 1
+                    _v2 = (_s2.visible rescue false)
+                    _vis += 1 if _v2
+                    _b2 = (_s2.bitmap rescue nil)
+                    if _b2.nil?
+                      _bnil += 1
+                    elsif (_b2.disposed? rescue true)
+                      _bdisp += 1
+                    end
+                    if _amos.length < 6 && _v2 && (_s2.z rescue 0) > 100
+                      _amos << "z=#{(_s2.z rescue '?')} y=#{(_s2.y rescue '?')} bmp=#{_b2 ? ((_b2.disposed? rescue true) ? 'DISP' : "#{_b2.width}x#{_b2.height}") : 'NIL'}"
+                    end
+                  end
+                  _i += 2
+                end
+                (MKXPDebug.log("[ARVSPR] @tiles=#{_tot} visiveis=#{_vis} bmp_nil=#{_bnil} bmp_DISPOSED=#{_bdisp} | altos: #{_amos.join(' | ')}") rescue nil)
+              else
+                (MKXPDebug.log("[ARVSPR] tilemap/@tiles inacessivel (ss=#{!_ss.nil?} sp=#{!_sp0.nil?} tl=#{!_tl.nil?})") rescue nil)
+              end
+            end
+          rescue Exception
+          end
+          if $__pp_n >= 600
+            (MKXPDebug.log("[FRAMEBUDGET] scene=#{(($__pp_su || 0.0) / 600 * 100).round / 100.0} gfx=#{(($__pp_g || 0.0) / 600 * 100).round / 100.0} input=#{(($__pp_i || 0.0) / 600 * 100).round / 100.0} hooks=#{($__pp_a / 600 * 100).round / 100.0} ms/frame | soma vs PROFILE update= fecha o balanco (600f)") rescue nil)
+            $__pp_su = 0.0
+            $__pp_g = 0.0
+            $__pp_i = 0.0
+            $__pp_a = 0.0
+            $__pp_n = 0
+          end
           # [TRY-CONTINUE teleporte tardio 2026-07-03] o teleporte imediato pos-
           # Game.load era desfeito (autorun/cutscene reposiciona). Aqui, ~700
           # frames DEPOIS do mapa estar vivo, movemos o jogador 1x para o alvo
@@ -2861,21 +3472,22 @@ begin
             sxb = (i & 7) * 32; syb = (i >> 3) * 32
             cy = (k >> 3) * 32; col = cy / th
             dx = col * 256 + (k & 7) * 32; dy = cy % th
-            if col >= 1 && $MKXP_TSC_COL1_FORCE != false
-              # [FIX-CASA-COL1] A COLUNA 1 e' a zona onde o blt da fonte gigante em
-              # Y-alto falha de forma ERRATICA (provado: tiles col=1 -> aMAX=0 no
-              # render; col=0 -> aMAX=255). A deteccao por 9 pontos perde tiles
-              # ESPARSOS (bordas de telhado/arvore) e marca-os como "fonte vazia".
-              # Por isso recopiamos SEMPRE toda a col1 via get_pixel/set_pixel -- o
-              # caminho CPU que le Y-alto corretamente (TSC-PIXDBG: s255 a Y30784).
-              # Aditivo: so' escreve col1; a col0 (que funciona) nunca e' tocada.
-              # Tiles de fonte transparente recopiam transparente (inofensivo).
-              _fail.push([sxb, syb, dx, dy, old]); _forced1 += 1
-            else
+            # [FIX-COPA-ESPARSA 2026-07-05] RAIZ da copa do monumento cortada
+            # (TREEDIAG: 17/167 tiles de copa VAZIAS no atlas): a deteccao por 9
+            # pontos da col0 SALTAVA tiles ESPARSOS (conteudo so' nas bordas -> os 9
+            # pontos veem alpha 0 -> "fonte vazia") e o blt gigante em Y-alto falha
+            # em silencio -> ficavam transparentes no atlas. Agora forcamos TODOS os
+            # tiles (col0+col1) no lote nativo compose_tiles, que copia o tile 32x32
+            # INTEIRO da fonte (nao amostra) -> os esparsos entram. Custo: 1 chamada
+            # nativa ~50ms/mapa gigante (cacheado). $MKXP_TSC_FORCE_ALL=false reverte
+            # p/ a deteccao antiga (col1 forcada + 9-pontos col0).
+            if $MKXP_TSC_FORCE_ALL == false && !(col >= 1 && $MKXP_TSC_COL1_FORCE != false)
               _as = 0; _pts.each { |p| _v = (src.get_pixel(sxb + p[0], syb + p[1]).alpha rescue 0); (_as = _v if _v > _as) }
-              next if _as <= 0                       # col0: fonte vazia => tile legitimamente transparente
+              next if _as <= 0
               _ac = 0; _pts.each { |p| _v = (dst.get_pixel(dx + p[0], dy + p[1]).alpha rescue 0); (_ac = _v if _v > _ac) }
-              _fail.push([sxb, syb, dx, dy, old]) if _ac == 0   # blt falhou em silencio
+              _fail.push([sxb, syb, dx, dy, old]) if _ac == 0
+            else
+              _fail.push([sxb, syb, dx, dy, old]); _forced1 += 1
             end
           end
           # [PERF-RECOPY 2026-07-04] o recopy pixel-a-pixel da col1 inteira custava
@@ -2895,10 +3507,12 @@ begin
             (dst.compose_tiles(src, _q) rescue nil)
             _still = []
             _fail.each do |f|
-              _as2 = 0; _pts.each { |p| _v = (src.get_pixel(f[0] + p[0], f[1] + p[1]).alpha rescue 0); (_as2 = _v if _v > _as2) }
-              next if _as2 <= 0                    # fonte vazia -> transparente e' correto
+              # [FIX-COPA-ESPARSA] NAO saltar por "fonte 9-pontos vazia" -- e' isso que
+              # perde os tiles esparsos (conteudo nas bordas). Se o DST ficou vazio nos
+              # 9 pontos apos o nativo, manda p/ o fallback get_pixel (le Y-alto certo e
+              # copia o tile 32x32 INTEIRO). Tiles genuinamente vazios recopiam vazio.
               _ac2 = 0; _pts.each { |p| _v = (dst.get_pixel(f[2] + p[0], f[3] + p[1]).alpha rescue 0); (_ac2 = _v if _v > _ac2) }
-              _still.push(f) if _ac2 == 0          # nativo falhou mesmo -> pixel a pixel
+              _still.push(f) if _ac2 == 0          # nativo nao encheu -> pixel a pixel
             end
             (MKXPDebug.log("[TSC-RECOPY] lote nativo: #{_fail.size} tiles em 1 chamada; #{_still.size} precisaram de fallback pixel") rescue nil)
             _fail = _still
@@ -2929,11 +3543,40 @@ begin
     end
 
 
+    # [TSC-NEIGHBOR] Spriteset_Map#initialize(map=nil): o mapa dono do spriteset
+    # fica em $__tsc_gm durante o initialize (o tileset= interno usa-o). ensure
+    # limpa SEMPRE -> fora do initialize o TSC volta ao $game_map (como antes).
+    begin
+      if !$__tsc_gm_wrap && Object.const_defined?(:Spriteset_Map)
+        class Spriteset_Map
+          alias_method :__tscn_orig_init, :initialize
+          def initialize(map = nil)
+            $__tsc_gm = (map || ($game_map rescue nil))
+            begin
+              __tscn_orig_init(map)
+            ensure
+              $__tsc_gm = nil
+            end
+          end
+        end
+        $__tsc_gm_wrap = true
+        (MKXPDebug.log("[TSC-NEIGHBOR] Spriteset_Map#initialize marca o mapa dono ($__tsc_gm) p/ o TSC do vizinho") rescue nil)
+      end
+    rescue Exception => _etn
+      (MKXPDebug.log("[TSC-NEIGHBOR] indisponivel: #{_etn.class}: #{_etn.message.to_s[0,60]}") rescue nil)
+    end
+
     class CustomTilemap
       unless method_defined?(:__tsc_orig_tileset_eq)
         alias_method :__tsc_orig_tileset_eq, :tileset=
         def tileset=(value)
-          gm  = ($game_map rescue nil)
+          # [TSC-NEIGHBOR 2026-07-04] o dono REAL do tilemap: nos mapas CONECTADOS
+          # o Spriteset do VIZINHO tambem passa aqui, mas $game_map e' o mapa
+          # ATUAL -> o vizinho recebia CACHE-HIT da compactada do mapa atual +
+          # REMAP-SKIP (comparava com o data do atual) = ids originais do vizinho
+          # num atlas alheio => TUDO do vizinho invisivel (casas!). O wrapper de
+          # Spriteset_Map#initialize poe o mapa dono em $__tsc_gm.
+          gm  = (($__tsc_gm rescue nil) || ($game_map rescue nil))
           seq = ($__tsc_seq = (($__tsc_seq || 0) + 1))
           verbose = (seq <= 20)
           # ---- TRACE entrada: o que o setter recebe + thresholds ----
@@ -3015,7 +3658,7 @@ begin
                     acmp = -1; pts.each { |p| vv=(raw.get_pixel(cxb+p[0], cyb+p[1]).alpha rescue -1); acmp=vv if vv>acmp }
                     partes.push("#{old}(Y#{syb})s#{asrc.to_i}/c#{acmp.to_i}")
                   end
-                  (MKXPDebug.log("[TSC-PIXDBG] map=#{mid} [5 ALTOS + 3 CHAO] #{partes.join(' ')} (sN/cN=alpha fonte/compactado; s>0 & c=0 => blt Y-alto FALHOU)") rescue nil)
+                  ((MKXPDebug.log("[TSC-PIXDBG] map=#{mid} [5 ALTOS + 3 CHAO] #{partes.join(' ')} (sN/cN=alpha fonte/compactado; s>0 & c=0 => blt Y-alto FALHOU)") rescue nil) if $MKXP_BOOT_QUIET == false)
                 rescue => _pe
                   (MKXPDebug.log("[TSC-PIXDBG] map=#{mid} erro: #{_pe.class}: #{_pe.message}") rescue nil)
                 end
@@ -3048,12 +3691,22 @@ begin
                     snz = 0; (src.data.each { |v| snz += 1 if (v || 0) != 0 } rescue nil) if src
                     gnz = 0; (gmv.data.each { |v| gnz += 1 if (v || 0) != 0 } rescue nil) if gmv
                     same = (src && gmv && (src.equal?(gmv) rescue false)) ? 'SIM' : 'NAO'
-                    (MKXPDebug.log("[TSC-ORIGDBG] tsid=#{_tsid} $data_tilesets(len=#{sl},nz=#{snz}) vs gm.@passages(len=#{gl},nz=#{gnz}) mesmo_obj=#{same} -> uso=#{src ? '$data_tilesets' : 'gm'}") rescue nil)
+                    ((MKXPDebug.log("[TSC-ORIGDBG] tsid=#{_tsid} $data_tilesets(len=#{sl},nz=#{snz}) vs gm.@passages(len=#{gl},nz=#{gnz}) mesmo_obj=#{same} -> uso=#{src ? '$data_tilesets' : 'gm'}") rescue nil) if $MKXP_BOOT_QUIET == false)
                   end
+                  # [TABOVERLAY] ler do PRISTINE se ja' houve overlay nesta tabela
+                  # (o overlay escreve nids nos slots 384..755 da tabela original ->
+                  # sem pristine, re-remaps de revisita leriam valores corrompidos)
+                  _prs = ($__tsc_prist && $__tsc_prist[[_tsid, attr]]) || nil
                   arr = Array.new(newsz, 0)
-                  (0...384).each { |i| arr[i] = (orig[i] rescue 0) || 0 }
-                  cache[:us].each_with_index { |old, k| arr[384 + k] = (orig[old] rescue 0) || 0 }
-                  (gm.events || {}).each_value { |ev| (ev.pages || []).each { |pg| t = (pg.graphic.tile_id rescue 0) || 0; (arr[t] = (orig[t] rescue 0) || 0) if t >= 384 && t < newsz } }
+                  if _prs
+                    (0...384).each { |i| arr[i] = _prs[i] || 0 }
+                    cache[:us].each_with_index { |old, k| arr[384 + k] = _prs[old] || 0 }
+                    (gm.events || {}).each_value { |ev| (ev.pages || []).each { |pg| t = (pg.graphic.tile_id rescue 0) || 0; (arr[t] = _prs[t] || 0) if t >= 384 && t < newsz } }
+                  else
+                    (0...384).each { |i| arr[i] = (orig[i] rescue 0) || 0 }
+                    cache[:us].each_with_index { |old, k| arr[384 + k] = (orig[old] rescue 0) || 0 }
+                    (gm.events || {}).each_value { |ev| (ev.pages || []).each { |pg| t = (pg.graphic.tile_id rescue 0) || 0; (arr[t] = (orig[t] rescue 0) || 0) if t >= 384 && t < newsz } }
+                  end
                   ntabs[attr] = __tsc_mk_table(arr)
                 end
                 # CRITICO: remapear o data via []= NATIVO (o @data ivar NAO afeta a Table nativa)
@@ -3074,6 +3727,45 @@ begin
                 ntabs.each { |attr, tb| gm.instance_variable_set("@#{attr}", tb) }
                 (gm.instance_variable_set(:@__tsc_data_done, d) rescue nil)
                 (MKXPDebug.log("[TSC #{seq}] REMAP-DATA map=#{mid} | celulas=#{xs}x#{ys}x#{zs}=#{xs * ys * zs} remapeadas=#{cnt} | id_max #{vmax_old}->#{vmax_new} | tabelas newsz=#{newsz} evmax=#{evmax}") rescue nil)
+                # [TTMAP-INVAL 2026-07-05] o remap troca data+tabelas DEPOIS do
+                # onMapChange -> a memo do terrain_tag ($__ttm_cache, binding) tinha
+                # entradas calculadas com o data PRE-remap = tags ERRADAS (pegadas
+                # em terreno normal, logica de terreno errada). Invalida ao remapear.
+                ($__ttm_cache.delete(mid) rescue nil) if $__ttm_cache
+                # [TABOVERLAY 2026-07-05] plugins (footprints 0037 etc.) leem
+                # $data_tilesets[tsid].terrain_tags[TILE_ID_REMAPEADO] na tabela
+                # ORIGINAL -> tag de outro tile qualquer (pegadas em relva!). Fix
+                # sistemico: escrever nos slots dos NIDs o valor PRISTINO do id
+                # antigo (todas as 3 tabelas; @data direto — Table#[]= tem bug C++).
+                # A copia pristina (guardada ANTES do 1o overlay) alimenta os
+                # re-remaps de revisita la' em cima.
+                begin
+                  # [TABOVERLAY REVERTIDO 2026-07-05] escrever nos slots 384..755 da
+                  # tabela ORIGINAL travou o player: gm's AINDA-nao-remapeados (setup
+                  # recem-carregado, vizinhos, REMAP-SKIP) usam essa tabela DIRETA ->
+                  # passabilidade adulterada. Pegadas tratadas por veto no Sprite#bmp
+                  # (ver [STEPVETO]). O bloco fica gated OFF.
+                  if false && _tsid && (_ots3 = ($data_tilesets[_tsid] rescue nil))
+                    _tover = 0
+                    %w[terrain_tags].each do |attr|
+                      _tb3 = (_ots3.send(attr) rescue nil)
+                      next unless _tb3
+                      _raw3 = (_tb3.instance_variable_get(:@data) rescue nil)
+                      next unless _raw3.is_a?(Array)
+                      _pr3 = (($__tsc_prist ||= {})[[_tsid, attr]] ||= _raw3.dup)
+                      remap.each do |_o3, _n3|
+                        _v3 = _pr3[_o3] || 0
+                        if _raw3[_n3] != _v3
+                          _raw3[_n3] = _v3
+                          _tover += 1
+                        end
+                      end
+                    end
+                    (MKXPDebug.log("[TABOVERLAY] map=#{mid} tsid=#{_tsid}: #{_tover} slots remapeados espelhados nas tabelas de $data_tilesets (plugins leem certo)") rescue nil) if _tover > 0
+                  end
+                rescue => _eto
+                  (MKXPDebug.log("[TABOVERLAY] falhou: #{_eto.class}: #{_eto.message.to_s[0,60]}") rescue nil)
+                end
                 # ── TSC-PASSDBG: confirmar que passabilidade/prioridade ficaram corretas ──
                 # Compara, para algumas tiles usadas, o valor ORIGINAL ($data_tilesets, indexado
                 # pelo id ANTIGO) vs o NOVO (@passages, indexado pelo id compactado). Se
@@ -3092,7 +3784,7 @@ begin
                       kk = cache[:us].index(old); nid = 384 + kk
                       "#{old}/#{nid}:pass#{(op ? (op[old] rescue '?') : '?')}->#{(np[nid] rescue '?')},pri#{(opr ? (opr[old] rescue '?') : '?')}->#{(npr[nid] rescue '?')}"
                     end.join(" ")
-                    (MKXPDebug.log("[TSC-PASSDBG] map=#{mid} tsid=#{tsid} npass_nao_zero=#{nzero} | #{smp}") rescue nil)
+                    ((MKXPDebug.log("[TSC-PASSDBG] map=#{mid} tsid=#{tsid} npass_nao_zero=#{nzero} | #{smp}") rescue nil) if $MKXP_BOOT_QUIET == false)
                     # NOVO V31: estado REAL da Table original do $data_tilesets.
                     # data.length vs xsize -> se length<xsize, o marshal TRUNCOU o array.
                     # ult_nz -> ultimo indice nao-zero (mostra ate' onde ha dados validos).
@@ -3102,12 +3794,12 @@ begin
                     if od
                       ult_nz = -1; (0...od.length).each { |i| ult_nz = i if (od[i] || 0) != 0 }
                       cnt_nz = 0; od.each { |v| cnt_nz += 1 if (v || 0) != 0 }
-                      (MKXPDebug.log("[TSC-PASSDBG-RAW] tsid=#{tsid} PASSAGES: data.length=#{od.length} xsize=#{(op.xsize rescue '?')} | nao_zero=#{cnt_nz} ult_indice_nz=#{ult_nz} (ficheiro espera ~8124 p/ ts28)") rescue nil)
+                      ((MKXPDebug.log("[TSC-PASSDBG-RAW] tsid=#{tsid} PASSAGES: data.length=#{od.length} xsize=#{(op.xsize rescue '?')} | nao_zero=#{cnt_nz} ult_indice_nz=#{ult_nz} (ficheiro espera ~8124 p/ ts28)") rescue nil) if $MKXP_BOOT_QUIET == false)
                     end
                     if odr
                       ult_nzr = -1; (0...odr.length).each { |i| ult_nzr = i if (odr[i] || 0) != 0 }
                       cnt_nzr = 0; odr.each { |v| cnt_nzr += 1 if (v || 0) != 0 }
-                      (MKXPDebug.log("[TSC-PASSDBG-RAW] tsid=#{tsid} PRIORITIES: data.length=#{odr.length} xsize=#{(opr.xsize rescue '?')} | nao_zero=#{cnt_nzr} ult_indice_nz=#{ult_nzr}") rescue nil)
+                      ((MKXPDebug.log("[TSC-PASSDBG-RAW] tsid=#{tsid} PRIORITIES: data.length=#{odr.length} xsize=#{(opr.xsize rescue '?')} | nao_zero=#{cnt_nzr} ult_indice_nz=#{ult_nzr}") rescue nil) if $MKXP_BOOT_QUIET == false)
                     end
                   end
                 rescue => _pe
@@ -3552,6 +4244,7 @@ begin
         unless $__probe_confirmed
           $__probe_confirmed = true
           begin
+            raise "quiet" if $MKXP_BOOT_QUIET != false   # [LOG-LEAN] 17 linhas de boot obsoletas
             MKXPDebug.log("[PROBE-CONFIRM] ===== debug_probe V47 a correr (confirmado no 1o frame) =====")
             MKXPDebug.log("[PROBE-CONFIRM] >>> VERSAO=V62 (defined? removido do MAXDIAG/BAG) BAGREOPEN+ZREVERT | CEWRAP=#{!!$__cewrap_installed} " \
                           "PBANIMFIX=#{!!$__pbanimfix_done} " \
@@ -3587,7 +4280,7 @@ begin
                           "public_ID=#{(($Trainer && $Trainer.respond_to?(:public_ID)) ? ($Trainer.public_ID rescue '?') : '-')}")
             MKXPDebug.log("[PROBE-CONFIRM] (se algum estiver false, o hook respetivo nao instalou -- avisa-me)")
           rescue => e
-            (MKXPDebug.log("[PROBE-CONFIRM] log falhou: #{e.class}: #{e.message}") rescue nil)
+            (MKXPDebug.log("[PROBE-CONFIRM] log falhou: #{e.class}: #{e.message}") rescue nil) unless e.message == "quiet"
           end
         end
         __probe_confirm_orig_update(*a)
@@ -3636,7 +4329,7 @@ begin
           begin
             dce = ($data_common_events rescue nil)
             if dce.nil?
-              (MKXPDebug.log("[CESCAN] $data_common_events=nil -- nada a medir") rescue nil)
+              ((MKXPDebug.log("[CESCAN] $data_common_events=nil -- nada a medir") rescue nil) if $MKXP_BOOT_QUIET == false)
             else
               _nil_meth = []   # .list (metodo) vem nil
               _accbug   = []   # .list nil MAS @list(ivar)=Array nao-vazio  -> getter partido
@@ -3662,19 +4355,19 @@ begin
                   _i += 1
                 end
               rescue => _e2
-                (MKXPDebug.log("[CESCAN] varrimento abortou apos #{_tot}: #{_e2.class}: #{_e2.message.to_s[0,80]}") rescue nil)
+                ((MKXPDebug.log("[CESCAN] varrimento abortou apos #{_tot}: #{_e2.class}: #{_e2.message.to_s[0,80]}") rescue nil) if $MKXP_BOOT_QUIET == false)
               end
-              (MKXPDebug.log("[CESCAN] CEs totais=#{_tot} | .list NIL=#{_nil_meth.size}") rescue nil)
-              (MKXPDebug.log("[CESCAN]   getter-partido (.list=nil mas @list=Array): #{_accbug.size} -> #{_accbug.inspect}") rescue nil)
-              (MKXPDebug.log("[CESCAN]   dados-em-falta (.list=nil e @list vazio):   #{_both_nil.size} -> #{_both_nil.inspect}") rescue nil)
+              ((MKXPDebug.log("[CESCAN] CEs totais=#{_tot} | .list NIL=#{_nil_meth.size}") rescue nil) if $MKXP_BOOT_QUIET == false)
+              ((MKXPDebug.log("[CESCAN]   getter-partido (.list=nil mas @list=Array): #{_accbug.size} -> #{_accbug.inspect}") rescue nil) if $MKXP_BOOT_QUIET == false)
+              ((MKXPDebug.log("[CESCAN]   dados-em-falta (.list=nil e @list vazio):   #{_both_nil.size} -> #{_both_nil.inspect}") rescue nil) if $MKXP_BOOT_QUIET == false)
               if _accbug.size > 0 && _both_nil.size == 0
-                (MKXPDebug.log("[CESCAN]   >>> VEREDITO: GETTER PARTIDO. Fix universal de 1 linha resolve TODOS (sem reconstruir CE a CE).") rescue nil)
+                ((MKXPDebug.log("[CESCAN]   >>> VEREDITO: GETTER PARTIDO. Fix universal de 1 linha resolve TODOS (sem reconstruir CE a CE).") rescue nil) if $MKXP_BOOT_QUIET == false)
               elsif _both_nil.size > 0 && _accbug.size == 0
-                (MKXPDebug.log("[CESCAN]   >>> VEREDITO: DADOS EM FALTA. Reconstrucao por CE (gerar da rxdata) e' o caminho.") rescue nil)
+                ((MKXPDebug.log("[CESCAN]   >>> VEREDITO: DADOS EM FALTA. Reconstrucao por CE (gerar da rxdata) e' o caminho.") rescue nil) if $MKXP_BOOT_QUIET == false)
               elsif _nil_meth.size == 0
-                (MKXPDebug.log("[CESCAN]   >>> VEREDITO: nenhuma .list nil neste arranque. Se a estante falhar, a causa e' outra.") rescue nil)
+                ((MKXPDebug.log("[CESCAN]   >>> VEREDITO: nenhuma .list nil neste arranque. Se a estante falhar, a causa e' outra.") rescue nil) if $MKXP_BOOT_QUIET == false)
               else
-                (MKXPDebug.log("[CESCAN]   >>> VEREDITO: MISTO (getter + dados). Ver as duas listas acima.") rescue nil)
+                ((MKXPDebug.log("[CESCAN]   >>> VEREDITO: MISTO (getter + dados). Ver as duas listas acima.") rescue nil) if $MKXP_BOOT_QUIET == false)
               end
 
               # (C) DEEP DUMP do CE#34 (estado pristino -- o CEFIX ainda nao correu)
@@ -3691,15 +4384,15 @@ begin
                   _nm  = (_c.instance_variable_get(:@name) rescue nil)
                   _id  = (_c.instance_variable_get(:@id) rescue nil)
                   _tg  = (_c.instance_variable_get(:@trigger) rescue nil)
-                  (MKXPDebug.log("[CESCAN] CE#34 DEEP: class=#{_kl} is_a_CE=#{_is} .list(metodo)=#{_md} @list(ivar)=#{_rd}") rescue nil)
-                  (MKXPDebug.log("[CESCAN] CE#34 DEEP: ivars=#{_ivs.inspect} @name=#{_nm.inspect} @id=#{_id.inspect} @trigger=#{_tg.inspect}") rescue nil)
+                  ((MKXPDebug.log("[CESCAN] CE#34 DEEP: class=#{_kl} is_a_CE=#{_is} .list(metodo)=#{_md} @list(ivar)=#{_rd}") rescue nil) if $MKXP_BOOT_QUIET == false)
+                  ((MKXPDebug.log("[CESCAN] CE#34 DEEP: ivars=#{_ivs.inspect} @name=#{_nm.inspect} @id=#{_id.inspect} @trigger=#{_tg.inspect}") rescue nil) if $MKXP_BOOT_QUIET == false)
                 end
               rescue => _e3
-                (MKXPDebug.log("[CESCAN] deep dump CE#34 falhou: #{_e3.class}: #{_e3.message.to_s[0,80]}") rescue nil)
+                ((MKXPDebug.log("[CESCAN] deep dump CE#34 falhou: #{_e3.class}: #{_e3.message.to_s[0,80]}") rescue nil) if $MKXP_BOOT_QUIET == false)
               end
             end
           rescue => _e
-            (MKXPDebug.log("[CESCAN] falhou: #{_e.class}: #{_e.message.to_s[0,100]}") rescue nil)
+            ((MKXPDebug.log("[CESCAN] falhou: #{_e.class}: #{_e.message.to_s[0,100]}") rescue nil) if $MKXP_BOOT_QUIET == false)
           end
         end
         __cescan_orig_update(*a)
@@ -3707,7 +4400,7 @@ begin
     end
   end
 rescue => _e
-  (MKXPDebug.log("[CESCAN] instalacao falhou: #{_e.class}: #{_e.message}") rescue nil)
+  ((MKXPDebug.log("[CESCAN] instalacao falhou: #{_e.class}: #{_e.message}") rescue nil) if $MKXP_BOOT_QUIET == false)
 end
 
 # =============================================================================
@@ -6219,46 +6912,6 @@ begin
         if method_defined?(:update_scene)
           alias_method :__oz_orig_us, :update_scene
           def update_scene(*a)
-            if $MKXP_OUTFITZ_LOG != false && !$__oz_dumped
-              $__oz_dumped = true
-              begin
-                myvp = (@viewport.z rescue nil)
-                (MKXPDebug.log("[OUTFITZ] menu do roupeiro montado | viewport.z=#{myvp} (deve ficar no topo de tudo)") rescue nil)
-                menu_n = 0; fundo_n = 0; vis = 0; bg_found = false
-                ObjectSpace.each_object(Sprite) do |sp|
-                  begin
-                    next if (sp.disposed? rescue true)
-                    next if !(sp.visible rescue false)
-                    vis += 1
-                    vp  = (sp.viewport rescue nil)
-                    vpz = vp ? (vp.z rescue -1) : nil
-                    spz = (sp.z rescue 0)
-                    haschar = (sp.instance_variable_defined?(:@character) rescue false)
-                    if vpz && vpz >= 99999
-                      menu_n += 1   # sprite do proprio menu (esperado)
-                      # [SELFTEST|ROUPEIRO] o bg solido do FIX-ROUPEIRO-FUNDO: vp.z>=99999
-                      # + z muito negativo + bitmap grande (tapa o ecra). Se existe, o
-                      # mapa esta' tapado; se nao, o quarto/moveis aparecem atraves.
-                      if spz <= -500 && !haschar
-                        _bgw = (sp.bitmap && !(sp.bitmap.disposed? rescue true) ? (sp.bitmap.width rescue 0) : 0) rescue 0
-                        bg_found = true if _bgw >= 300
-                      end
-                    else
-                      fundo_n += 1
-                      if fundo_n <= 25
-                        cn = (sp.class.name rescue "?")
-                        bw = ((sp.bitmap && !(sp.bitmap.disposed? rescue true)) ? "#{sp.bitmap.width}x#{sp.bitmap.height}" : "nil") rescue "?"
-                        (MKXPDebug.log("[OUTFITZ]   FUNDO-VISIVEL (devia estar tapado): #{cn} z=#{spz} vp.z=#{vpz.nil? ? 'sem-vp' : vpz} char=#{haschar} bmp=#{bw}") rescue nil)
-                      end
-                    end
-                  rescue; end
-                end
-                (MKXPDebug.log("[SELFTEST|ROUPEIRO] bg-solido=#{bg_found ? 'PRESENTE (cobre o quarto)' : 'AUSENTE (mapa/moveis aparecem atraves)'} | sprites-do-mapa atras=#{fundo_n}") rescue nil)
-                (MKXPDebug.log("[OUTFITZ] total visiveis=#{vis} | do-menu(vp.z>=99999)=#{menu_n} | FUNDO-visivel=#{fundo_n} -> se o FUNDO aparece por cima, e' o motor a ignorar viewport.z") rescue nil)
-              rescue => e2
-                (MKXPDebug.log("[OUTFITZ] scan falhou: #{e2.class}: #{e2.message}") rescue nil)
-              end
-            end
             # FIX-OUTFITZ: REATIVADO por defeito. O fix de z-order do MOTOR (ZSORT-REGTIE)
             # foi revertido (partia o teclado do nome -- ver [ZREVERT] no topo), por isso o
             # probe volta a tratar do z-order do menu: sobe o z individual dos sprites do menu
@@ -6288,10 +6941,7 @@ begin
                       end
                     rescue; end
                   end
-                  (MKXPDebug.log("[FIX-OUTFITZ] subi z de #{_bz} sprites do menu (+1e6) p/ ficarem sobre o fundo (motor ignora vp.z) | f=#{@__oz_fix_n} flag $MKXP_OUTFITZ_FIX") rescue nil) if _bz > 0
-                rescue => _oze
-                  (MKXPDebug.log("[FIX-OUTFITZ] falhou: #{_oze.class}: #{_oze.message}") rescue nil)
-                end
+                rescue; end
               end
             end
             __oz_orig_us(*a)
@@ -6299,11 +6949,8 @@ begin
         end
       end
     end
-    (MKXPDebug.log("[OUTFITZ] instalado (hook GenderPickSelection::Show; scan unico; flag $MKXP_OUTFITZ_LOG)") rescue nil)
   end
-rescue => e
-  (MKXPDebug.log("[OUTFITZ] install falhou: #{e.class}: #{e.message}") rescue nil)
-end
+rescue; end
 
 # ─── [INTERPCMD 2026-07-04] perfil de comandos do interpreter (rua: 25-152ms) ──
 # O PERF-RESTO provou interpreter pesado na rua com o EVSC ja' ativo -> o custo
@@ -6345,3 +6992,403 @@ begin
 rescue => _ipce
   (MKXPDebug.log("[INTERPCMD] falhou: #{_ipce.class}: #{_ipce.message}") rescue nil)
 end
+
+# =============================================================================
+#  STEPVETO (re-add pos-rollback; ABSOLVIDO do travao — o travao existia antes
+#  dele) — pegadas fantasma: so' carrega "Characters/steps" se player OU um
+#  realEvent estiver em areia(3)/neve(20), via terrain_tag remap-aware.
+# =============================================================================
+begin
+  if !$__stepveto_on
+    class Sprite
+      alias_method :__sv_bmp, :bmp
+      def bmp(_a1 = nil, _a2 = nil)
+        begin
+          if _a1.is_a?(String) && _a1.include?("Characters/steps")
+            _ok = false
+            begin
+              _chs = [($game_player rescue nil)]
+              (_chs.concat($PokemonTemp.dependentEvents.realEvents) rescue nil)
+              _chs.each do |_ch|
+                next unless _ch
+                _m = (_ch.map rescue nil) || ($game_map rescue nil)
+                next unless _m
+                _id = (_m.terrain_tag(_ch.x, _ch.y).id_number rescue -1)
+                if _id == 3 || _id == 20
+                  _ok = true
+                  break
+                end
+              end
+            rescue Exception
+            end
+            unless _ok
+              $__sv_n = ($__sv_n || 0) + 1
+              (MKXPDebug.log("[STEPVETO] pegada vetada (ninguem em areia/neve) ##{$__sv_n}") rescue nil) if $__sv_n <= 6
+              return self
+            end
+          end
+        rescue Exception
+        end
+        __sv_bmp(_a1, _a2)
+      end
+    end
+    $__stepveto_on = true
+  end
+rescue Exception => _esv
+  (MKXPDebug.log("[STEPVETO] indisponivel: #{_esv.class}") rescue nil)
+end
+
+# =============================================================================
+#  ITEMDBG 2026-07-05 — item apanhado ficou com nome "0" e a bola nao sumiu.
+#  Loga o argumento REAL do pbItemBall e o nome resolvido.
+# =============================================================================
+begin
+  if !$__itemdbg_on && (begin; method(:pbItemBall); true; rescue; false; end)
+    $__itemdbg_on = true
+    class Object
+      alias_method :__idbg_itemball, :pbItemBall
+      def pbItemBall(_it, _qty = 1)
+        _nm = (GameData::Item.get(_it).name rescue "ERRO-#{_it.class}")
+        (MKXPDebug.log("[ITEMDBG] pbItemBall(#{_it.inspect}, #{_qty}) -> nome='#{_nm}' | evento=#{(get_character(0).id rescue '?')} map=#{($game_map.map_id rescue '?')}") rescue nil)
+        _r = __idbg_itemball(_it, _qty)
+        (MKXPDebug.log("[ITEMDBG] pbItemBall devolveu #{_r.inspect}; self_switch A=#{($game_self_switches[[($game_map.map_id rescue 0), (get_character(0).id rescue 0), 'A']] rescue '?')}") rescue nil)
+        _r
+      end
+    end
+  end
+rescue Exception => _eid
+  (MKXPDebug.log("[ITEMDBG] indisponivel: #{_eid.class}") rescue nil)
+end
+
+
+# =============================================================================
+#  FRAMEBUDGET 2026-07-05 — contabilidade 100% do frame Ruby. O relogio C do
+#  motor (PROFILE|frame update=) mede TODO o Ruby entre frames; aqui medem-se
+#  os 4 marcos que o compoem: Scene_Map#update (ja' no PROBEPROF v2),
+#  Graphics.update e Input.update (1x/frame, frios). soma vs PROFILE fecha o
+#  balanco — o que faltar e' overhead de main-loop/message e fica visivel.
+# =============================================================================
+$__fb_install = proc do
+  if !$__fbudget_on
+    class << Graphics
+      alias_method :__fb_gup, :update
+      def update(*_a)
+        _t0 = Time.now
+        _r = __fb_gup(*_a)
+        $__pp_g = ($__pp_g || 0.0) + (Time.now - _t0) * 1000.0
+        # [MOVEDBG4] dump do player via Graphics.update (corre SEMPRE). 1x/90f.
+        begin
+          $__mv4 = ($__mv4 || 0) + 1
+          if ($__mv4 % 90) == 0
+            _gp = ($game_player rescue nil)
+            _gm = ($game_map rescue nil)
+            if _gp.nil? || _gm.nil?
+              (MKXPDebug.log("[MOVEDBG4] player=#{_gp.nil? ? 'NIL' : 'ok'} map=#{_gm.nil? ? 'NIL' : (_gm.map_id rescue '?')} scene=#{($scene.class rescue '?')}") rescue nil)
+            else
+              _mi = (_gm.instance_variable_get(:@map_interpreter) rescue nil)
+              _run = (_mi ? (_mi.running? rescue '?') : 'no-mi')
+              _pass = (_gp.passable?(_gp.x, _gp.y, (_gp.direction rescue 2)) rescue '?')
+              (MKXPDebug.log("[MOVEDBG4] map=#{(_gm.map_id rescue '?')} p=(#{(_gp.x rescue '?')},#{(_gp.y rescue '?')}) mov=#{(_gp.moving? rescue '?')} dir=#{(_gp.direction rescue '?')} mrf=#{(_gp.move_route_forcing rescue '?')} | mi_run=#{_run} | msg=#{($game_temp.message_window_showing rescue '?')} menu=#{($game_temp.in_menu rescue '?')} xfer=#{($game_temp.player_transferring rescue '?')} lock=#{(_gp.instance_variable_get(:@locked) rescue '?')} | bridge=#{($PokemonGlobal.bridge rescue '?')} pass_frente=#{_pass} disp=(#{(_gm.display_x rescue '?')},#{(_gm.display_y rescue '?')})") rescue nil)
+            end
+          end
+        rescue Exception
+        end
+        _r
+      end
+    end
+    begin
+      class << Input
+        alias_method :__fb_iup, :update
+        def update(*_a)
+          _t0 = Time.now
+          _r = __fb_iup(*_a)
+          $__pp_i = ($__pp_i || 0.0) + (Time.now - _t0) * 1000.0
+          _r
+        end
+      end
+    rescue Exception
+    end
+    $__fbudget_on = true
+    (MKXPDebug.log("[FRAMEBUDGET] instalado NO 1o FRAME (pos-rebinds: mede os update ATIVOS)") rescue nil)
+  end
+rescue Exception => _efb
+  (MKXPDebug.log("[FRAMEBUDGET] indisponivel: #{_efb.class}") rescue nil)
+end
+
+# =============================================================================
+#  STUCKCMD 2026-07-05 — deteta comando de evento ENCRAVADO (New Game autowalk).
+#  Envolve Interpreter#update: se o @index NAO muda ha' >180 chamadas com o
+#  interpretador a correr, loga o comando parado (code+params) 1x. Independente
+#  do scene/per_frame -> dispara de certeza.
+# =============================================================================
+begin
+  if $MKXP_DIAG == true && !$__stuckcmd_on && Object.const_defined?(:Interpreter)
+    class Interpreter
+      alias_method :__sc_orig_update, :update
+      def update(*a, &b)
+        _r = __sc_orig_update(*a, &b)
+        begin
+          if (@running rescue false) || (running? rescue false)
+            _ix = (@index rescue -1)
+            if _ix == (@__sc_last_ix ||= -999)
+              @__sc_same = (@__sc_same || 0) + 1
+              if @__sc_same == 180
+                _cmd = (@list[@index] rescue nil)
+                (MKXPDebug.log("[STUCKCMD] ENCRAVADO 180f no mesmo comando: idx=#{_ix} code=#{(_cmd.code rescue '?')} params=#{(_cmd.parameters.inspect rescue '?')[0,90]} map=#{(@map_id rescue '?')} evt=#{(@event_id rescue '?')}") rescue nil)
+              end
+            else
+              @__sc_last_ix = _ix
+              @__sc_same = 0
+            end
+          end
+        rescue Exception
+        end
+        _r
+      end
+    end
+    $__stuckcmd_on = true
+    (MKXPDebug.log("[STUCKCMD] instalado (deteta comando de evento parado >180f)") rescue nil)
+  end
+rescue Exception => _esc2
+  (MKXPDebug.log("[STUCKCMD] indisponivel: #{_esc2.class}") rescue nil)
+end
+
+# =============================================================================
+#  AUTOPILOT 2026-07-05 — SO' para self-run do debug de New Game. Gated
+#  $MKXP_AUTOPILOT (default OFF). Confirma dialogos/menus (USE sintetico 1x/12f)
+#  e curto-circuita a entrada de nome -> chega ao autowalk do intro sem input
+#  humano. REMOVER apos o debug. NAO afeta gameplay normal (flag off).
+# =============================================================================
+begin
+  if $MKXP_AUTOPILOT == true && !$__autopilot_on
+    $__autopilot_on = true
+    # 1) [REMOVIDO] short-circuit de pbEnterText -> teclado de nome normal
+    # 2) USE sintetico periodico (avanca dialogo + confirma New Game no titulo)
+    class << Input
+      unless method_defined?(:__ap_orig_trigger)
+        alias_method :__ap_orig_trigger, :trigger?
+        def trigger?(code)
+          _r = __ap_orig_trigger(code)
+          begin
+            if $MKXP_AUTOPILOT == true && !$__ap_stop
+              _use = (Input::USE rescue 13)
+              $__ap_f = ($__ap_f || 0) + 1 if code == _use
+              if code == _use && ($__ap_f % 12) == 0
+                _r = true   # injeta USE
+              end
+            end
+          rescue Exception
+          end
+          _r
+        end
+      end
+    end
+    (MKXPDebug.log("[AUTOPILOT] ATIVO (USE 1x/12f + nome instantaneo) -- self-run new game") rescue nil)
+
+# [AUTOPILOT-DIR] injeta BAIXO periodicamente p/ testar se o player anda
+begin
+  if $MKXP_AUTOPILOT == true && !$__ap_dir_on
+    $__ap_dir_on = true
+    class << Input
+      unless method_defined?(:__apd_orig_dir4)
+        alias_method :__apd_orig_dir4, :dir4
+        def dir4
+          _r = __apd_orig_dir4
+          begin
+            if $MKXP_AUTOPILOT == true
+              $__apd_f = ($__apd_f || 0) + 1
+              # apos ~90s (autowalk deve ter passado), martela BAIXO
+              _r = 2 if (Graphics.frame_count rescue 0) > 3000 && ($__apd_f % 3) != 0
+            end
+          rescue Exception
+          end
+          _r
+        end
+      end
+    end
+    (MKXPDebug.log("[AUTOPILOT-DIR] injecao de BAIXO armada (apos frame 3000)") rescue nil)
+  end
+rescue Exception
+end
+
+  end
+rescue Exception => _eap
+  (MKXPDebug.log("[AUTOPILOT] indisponivel: #{_eap.class}") rescue nil)
+end
+
+# =============================================================================
+#  MOVEDBG3 2026-07-05 — dump do estado do player via Game_Map#update (corre
+#  TODOS os frames, indep. de scene/interpretador). Diz porque o New Game
+#  encrava apos pbBridgeOn. 1x/90f.
+# =============================================================================
+begin
+  if $MKXP_DIAG == true && !$__movedbg3_on && Object.const_defined?(:Game_Map)
+    class Game_Map
+      alias_method :__mv3_orig_update, :update
+      def update(*a, &b)
+        _r = __mv3_orig_update(*a, &b)
+        begin
+          $__mv3_t = ($__mv3_t || 0) + 1
+          if ($__mv3_t % 90) == 0
+            _gp = ($game_player rescue nil)
+            if _gp.nil?
+              (MKXPDebug.log("[MOVEDBG3] $game_player=NIL map=#{(@map_id rescue '?')}") rescue nil)
+            else
+              _run = (@map_interpreter ? (@map_interpreter.running? rescue '?') : 'no-mi')
+              _idx = (@map_interpreter ? (@map_interpreter.instance_variable_get(:@index) rescue '?') : '-')
+              _pass = (_gp.passable?(_gp.x, _gp.y, (_gp.direction rescue 2)) rescue '?')
+              _tt = (self.terrain_tag(_gp.x, _gp.y).id rescue '?')
+              (MKXPDebug.log("[MOVEDBG3] map=#{(@map_id rescue '?')} p=(#{(_gp.x rescue '?')},#{(_gp.y rescue '?')}) mov=#{(_gp.moving? rescue '?')} dir=#{(_gp.direction rescue '?')} mrf=#{(_gp.move_route_forcing rescue '?')} | mi_run=#{_run} idx=#{_idx} | msg=#{($game_temp.message_window_showing rescue '?')} menu=#{($game_temp.in_menu rescue '?')} xfer=#{($game_temp.player_transferring rescue '?')} lock=#{(_gp.instance_variable_get(:@locked) rescue '?')} | bridge=#{($PokemonGlobal.bridge rescue '?')} terr=#{_tt} pass_frente=#{_pass} disp=(#{(@display_x rescue '?')},#{(@display_y rescue '?')})") rescue nil)
+            end
+          end
+        rescue Exception
+        end
+        _r
+      end
+    end
+    $__movedbg3_on = true
+    (MKXPDebug.log("[MOVEDBG3] instalado (Game_Map#update; 1x/90f)") rescue nil)
+  end
+rescue Exception => _emv3
+  (MKXPDebug.log("[MOVEDBG3] indisponivel: #{_emv3.class}") rescue nil)
+end
+
+# =============================================================================
+#  INTROFIX-TEST 2026-07-05 — map43 intro: se EV26 (autorun, cond SW50) nao esta'
+#  na pagina certa apesar de SW50 ON, forcar need_refresh+refresh CEDO e todos os
+#  frames ate' arrancar. Le events[26] FRESCO. Gate $MKXP_INTROFIX.
+# =============================================================================
+begin
+  if !$__introfix_on && Object.const_defined?(:Game_Player)
+    class Game_Player
+      alias_method :__ifx_orig_update, :update
+      def update(*a,&b)
+        _r = __ifx_orig_update(*a,&b)
+        begin
+          if $MKXP_INTROFIX == true
+            _gm = ($game_map rescue nil)
+            if _gm && (_gm.map_id rescue 0)==43 && ($game_switches[50] rescue false)
+              _e = (_gm.events[26] rescue nil)
+              _pg = (_e ? (_e.instance_variable_get(:@page) rescue nil) : nil)
+              if _pg.nil? && _e
+                _son = (_e.switchIsOn?(50) rescue "err")
+                (_e.refresh) rescue nil
+                _pg2 = (_e.instance_variable_get(:@page) rescue nil)
+                _tr = (_e.instance_variable_get(:@trigger) rescue nil)
+                $__ifx_n = ($__ifx_n||0)+1
+                (MKXPDebug.log("[INTROFIX2] ev26.switchIsOn?(50)=#{_son.inspect} $gsw[50]=#{($game_switches[50] rescue '?')} | apos ev.refresh: page=#{_pg2.nil? ? 'NIL' : 'SET'} trigger=#{_tr.inspect} SW65=#{($game_switches[65] rescue '?')}") rescue nil) if $__ifx_n <= 8
+              end
+            end
+          end
+        rescue Exception => _eifx
+          (MKXPDebug.log("[INTROFIX2] erro: #{_eifx.class}: #{_eifx.message.to_s[0,60]}") rescue nil) if ($__ifx_n||0) < 2
+        end
+        _r
+      end
+    end
+    $__introfix_on = true
+    (MKXPDebug.log("[INTROFIX] instalado") rescue nil)
+  end
+rescue Exception => _e2ifx
+  (MKXPDebug.log("[INTROFIX] indisponivel: #{_e2ifx.class}") rescue nil)
+end
+
+begin
+  $MKXP_SMARTAP = false
+  # [REMOVIDO] short-circuit de pbEnterText -> teclado de nome normal
+  class << Input
+    alias_method :__sap_trig, :trigger?
+    def trigger?(code)
+      _r = __sap_trig(code)
+      begin
+        if $MKXP_SMARTAP && code == (Input::USE rescue 13)
+          _msg = ($game_temp && $game_temp.message_window_showing rescue false)
+          if _msg
+            $__sap_f = ($__sap_f || 0) + 1
+            _r = true if ($__sap_f % 20) == 0
+          end
+        end
+      rescue Exception; end
+      _r
+    end
+  end
+  class Game_Player
+    alias_method :__sapd, :update
+    def update(*a,&b)
+      _r=__sapd(*a,&b)
+      begin
+        $__st=($__st||0)+1
+        if ($__st%90)==0 && ($game_map.map_id rescue 0)==43
+          (MKXPDebug.log("[SAPDBG] p=(#{@x},#{@y}) SW65=#{$game_switches[65]} transp=#{@transparent} sw50=#{$game_switches[50]}") rescue nil)
+        end
+      rescue Exception; end
+      _r
+    end
+  end
+rescue Exception=>e; (MKXPDebug.log("[SAP] erro #{e.class}") rescue nil); end
+
+
+# =============================================================================
+#  SWITCHNAME-FIX 2026-07-05 — RAIZ do NEW GAME preso: System.rxdata falha no
+#  boot (allocation failure) -> $data_system.switches[id] devolve nil (nome em
+#  falta) -> switchIsOn?(id) faz `return false if !switchname` -> FALSE p/ todos
+#  os switches GLOBAIS, mesmo os ligados. Condicoes de pagina de eventos usam
+#  switchIsOn? -> o EV26 'INTRO' (cond switch "ShowOpening") nunca ativa ->
+#  sprite preso nas arvores. Continue funciona porque os seus eventos usam
+#  self-switches (nao passam por switchIsOn?). FIX: nome nil = switch NORMAL =
+#  devolver $game_switches[id]. So' os "s:" (script) precisam do nome.
+#  $MKXP_SWITCHNAME_FIX=false reverte.
+# =============================================================================
+begin
+  if $MKXP_SWITCHNAME_FIX != false
+    [:Game_Event, :Game_CommonEvent].each do |_kn|
+      next unless Object.const_defined?(_kn)
+      _k = Object.const_get(_kn)
+      next unless _k.instance_methods.include?(:switchIsOn?)
+      next if _k.instance_methods.include?(:__swnf_orig)
+      _k.class_eval do
+        alias_method :__swnf_orig, :switchIsOn?
+        def switchIsOn?(id)
+          _sw = ($data_system.switches[id] rescue nil)
+          if _sw && (_sw[/^s\:/] rescue nil)
+            # switch de script "s:" -> avaliar via original (correto)
+            return (__swnf_orig(id) rescue ($game_switches[id] ? true : false))
+          end
+          # nome nil OU normal -> switch global directo (robusto a System.rxdata partido)
+          return ($game_switches[id] ? true : false)
+        end
+      end
+      (MKXPDebug.log("[SWITCHNAME-FIX] switchIsOn? robusto a nome-nil em #{_kn}") rescue nil)
+    end
+  end
+rescue Exception => _eswf
+  (MKXPDebug.log("[SWITCHNAME-FIX] indisponivel: #{_eswf.class}") rescue nil)
+end
+
+# =============================================================================
+#  ITEMDBG2 2026-07-05 — item apanhado mostra nome "0" + bola segue. Hooka
+#  pbReceiveItem (funcao base) alem de pbItemBall, e loga o item cru + nome
+#  resolvido + como o jogo obtem o nome. Gate $MKXP_ITEMDBG (default ON p/ caçar).
+# =============================================================================
+begin
+  if $MKXP_ITEMDBG != false && !$__itemdbg2_on
+    $__itemdbg2_on = true
+    if Object.method_defined?(:pbReceiveItem)
+      class Object
+        alias_method :__id2_recv, :pbReceiveItem
+        def pbReceiveItem(item, *a)
+          begin
+            _gd = (GameData::Item.get(item) rescue nil)
+            (MKXPDebug.log("[ITEMDBG2] pbReceiveItem item=#{item.inspect}(#{item.class}) | GameData.get=#{_gd ? _gd.class : 'NIL'} name=#{(_gd.name rescue 'ERR').inspect} id=#{(_gd.id rescue '?').inspect} | pbGetMsg=#{(pbGetMessage(MessageTypes::Items, (_gd.id_number rescue 0)) rescue 'ERR').inspect}") rescue nil)
+          rescue Exception; end
+          __id2_recv(item, *a)
+        end
+      end
+      (MKXPDebug.log("[ITEMDBG2] hook pbReceiveItem instalado") rescue nil)
+    end
+  end
+rescue Exception => _eid2
+  (MKXPDebug.log("[ITEMDBG2] indisponivel: #{_eid2.class}") rescue nil)
+end
+
+(MKXPDebug.log("[PROBE-END] WARNING probe carregado ate ao fim") rescue nil)
