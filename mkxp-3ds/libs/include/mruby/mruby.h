@@ -293,9 +293,9 @@ typedef struct mrb_state {
 
   mrb_sym symidx;
   const char **symtbl;
-  uint8_t *symlink;
+  uint32_t *symlink;   /* PATCH 3DS: era uint8_t -> overflow 0xff caia em O(N); uint32 elimina varrimento */
   uint8_t *symflags;
-  mrb_sym symhash[256];
+  mrb_sym symhash[16384];   /* PATCH 3DS: era 256 baldes -> colisoes em massa; 16384 encurta cadeias p/ O(1) */
   size_t symcapa;
 #ifndef MRB_USE_ALL_SYMBOLS
   char symbuf[8];               /* buffer for small symbol names */
