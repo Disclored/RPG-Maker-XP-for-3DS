@@ -130,7 +130,8 @@ graphics_binding.o: \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/sprite_binding_3ds.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/data.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/bitmap_binding_3ds.h \
- C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/tilemap_binding_3ds.h
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/tilemap_binding_3ds.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/array.h
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mrbconf.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/common.h:
@@ -262,3 +263,4 @@ C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/sprite_binding_3ds.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/data.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/bitmap_binding_3ds.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/tilemap_binding_3ds.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/array.h:

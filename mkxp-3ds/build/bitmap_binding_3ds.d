@@ -128,10 +128,26 @@ bitmap_binding_3ds.o: \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/string.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/variable.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/array.h \
+ C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/hash.h \
  C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/stb_image.h \
  C:/devkitPro/portlibs/3ds/include/png.h \
  C:/devkitPro/portlibs/3ds/include/pnglibconf.h \
- C:/devkitPro/portlibs/3ds/include/pngconf.h
+ C:/devkitPro/portlibs/3ds/include/pngconf.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/ft2build.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/ftheader.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/freetype.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/ftconfig.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/ftoption.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/ftstdlib.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/integer-types.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/public-macros.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/mac-support.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/fttypes.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/ftsystem.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/ftimage.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/fterrors.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/ftmoderr.h \
+ C:/devkitPro/portlibs/3ds/include/freetype2/freetype/fterrdef.h
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/bitmap_binding_3ds.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mrbconf.h:
@@ -260,7 +276,23 @@ C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/class.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/string.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/variable.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/array.h:
+C:/Users/USER/Desktop/Emulator/mkxp-3ds/libs/include/mruby/mruby/hash.h:
 C:/Users/USER/Desktop/Emulator/mkxp-3ds/source/stb_image.h:
 C:/devkitPro/portlibs/3ds/include/png.h:
 C:/devkitPro/portlibs/3ds/include/pnglibconf.h:
 C:/devkitPro/portlibs/3ds/include/pngconf.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/ft2build.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/ftheader.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/freetype.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/ftconfig.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/ftoption.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/ftstdlib.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/integer-types.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/public-macros.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/config/mac-support.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/fttypes.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/ftsystem.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/ftimage.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/fterrors.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/ftmoderr.h:
+C:/devkitPro/portlibs/3ds/include/freetype2/freetype/fterrdef.h:
