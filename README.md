@@ -1,9 +1,11 @@
 # mkxp-3ds — Pokémon Essentials on 3DS
 
-> **Status:** Work in progress. Pokémon Essentials fan games boot, load saves and play on the map, now measured
-> on a **real Old 3DS**. On a busy town map (Solar Eclipse, map 43) the median frame dropped from **~60 ms
-> (Oct 18) to ~25–30 ms (Nov 1)**; the target is a stable 30 FPS with no spikes. The latest build (Nov 1) still
-> crashes at a map border and when entering a house, and shows a vertical black line on the map: being fixed.
+> **Status (14/11/2026):** Work in progress. Pokémon Essentials fan games boot, load saves and play on the map, measured
+> on a **real Old 3DS**. On a busy town map (Solar Eclipse, map 43) the median frame went from **~60 ms (Oct 18)** to
+> **~22–27 ms (Nov 14)**; the target is a stable 30 FPS with no spikes, then 60 FPS. Round 44 moved the map engine
+> to C (event state in a contiguous C registry, sprites loop in C, half the live Ruby objects) and removed most
+> memory/GC spikes. The last console run (14/11) crashed after 3.5 minutes on **heap fragmentation**. The cause (a
+> tile cache that grew to a 300 KB block) is fixed on PC and waits for the next console build.
 
 A port of **mkxp-z** that runs **RPG Maker XP / RGSS1** games (including **Pokémon Essentials** fan games)
 natively on **Nintendo 3DS**, powered by **mruby 3.2** and **citro2d/citro3d**. The main target is the
@@ -147,6 +149,93 @@ Some screenshots of the progress:
 * Real Old 3DS, map 43 (busy town): median frame **28.8–29.7 ms** (log of 01/11 18:56) and **25.2 ms** in the
   latest log (one window), Ruby ~22–28 ms, drawing ~6.5–8 ms.
 
+### 06/11/2026 — Round 20: the two crashes, the black line, and more of the map in C
+
+* devkitPro updated (libctru 2.7.1, host gcc 16): clean rebuild and every test/session checked again first.
+* **Crashes at a map border and when entering a house:** the ground texture of a second map was created in the
+  middle of drawing, with the GPU frame open, after freeing idle images from VRAM. It is now created before the
+  frame starts (to be confirmed on the console).
+* **Vertical black line:** a ground cell drawn while one of its tile pieces was not ready stayed empty forever; it
+  is now redrawn on the next frame (to be confirmed on the console).
+* **Emulator bug found by comparing with Ruby (MRI):** a `return` inside a `File.open { }` block did not leave the
+  method. Essentials' `pbGetFileChar` then read the whole file instead of 1 byte (menus, load screen). `File.open`
+  with a block is now Ruby (yield + ensure), like mruby-io.
+* Another one found by a check mode: the "event variables unchanged" fingerprint skipped part of the variable
+  table, so an event that moved could stay "out of range".
+* Map spikes: the tilemap prepare (~24 ms, 77 of 600 frames) now redoes only the animated autotile cells; events in
+  range reuse their cached "should update?" result; wandering NPCs between steps take the idle shortcut; screen
+  position calls of the character update go straight to C; shadows skip their update twice as often.
+* Memory estimate made safe when memory is low (it was off by 6.4 MB after loading).
+
+### 07/11/2026 — Rounds 21-23: house crash fixed, black stripe worked around, more in C
+
+* **Crash entering a house:** render targets were deleted inside an open GPU frame (citro3d `svcBreak`); now deleted
+  before `C3D_FrameBegin`. Confirmed on the console.
+* **Black stripe:** comes from the ground render texture on the real console (not on PC). The ground is drawn tile by
+  tile on 3DS for now (`chao_tile`); a one-shot render-target self-test (`rt_teste`) is in the log to find the cause.
+* Sprites: idle sprites near the edge refresh less often when the screen is still; slide reads the screen position in C.
+* `defined?(super)` fixed for modules and subclasses; Essentials v19.1 idle events skipped like v20; 247 methods in
+  generated C (was 192).
+
+### 07/11/2026 — Round 24: ground batched by texture, idle sprite re-checks rarer, IMA-ADPCM WAV
+- The ground (drawn tile by tile since the stripe workaround) is now drawn layer by layer and grouped by texture, to
+  cut the 21-38 texture switches per frame seen on the console (`ordem_tex`).
+- Idle character sprites whose periodic full update changed nothing twice now re-check every 64 frames instead of 16
+  (`spr_chave`); the day/night tint is applied without a Ruby dispatch (`tint_direto`).
+- IMA-ADPCM WAV files play (`wav_adpcm`); negative-width quads are clipped by their viewport (`compat_scissor`).
+- Render-target self-test reworked (one target at a time, only when VRAM is free) to find the stripe's cause.
+
+### 07/11 – 12/11/2026 — Rounds 25–43: the character state in C, memory and the VM
+
+* **Character state in C:** an exact per-object write generation (mruby patch 0079) and a native registry of the
+  characters kept up to date by the VM's own writes. The interpreter reads position, direction and look from that
+  contiguous C table instead of scattered Ruby tables (no cache misses at ~220 ns each on the Old 3DS).
+* `update_move`, `screen_x/y/z`, water reflections, `update_screen_position`, `update_event_triggering`,
+  `isPassableStrict?`, `move_speed=`, the start of `Interpreter#update` (also with Following Pokémon), map scrolling,
+  weather, `Event#trigger` and message text formatting (`getFormattedText`) run in C.
+* **Memory:** GC pages and medium malloc blocks in slabs, 64–256 KB pixel buffers outside the heap, the font cache
+  survives saving, and the memory of bitmap pixels is counted.
+* **VM:** sends to getters/attr without a frame, a 2-way call cache, faster `Integer#% & | ^`, and lazy Essentials
+  getters without a frame (patch 0086).
+* Load screen 5.7 s → 4.3 s; faster `Marshal.load` of saves (patch 0085).
+* Generated C re-targeted by the console profile (371 methods).
+* A console run on 11/11 (log 20:26) showed the same map FPS and a memory regression (slab arena full). It was fixed
+  in round 43, and that run became the reference session replayed on PC.
+
+### 13/11 – 14/11/2026 — Round 44: the full-frame native map engine (4 console runs)
+
+* **Events:** a push registry (patches 0080/0081): the VM writes instance variables into a C store, and native code
+  reads from it.
+  * Events out of range are skipped in batch: ~17–18 thousand per 600 frames, without touching them.
+  * The event body skips writes that would not change anything.
+  * Passability checks go through a C position index instead of scanning every event.
+* **Sprites:** the `Spriteset_Map#update` loop is in C. Off-screen sprites are decided without looking up their
+  character. Signatures avoid redoing unchanged sprites.
+* **Map data outside the Ruby heap:** message tables and map strings are kept in C. Live objects on the map went from
+  ~230–270 thousand to ~120 thousand (−50%), so every GC is cheaper.
+* **Spikes removed (confirmed on the console):**
+  * Periodic emergency GCs: a `Marshal.dump` size hint was kept per class, so small dumps asked for 295 KB.
+  * ~450 ms `FileTest.exist?` frames: a recovery path did an SD `stat` for every missing file.
+  * A 9 s map load: the map message step.
+  * A font crash when memory was low.
+  * `bush?`/`deepBush?` results cached per tile (45–88% hits).
+  * `GC.start` from plugins deferred when memory is tight.
+* `Regexp`/`MatchData` now behave like MRI (class names, `options`, `Regexp.new(regexp)`).
+* The tile atlas falls back to RGBA4 when RGBA8 does not fit.
+* The ahead-of-time C generation is re-ranked by the console profile: 372 methods, ~900 KB of ARM code.
+* **New profiling zones** show where the map frame goes on the Old 3DS (map 43):
+  | part | ms/frame |
+  |---|---|
+  | drawing | 8–10 |
+  | events | ~8 |
+  | sprites, footprints and shadows | ~6.5 |
+  | GC | 1–2, plus spikes |
+  Ruby that could still move to C is only ~2.3 ms/frame. The remaining time is in the engine's own C, which still
+  reads Ruby objects.
+* **Crash found on the console (14/11):** after 3.5 min the largest free block fell from 3.3 MB to 216 KB (with 14 MB
+  free in holes), and a tile cache vector asked for 300 KB in one piece. The cache now uses 6 KB pages and simply
+  stops caching when memory is short. Fixed on PC (all 1482 checks, 25 replayed sessions), next on the console.
+
 ---
 
 ## What was done
@@ -159,7 +248,7 @@ Some screenshots of the progress:
 * **Graphics pack:** all images in one file (avoids 200–650 ms `fopen` in big folders on the console SD).
 * `Game.rgssad` is extracted automatically on the first run.
 
-### Interpreter and Ruby core (75 mruby patches, all checked against MRI)
+### Interpreter and Ruby core (91 mruby patches, all checked against MRI)
 
 * Method calls: per-call-site cache, instance-variable hints, trivial C functions inside the call itself, faster
   method entry/return, C sends with a cached method (patch 0075).
@@ -173,8 +262,8 @@ Some screenshots of the progress:
 * Hundreds of core and public-plugin methods run in C (map, events, characters, sprites, tilemap, messages,
   windows, battle scene). **Safety:** the original source is compiled at boot and compared with the game's
   bytecode; any difference or unusual case falls back to the original Ruby, so results and errors stay the same.
-* Each one is tested against MRI with mutations, and by replaying 14 recorded console sessions on PC (the final
-  save must match exactly), plus screenshot A/B comparisons.
+* Each one is tested against MRI with mutations, and by replaying 25 recorded console sessions on PC (the final
+  save must match exactly), plus screenshot A/B comparisons. 1482 host checks run before every build.
 
 ### Rendering
 
@@ -190,19 +279,30 @@ Some screenshots of the progress:
 
 ### Profiling and debugging
 
-* Console log with scenes (p50/p95/p99), per-method profile, slow-frame reports, memory/VRAM, watchdog for stalls.
+* Console log with scenes (p50/p95/p99), per-method profile, profiling zones, slow-frame reports, memory/VRAM
+  (including the largest free block), watchdog for stalls, and a checklist script that reads a console log point by point.
 * PC tools: a simulator that **replays console sessions exactly**, gprof per window, verify modes for each cache,
   screenshot A/B diff, mutation scripts.
 
 ---
 
-## Known issues / next steps
+## Known issues / next steps (14/11/2026)
 
-* **Latest build (01/11):** crash at a map border (connected maps) and when entering a house; a vertical black
-  line in the middle of the map. These come first.
-* **Map performance:** median ~25–30 ms on a real Old 3DS, but spikes remain (p95 ~45 ms). Next: Following Pokémon
-  in C, the rest of the character update, events in range, the remaining native map engine parts.
-* **Menus and loading:** opening the menu 335–545 ms, a new message 115–414 ms, map change 1.7–2.4 s, loading a
-  save 3.6–4.2 s, warm boot 51–65 s.
-* **Battles (EBDX):** run, but not optimized yet; done after the map is smooth.
-* **Other games:** Essentials v20/v21 (TilemapRenderer) and New 3DS (core 2) later.
+* **Memory fragmentation** on long sessions: the heap ends up with many small holes. First: big allocations out of
+  the main heap, a refilled emergency reserve, compaction on map change. The crash it caused is already fixed on PC.
+* **GC spikes:** minor GCs of ~400 ms and the full GC that Following Pokémon asks for on every map change.
+* **Map frame (median ~22–27 ms, p95 42–58 ms):**
+  * the whole event update in C (~8 → ≤ 3 ms);
+  * sprites, footprints and shadows in C (~6.5 → ≤ 2.5 ms);
+  * Following Pokémon in C;
+  * drawing 8–10 → ≤ 5 ms (a persistent draw list, batching by texture, static tile layers, skipping unchanged
+    frames). The last one is needed for 60 FPS.
+* **Loading:**
+  * map change 1.7–2.6 s (target ≤ 0.8 s);
+  * boot 44 s to the first frame (target ≤ 25 s);
+  * load screen up to 5 s (target ≤ 1 s).
+* **Menus and messages:** opening a menu 130–210 ms; a new message up to 350–450 ms.
+* **Battles (EBDX):** run, but not optimized yet.
+* **Other games:** Essentials v20.1/v21.1, v17/v18 and other fan games (Reborn, …) are being checked against
+  their own scripts.
+* **Later:** audio work (MP3, MIDI) and New 3DS extra cores.
